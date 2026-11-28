@@ -3,6 +3,8 @@ package dev.genericpayments.platform.provider.application.port.out;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
@@ -16,6 +18,47 @@ public interface ProviderOperationStore {
      */
     ProviderOperation reserve(PaymentAccount account, ProviderOperation.Kind kind,
         UUID resourceId, String key, String fingerprint);
+    /** Explicit persisted branch authority; ordinary reserve never admits either owned step. */
+    default ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,
+            ProviderOperation.Kind kind) {
+        throw new UnsupportedOperationException("Owned failed renewal method reservation is unavailable");
+    }
+    default ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation reservation,
+            ProviderOperation claim,Instant now) {
+        throw new UnsupportedOperationException("Owned failed renewal method dispatch is unavailable");
+    }
+    default ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,Reservation reservation,
+            ProviderOperation.Kind kind,SuccessorOwner owner){throw successorUnavailable();}
+    default ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,Reservation reservation,
+            ProviderOperation claim,Instant now,SuccessorOwner owner){throw successorUnavailable();}
+    default Optional<ProviderOperation> claim(UUID id,String claimant,Instant now,Duration lease,SuccessorOwner owner){throw successorUnavailable();}
+    default ProviderOperation acknowledge(UUID id,String claimant,long version,String reference,SuccessorOwner owner){throw successorUnavailable();}
+    private static UnsupportedOperationException successorUnavailable(){return new UnsupportedOperationException("Owned grace successor write unavailable");}
+    default ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance) {
+        throw new UnsupportedOperationException("Owned first renewal reservation is unavailable");
+    }
+    default dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Ack acknowledgeOwnedFirstRenewalAdvance(
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.Advance advance,ProviderOperation claim,
+            dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.TestClockAck observation,Instant utcAt) {
+        throw new UnsupportedOperationException("Owned first renewal acknowledgment is unavailable");
+    }
+    /** Explicit owned lane: defaults fail closed for older pure doubles. */
+    default ProviderOperation reserveOwnedBillingCustomer(PaymentAccount account, dev.genericpayments.platform.provider.application.model.ReadyClock ready) {
+        throw new UnsupportedOperationException("Owned Billing Customer reservation is unavailable");
+    }
+    default ProviderOperation reserveOwnedBillingSubscription(PaymentAccount account,
+            dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent) {
+        throw new UnsupportedOperationException("Owned Billing Subscription reservation is unavailable");
+    }
+    /** Original live claim and complete response evidence commit together, or neither commits. */
+    default dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt acknowledgeOwnedBillingSubscription(
+            dev.genericpayments.platform.provider.application.model.OwnedClockSubscription intent, ProviderOperation claim,
+            String reference, long providerCreated, String itemReference, long periodStart, long periodEnd, Instant acknowledgedAt) {
+        throw new UnsupportedOperationException("Owned Billing Subscription acknowledgment is unavailable");
+    }
     Optional<ProviderOperation> find(PaymentAccountId account, String key);
     Optional<ProviderOperation> findById(UUID id);
     /** Join manual recovery transaction; lock operation, original Account, resource in that order. */
@@ -25,6 +68,13 @@ public interface ProviderOperationStore {
     /** Use real UTC, a fresh owner token per acquisition, and a 60-second lease. Returns its fencing version. */
     Optional<ProviderOperation> claim(UUID id, String owner, Instant now, Duration lease);
     ProviderOperation acknowledge(UUID id, String owner, long expectedVersion, String reference);
+    /** Exact RESUME receipt only: row lock without Account/lifecycle locks, inside the caller transaction. */
+    default ProviderOperation lockResumeReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
+    /** Exact CHANGE/Schedule receipt row lock, before Account/lifecycle locks. */
+    default ProviderOperation lockPlanReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
+    /** Exact CANCEL/WITHDRAW/RECOVER receipt row lock, before Account/lifecycle locks. */
+    default ProviderOperation lockSubscriptionMutationReceipt(ProviderOperation expected){throw new UnsupportedOperationException();}
+    default ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){throw new UnsupportedOperationException();}
     ProviderOperation unknown(UUID id, String owner, long expectedVersion);
 
     /**

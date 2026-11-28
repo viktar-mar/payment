@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFile} from 'node:fs/promises';
+import {readFile, stat} from 'node:fs/promises';
 
 // These are bounded policy/coverage checks. actionlint validates actual YAML and
 // GitHub Actions semantics; these checks do not attempt to implement a YAML parser.
@@ -9,18 +9,36 @@ function jobs(text) {
   const section = text.split(/^jobs:\n/m)[1] ?? '';
   return Object.fromEntries([...section.matchAll(/^  ([\w-]+):\n([\s\S]*?)(?=^  [\w-]+:|$(?![\s\S]))/gm)].map(m => [m[1], m[2]]));
 }
+const earlyFailedRenewal = "./mvnw -B -ntp '-Dtest=dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalScenarioIntegrationTest' test";
+const fullBackend = "./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify";
 const gates = {
-  backend: ['node infrastructure/init-local-customer-issuer.mjs', './mvnw -B -ntp verify'],
+  backend: [
+    'node infrastructure/init-local-customer-issuer.mjs',
+    earlyFailedRenewal,
+    fullBackend,
+    'sh backend/export-billing-first-payment-runtime.sh backend/target/test-classes',
+    "echo 'first_payment_runtime_packaging_verified_without_launch'",
+    'sh backend/export-billing-first-renewal-runtime.sh backend/target/test-classes',
+    "echo 'first_renewal_runtime_packaging_verified_without_launch'",
+    'sh backend/export-billing-failed-renewal-runtime.sh "$PWD/backend/target/test-classes" "$packaging_root/runtime"',
+    "echo 'failed_renewal_runtime_packaging_verified_without_launch'",
+  ],
+  'backend-owned-failed-renewal': [
+    'node infrastructure/init-local-customer-issuer.mjs',
+    "./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test",
+  ],
   frontend: [
     'pnpm --dir frontend install --frozen-lockfile',
     'pnpm --dir frontend/sdk test --run', 'pnpm --dir frontend/sdk typecheck', 'pnpm --dir frontend/sdk build',
     'pnpm --dir frontend/admin test --run', 'pnpm --dir frontend/admin typecheck', 'pnpm --dir frontend/admin lint', 'pnpm --dir frontend/admin build',
     'pnpm --dir examples/demo-site install --frozen-lockfile',
-    'pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/vite-return-privacy.test.ts',
+    'pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/subscription-return.test.ts src/vite-return-privacy.test.ts',
     'pnpm --dir examples/demo-site build',
     'pnpm --dir examples/demo-site exec playwright install --with-deps chromium',
     'node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts',
     'pnpm --dir examples/demo-site exec playwright test --config playwright.offline.config.ts --workers=1 --retries=0',
+    "run('./mvnw', ['-B', '-ntp', '-DskipTests', 'package']",
+    "run('pnpm', ['--dir', 'examples/demo-site', 'exec', 'playwright', 'test', '--config', 'playwright.config.ts', '--workers=1', '--retries=0']",
   ],
   infrastructure: [
     'pnpm --dir frontend install --frozen-lockfile', 'pnpm --dir frontend/sdk build',
@@ -30,6 +48,19 @@ const gates = {
   ],
 };
 
+test('failed renewal packaging checks isolation and dependency closure without launching the runtime', async () => {
+  const block = jobs(await readWorkflow()).backend.split('      - name: ').find(step =>
+    step.includes("echo 'failed_renewal_runtime_packaging_verified_without_launch'"));
+  assert.ok(block);
+  for (const required of ['set -euo pipefail', gates.backend.at(-2), 'jar tf "$backend_jar"',
+    'OwnedBillingFailedRenewal', 'OwnedFailedGraceBillingTime', 'OwnedGraceSubscriptionRows',
+    'jar xf "$backend_jar" BOOT-INF/lib', 'jdeps --multi-release 25', '-verbose:class -filter:none',
+    '--class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*"', 'not found',
+    'org\\.junit', 'org\\.mockito', 'org\\.testcontainers', 'org\\.springframework\\.test',
+    'org\\.springframework\\.boot\\.test', 'exit 1']) assert.ok(block.includes(required), required);
+  assert.doesNotMatch(block, /(?:^|\s)(?:java|docker|mvnw|node)\s|--class-path[^\n]*test-classes/m);
+});
+
 test('CI admits untrusted PRs with read-only credentials and bounded cancellable jobs', async () => {
   const text = await readWorkflow();
   for (const event of ['push', 'pull_request', 'workflow_dispatch']) assert.match(text, new RegExp(`^  ${event}:`, 'm'));
@@ -37,17 +68,146 @@ test('CI admits untrusted PRs with read-only credentials and bounded cancellable
   assert.equal([...text.matchAll(/^\s*permissions:/gm)].length, 1, 'jobs cannot escalate workflow permissions');
   assert.match(text, /group:.*github.workflow.*github.ref/);
   assert.match(text, /cancel-in-progress: true/);
-  assert.doesNotMatch(text, /pull_request_target|paths(?:-ignore)?:|secrets\.|\bif:|continue-on-error|\b(?:deploy|publish|upload-artifact)\b|PAYMENT_STRIPE_SANDBOX_|--env-file|printenv|\benv\s*$/im);
+  assert.doesNotMatch(text, /pull_request_target|paths(?:-ignore)?:|secrets\.|\bif:|\bneeds:|continue-on-error|\b(?:deploy|publish|upload-artifact)\b|PAYMENT_STRIPE_SANDBOX_|printenv|\benv\s*$/im);
+  // The only env file admitted is an explicitly empty, privately owned file.
+  assert.deepEqual([...text.matchAll(/--env-file[^\n]*/g)].map(m => m[0]), ["--env-file', env.PAYMENT_FAKE_CI_EMPTY_ENV,"]);
   const blocks = jobs(text);
-  assert.deepEqual(Object.keys(blocks).sort(), ['backend', 'frontend', 'infrastructure']);
+  assert.deepEqual(Object.keys(blocks).sort(), ['backend', 'backend-owned-failed-renewal', 'frontend', 'infrastructure']);
   for (const [job, block] of Object.entries(blocks)) {
     assert.match(block, /runs-on: ubuntu-24\.04/);
-    assert.match(block, new RegExp(`timeout-minutes: ${job === 'backend' ? 45 : 30}\\b`));
+    assert.match(block, new RegExp(`timeout-minutes: ${{backend: 60, 'backend-owned-failed-renewal': 90, frontend: 45, infrastructure: 30}[job]}\\b`));
     assert.match(block, /persist-credentials: false/);
     assert.match(block, /node-version: ['"]24['"]/);
     assert.match(block, /working-directory: \./);
-    for (const action of block.matchAll(/uses: (\S+)/g)) assert.match(action[1], /^(?:actions\/(?:checkout|setup-node|setup-java)|pnpm\/action-setup)@[a-f0-9]{40}$/);
+    assert.match(block, /uses: actions\/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd\b/);
+    assert.match(block, /uses: actions\/setup-node@a0853c24544627f65ddf259abe73b1d18a591444\b/);
+    for (const action of block.matchAll(/uses: (\S+)/g)) assert.match(action[1], /^(?:actions\/(?:checkout|setup-node|setup-java|cache)|pnpm\/action-setup)@[a-f0-9]{40}$/);
   }
+});
+
+test('every hosted Maven consumer restores only an exact wrapper distribution cache before execution', async () => {
+  const workflows = [
+    jobs(await readWorkflow()),
+    jobs(await readFile(new URL('../.github/workflows/owned-first-renewal-tests.yml', import.meta.url), 'utf8')),
+  ];
+  let consumers = 0;
+  for (const blocks of workflows) for (const [job, block] of Object.entries(blocks)) {
+    if (!block.includes('./mvnw')) continue;
+    consumers++;
+    const cache = block.split(/(?=^      - )/m).filter(step => step.includes('uses: actions/cache@'));
+    assert.equal(cache.length, 1, `${job}: exactly one wrapper cache`);
+    assert.match(cache[0], /uses: actions\/cache@5a3ec84eff668545956fd18022155c47e93e2684\b/);
+    assert.match(cache[0], /path: ~\/\.m2\/wrapper\/dists\n/);
+    assert.match(cache[0], /key: maven-wrapper-v1-\$\{\{ runner.os \}\}-\$\{\{ runner.arch \}\}-\$\{\{ hashFiles\('backend\/mvnw', 'backend\/\.mvn\/wrapper\/maven-wrapper.properties'\) \}\}/);
+    assert.doesNotMatch(cache[0], /restore-keys:|lookup-only:|save-always:|cache-hit|repository|settings.xml/);
+    assert.ok(block.indexOf(cache[0]) < block.indexOf('./mvnw'), `${job}: restore precedes Maven`);
+  }
+  assert.equal(consumers, 4);
+});
+
+// The emitted Maven invocations are our coverage boundary. Removing either
+// partition, widening its selection, losing the default nested-class exclusion,
+// or bypassing an absent explicit class must fail this configuration policy.
+// Actual Surefire discovery and execution remain hosted-only verification.
+test('backend partitions preserve default discovery and require the whole owned failed-renewal class', async () => {
+  const blocks = jobs(await readWorkflow());
+  const expected = {
+    backend: [earlyFailedRenewal, fullBackend],
+    'backend-owned-failed-renewal': ["./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test"],
+  };
+  for (const [job, commands] of Object.entries(expected)) {
+    const block = blocks[job];
+    assert.ok(block, `missing ${job} job`);
+    assert.deepEqual([...block.matchAll(/^\s+run: (\.\/mvnw[^\n]*)$/gm)].map(match => match[1]), commands, `${job}: exact Maven invocations required`);
+    assert.equal([...block.matchAll(/\.\/mvnw\b/g)].length, commands.length, `${job}: no additional Maven invocation`);
+    for (const command of commands) assert.ok(block.includes(`working-directory: backend\n        run: ${command}`), `${job}: run Maven in backend`);
+    assert.doesNotMatch(block, /^\s+(?:env|needs):|-D[^\s'"]*(?:skip|ignore|failIfNo(?:Specified)?Tests)|PAYMENT_STRIPE|secrets\./im);
+    assert.match(block, /uses: actions\/setup-java@dded0888837ed1f317902acf8a20df0ad188d165\b/);
+    assert.match(block, /distribution: temurin/);
+    assert.match(block, /java-version: ['"]25['"]/);
+    assert.match(block, /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
+    assert.match(block, /package-manager-cache: false/);
+    assert.equal([...block.matchAll(/run: node infrastructure\/init-local-customer-issuer\.mjs$/gm)].length, 1, `${job}: fresh local issuer preparation required`);
+  }
+  assert.doesNotMatch(blocks.backend.replace(earlyFailedRenewal, ''), /-Dtest=|-(?:P|D)(?:groups|excludedGroups|surefire\.includes)/);
+  assert.ok((await stat(new URL('../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java', import.meta.url))).isFile(), 'explicitly selected owned failed-renewal source must exist');
+});
+
+test('the hosted failed-renewal scenario runs immediately after issuer preparation and before full backend verification', async () => {
+  const block = jobs(await readWorkflow()).backend;
+  assert.ok(block.includes([
+    '      - name: Prepare local test issuer',
+    '        run: node infrastructure/init-local-customer-issuer.mjs',
+    '      - name: Verify failed-renewal scenario',
+    '        working-directory: backend',
+    `        run: ${earlyFailedRenewal}`,
+    '      - name: Verify backend',
+    '        working-directory: backend',
+    `        run: ${fullBackend}`,
+    '      - name: Verify dedicated first-payment runtime packaging without launching it',
+  ].join('\n')));
+  assert.ok((await stat(new URL('../backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFailedRenewalScenarioIntegrationTest.java', import.meta.url))).isFile());
+});
+
+// Dropping the owned launcher, using production java -jar, widening the test
+// classpath, omitting the mail owner, or selecting only a browser subset breaks
+// the real fixture contract checked here. These remain source policy checks;
+// only the hosted job proves YAML composition and runtime behavior.
+test('default Fake browser CI supplies the isolated business clock and complete fixture topology', async () => {
+  const block = jobs(await readWorkflow()).frontend;
+  assert.match(block, /java-version: ['"]25['"]/);
+  assert.match(block, /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
+  const overlay = await readFile(new URL('./compose.fake-e2e.yaml', import.meta.url), 'utf8').catch(error => { if (error.code === 'ENOENT') return ''; throw error; });
+  assert.match(overlay, /org\.springframework\.boot\.loader\.launch\.PropertiesLauncher/);
+  assert.match(overlay, /-Dloader\.main=dev\.genericpayments\.acceptance\.runtime\.OwnedSubscriptionRuntime/);
+  assert.match(overlay, /-Dloader\.path=\/app\/owned-runtime\//);
+  assert.match(overlay, /PAYMENT_STAGE4_TEST_RUNTIME: "true"/);
+  assert.match(overlay, /PAYMENT_CUSTOMER_EMAIL_OTP_RATE_LIMIT_SOURCE_IP_REQUESTS: "100"/);
+  assert.match(overlay, /127\.0\.0\.1:28081:28081/);
+  assert.match(overlay, /PAYMENT_FAKE_CI_RUNTIME[^\n]*:\/app\/owned-runtime:ro/);
+  assert.match(overlay, /PAYMENT_FAKE_CI_TIME[^\n]*:\/app\/task17-time-fake/);
+  assert.match(overlay, /PAYMENT_FAKE_CI_ISSUER[^\n]*:\/app\/local-fixtures\/customer-issuer-private\.jwks\.json:ro/);
+  assert.doesNotMatch(overlay, /target\/test-classes|PAYMENT_STRIPE|privileged|network_mode/);
+  assert.match(block, /const classes = \['OwnedSubscriptionRuntime\.class', 'OwnedSubscriptionRuntime\$1\.class', 'OwnedSubscriptionRuntime\$BusinessClock\.class'\]/);
+  assert.match(block, /org\/springframework\/boot\/loader\/launch\/PropertiesLauncher\.class/);
+  assert.match(block, /'infrastructure\/compose\.yaml', '-f', 'infrastructure\/compose\.local-user\.yaml', '-f', 'infrastructure\/compose\.fake-e2e\.yaml'/);
+  assert.match(block, /const services = \['postgres', 'mailpit', 'backend', 'admin'\]/);
+  assert.match(block, /'up', '--build', '-d', '--wait', '--wait-timeout', '180', \.\.\.services/);
+  assert.match(block, /env\.PAYMENT_E2E_MAILPIT_OWNER = owned\.get\('mailpit'\)/);
+  assert.match(block, /Authorization: 'Bearer ' \+ env\.PAYMENT_STAGE4_CONTROL_KEY/);
+  assert.match(block, /AbortSignal\.timeout\(2000\)/);
+  assert.match(block, /Date\.parse\(body\)/);
+  assert.match(block, /body\.length > 64/);
+  assert.doesNotMatch(block, /PAYMENT_E2E_DEMO_ORIGIN\s*[:=]|--grep|--project|test\.skip|runSmoke|stripe-sandbox-bootstrap|local-compose\.mjs|GITHUB_ENV/);
+});
+
+test('Fake CI uses fresh private inputs and stops only captured verified full IDs on every exit', async () => {
+  const block = jobs(await readWorkflow()).frontend;
+  assert.match(block, /mkdtempSync\(join\(process\.env\.RUNNER_TEMP, 'payment-fake-'\)\)/);
+  assert.match(block, /writeFileSync\(env\.PAYMENT_FAKE_CI_EMPTY_ENV, '', \{flag: 'wx', mode: 0o600\}\)/);
+  assert.match(block, /initializeLocalCustomerIssuer\(env\.PAYMENT_FAKE_CI_ISSUER\)/);
+  assert.match(block, /randomBytes\(32\)\.toString\('base64'\)/);
+  assert.match(block, /randomBytes\(32\)\.toString\('base64url'\)/);
+  assert.match(block, /encodeURIComponent\(env\.PAYMENT_DB_PASSWORD\)/);
+  assert.match(block, /\[25432, 28080, 28025, 21025, 23000, 28081, 4173\]/);
+  assert.match(block, /com\.docker\.compose\.project/);
+  assert.match(block, /com\.docker\.compose\.service/);
+  assert.match(block, /\^\[0-9a-f\]\{64\}\$/);
+  assert.match(block, /finally \{[\s\S]*capture\(\);[\s\S]*verify\(service, id\);[\s\S]*\['stop', '--time', '10', id\]/);
+  assert.match(block, /process\.exitCode = failure \? 1 : cleanupFailed \? 1 : 0/);
+  assert.doesNotMatch(block, /\b(?:down|prune|unlinkSync|rmSync)\b|--remove|docker[^\n]*\brm\b|target\/test-classes[^\n]*:\//);
+});
+
+test('Fake telemetry permits every current r0 browser fixture and no retry wildcard', async () => {
+  const block = jobs(await readWorkflow()).frontend;
+  const labels = (block.match(/const journeys = `([^`]+)`/)?.[1] ?? '').trim().split(/\s+/);
+  const expected = `success decline processing unknown failure reload recoverlogout recoverexpiry navigation customer expiry storage racecheckout raceconfirm racehistory racelogout racehistoryerror racelogouterror racebusy scope second pending admin unavailable config delivery donateanon donatecustomer donateinvalid donatemixed donaterevoked donatepolicy donaterace donateoutdraft donateoutintent donateoutok donateouterr adminrefund admincampaign adminredact sub-admin sub-admin-read sub-admin-dialog sub-portal sub-journey sub-locale sub-logout sub-customer-switch sub-disconnect`.split(' ');
+  assert.deepEqual(labels.toSorted(), expected.toSorted());
+  assert.match(block, /`t12-\$\{env\.PAYMENT_E2E_SITE_RUN\}-\$\{journey\}-r0-site`/);
+  const browser = await readFile(new URL('../examples/demo-site/playwright.config.ts', import.meta.url), 'utf8');
+  assert.match(browser, /reuseExistingServer: false/);
+  for (const ignored of ['stripe-sandbox.spec.ts', 'stripe-sandbox-remaining.spec.ts', 'form-load-diagnostic.spec.ts']) assert.ok(browser.includes(`"${ignored}"`));
+  for (const included of ['checkout.spec.ts', 'customer-access.spec.ts', 'subscriptions.spec.ts', 'subscription-session-lifecycle.spec.ts', 'admin-subscriptions.spec.ts']) assert.ok(!browser.includes(`"${included}"`));
 });
 
 test('each CI job runs its required gates in dependency order with frozen caches', async () => {
@@ -64,15 +224,17 @@ test('each CI job runs its required gates in dependency order with frozen caches
     assert.match(block, /docker version/);
     assert.match(block, /docker compose version/);
     assert.match(block, /docker buildx version/);
-    if (job !== 'backend') {
+    if (job === 'frontend' || job === 'infrastructure') {
       assert.ok(block.indexOf('pnpm/action-setup@') < block.indexOf('cache: pnpm'));
       assert.match(block, /version: ['"]11\.1\.3['"]/);
       assert.match(block, /cache-dependency-path: \|\n\s+frontend\/pnpm-lock.yaml\n\s+examples\/demo-site\/pnpm-lock.yaml/);
     }
   }
-  assert.match(blocks.backend, /java-version: ['"]25['"]/);
-  assert.match(blocks.backend, /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
-  assert.match(blocks.backend, /working-directory: backend/);
+  for (const job of ['backend', 'backend-owned-failed-renewal']) {
+    assert.match(blocks[job], /java-version: ['"]25['"]/);
+    assert.match(blocks[job], /cache: maven\n\s+cache-dependency-path: backend\/pom.xml/);
+    assert.match(blocks[job], /working-directory: backend/);
+  }
   assert.match(blocks.frontend, /NEXT_TELEMETRY_DISABLED: ['"]1['"]/);
   for (const command of [...(await readWorkflow()).matchAll(/^\s+(?:run: )?(pnpm .*install[^\n]*)/gm)]) {
     if (!command[1].includes('playwright install')) assert.match(command[1], /--frozen-lockfile/);

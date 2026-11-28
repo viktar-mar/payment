@@ -17,7 +17,7 @@ class SubscriptionFactsIntegrationTest extends SubscriptionFactFixture {
             if(method.getName().equals("find")&&firstRead.getAndSet(false))jdbc.update("update subscription_trial_eligibility set reserved_by_operation=null where reserved_by_operation=?",r.operationId());
             return result;
         });
-        var constructor=SubscriptionFactService.class.getConstructors()[0];var dependencies=Arrays.stream(constructor.getParameterTypes()).map(type->type==dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore.class?observed:context.getBean(type)).toArray();
+        var constructor=dev.genericpayments.platform.support.SubscriptionFactConstructors.ordinary();var dependencies=Arrays.stream(constructor.getParameterTypes()).map(type->type==dev.genericpayments.platform.subscriptions.application.port.out.TrialEligibilityStore.class?observed:context.getBean(type)).toArray();
         final SubscriptionFactService service;
         try{service=(SubscriptionFactService)constructor.newInstance(dependencies);}catch(ReflectiveOperationException exception){throw new AssertionError(exception);}
         assertThatThrownBy(()->tx.required(()->{service.apply(new ApplySubscriptionSnapshotUseCase.Command(account,r.subscriptionId(),snapshot,SubscriptionEvent.Source.RECONCILIATION,"stale-owner","test"));return null;})).isInstanceOf(IllegalArgumentException.class);

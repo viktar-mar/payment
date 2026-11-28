@@ -18,11 +18,22 @@ public class SubscriptionInteractionTransaction {
     private final SubscriptionStore subscriptions;private final SubscriptionAuthorityPort authority;
     private final SubscriptionPolicyPort policies;private final LockPaymentAccountPort accounts;
     private final SubscriptionActionStore actions;private final SubscriptionPortalStore portals;private final TrialEligibilityStore trials;
+    private final dev.genericpayments.platform.provider.application.port.out.StripeBillingClockSubscriptionStore confirmationAuthority;
     private final Clock clock;
+    @org.springframework.beans.factory.annotation.Autowired(required=false) @org.springframework.beans.factory.annotation.Qualifier("providerReferenceClock")
+    private Clock securityClock=Clock.systemUTC();
+    @org.springframework.beans.factory.annotation.Autowired(required=false)
+    private dev.genericpayments.platform.provider.application.port.out.StripePortalConfigurationPort portalProofs;
     public SubscriptionInteractionTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,SubscriptionActionStore actions,
         SubscriptionPortalStore portals,TrialEligibilityStore trials,Clock clock){
-        this.tx=tx;this.operations=operations;this.subscriptions=subscriptions;this.authority=authority;this.policies=policies;this.accounts=accounts;this.actions=actions;this.portals=portals;this.trials=trials;this.clock=clock;
+        this(tx,operations,subscriptions,authority,policies,accounts,actions,portals,trials,clock,null);
+    }
+    @org.springframework.beans.factory.annotation.Autowired
+    public SubscriptionInteractionTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
+        SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,SubscriptionActionStore actions,
+        SubscriptionPortalStore portals,TrialEligibilityStore trials,Clock clock,dev.genericpayments.platform.provider.application.port.out.StripeBillingClockSubscriptionStore confirmationAuthority){
+        this.confirmationAuthority=confirmationAuthority;this.tx=tx;this.operations=operations;this.subscriptions=subscriptions;this.authority=authority;this.policies=policies;this.accounts=accounts;this.actions=actions;this.portals=portals;this.trials=trials;this.clock=clock;
     }
     public record State(Subscription subscription,PaymentAccount account,SubscriptionPolicy policy,SubscriptionOperation operation,boolean owner) {}
     public void outside(){if(tx.active())throw new IllegalStateException("Provider workflow requires no ambient transaction");}
@@ -72,6 +83,9 @@ public class SubscriptionInteractionTransaction {
         return tx.requiresNew(()->{
             var now=clock.instant();var fresh=authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true);
             if(!fresh.subscription().nonTerminal()||!fresh.policy().enabled()||fresh.account().status()!=PaymentAccountStatus.ACTIVE)throw SubscriptionRuleErrors.conflict();
+            if(fresh.account().provider()==PaymentProviderType.STRIPE){
+                requireSame(r,fresh);var g=ordinaryBillingGrant(fresh,action.secret());if(!g.available(securityClock.instant())||!g.expiresAt().equals(action.expiresAt()))throw SubscriptionRuleErrors.conflict();return action;
+            }
             return issue(fresh,action,now);
         });
     }
@@ -80,38 +94,145 @@ public class SubscriptionInteractionTransaction {
         var expires=action.expiresAt().isBefore(now.plusSeconds(600))?action.expiresAt():now.plusSeconds(600);
         var o=r.operation();var s=r.subscription();var digest=digest(action.secret());
         actions.issue(s.siteId(),s.customerId(),s.paymentAccountId(),s.id(),o.id(),action.kind().name(),digest,expires);
-        if(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE||o.kind()==SubscriptionOperation.Kind.RESUME)
+        if(o.kind()==SubscriptionOperation.Kind.SETUP||o.kind()==SubscriptionOperation.Kind.CREATE||o.kind()==SubscriptionOperation.Kind.RESUME||o.kind()==SubscriptionOperation.Kind.CHANGE)
             actions.consent(digest,o.kind().name(),true,o.policyVersion(),o.createdAt());
         return new NextAction(action.kind(),action.secret(),expires);
     }
     public boolean replay(ConfirmSubscriptionActionUseCase.Command c){
         validateKey(c.context());validateToken(c.actionToken());
-        return tx.requiresNew(()->{authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true);return actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c));});
+        return tx.requiresNew(()->{ordinaryConfirmation(authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true));return actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c));});
     }
-    public void claim(ConfirmSubscriptionActionUseCase.Command c,State r,NextAction action){
-        translated(()->tx.requiresNew(()->{
+    public SubscriptionActionStore.ClaimDisposition claim(ConfirmSubscriptionActionUseCase.Command c,State r,NextAction action){
+        return translated(()->tx.requiresNew(()->{
             var fresh=authorized(c.context(),c.subscriptionId(),operations.lock(c.operationId()),true);
+            ordinaryConfirmation(fresh);
+            if(fresh.account().provider()==PaymentProviderType.STRIPE&&actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c)))return SubscriptionActionStore.ClaimDisposition.REPLAY;
             if(!fresh.subscription().nonTerminal()||!fresh.policy().enabled()||fresh.account().status()!=PaymentAccountStatus.ACTIVE)throw SubscriptionRuleErrors.conflict();
+            if(fresh.account().provider()==PaymentProviderType.STRIPE){
+                requireSame(r,fresh);var session=customer(c.context());var g=ordinaryBillingGrant(fresh,c.actionToken());
+                if(actions.serverConfirmationReserved(g.id())||!g.available(securityClock.instant())||!session.sessionId().value().equals(g.sessionId())||!session.origin().equals(g.origin())||g.clientExpiresAt()==null||!securityClock.instant().isBefore(g.clientExpiresAt()))throw SubscriptionRuleErrors.conflict();
+                return actions.claimBilling(c.context().siteId(),c.context().customerId(),fresh.account().id(),c.subscriptionId(),c.operationId(),digest(c.actionToken()),session.sessionId().value(),session.origin(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c),securityClock.instant());
+            }
             issue(fresh,action,clock.instant());
-            actions.claim(c.context().siteId(),c.context().customerId(),r.account().id(),c.subscriptionId(),c.operationId(),action.kind().name(),digest(c.actionToken()),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c),clock.instant());return null;
+            return actions.claim(c.context().siteId(),c.context().customerId(),r.account().id(),c.subscriptionId(),c.operationId(),action.kind().name(),digest(c.actionToken()),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c),clock.instant());
         }));
+    }
+    public SubscriptionClientGrant clientGrant(SubscriptionCommandContext c,State r,String token){
+        validateToken(token);return tx.requiresNew(()->{var fresh=authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true);requireSame(r,fresh);customer(c);return availableClientGrant(c,fresh,token);});
+    }
+    public SubscriptionClientSession clientIssued(SubscriptionCommandContext c,State r,SubscriptionClientGrant expected,String token,SubscriptionClientSession result){
+        return tx.requiresNew(()->{
+            var fresh=authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true);requireSame(r,fresh);var session=customer(c);var grant=availableClientGrant(c,fresh,token);
+            if(!grant.id().equals(expected.id())||!grant.binding().equals(expected.binding())||!"stripe".equals(result.provider())||result.flow()!=grant.binding().flow()||!token.equals(result.actionToken())||!result.expiresAt().equals(grant.expiresAt()))throw SubscriptionRuleErrors.conflict();
+            var expiry=grant.expiresAt().isBefore(session.expiresAt())?grant.expiresAt():session.expiresAt();
+            actions.bindSession(grant.tokenDigest(),session.sessionId().value(),session.origin(),expiry,securityClock.instant());
+            return new SubscriptionClientSession(result.provider(),result.flow(),result.publishableKey(),result.clientSecret(),token,expiry);
+        });
+    }
+    private SubscriptionClientGrant availableClientGrant(SubscriptionCommandContext c,State r,String token){
+        var session=customer(c);if(r.account().provider()!=PaymentProviderType.STRIPE||r.account().status()!=PaymentAccountStatus.ACTIVE||!r.policy().enabled()||!r.subscription().nonTerminal()||!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.SETUP,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE,SubscriptionOperation.Kind.RECOVER).contains(r.operation().kind())||r.operation().status()==SubscriptionOperation.Status.SUCCEEDED||r.operation().status()==SubscriptionOperation.Status.FAILED)throw SubscriptionRuleErrors.conflict();
+        var grant=ordinaryBillingGrant(r,token);if(actions.serverConfirmationReserved(grant.id())||!grant.available(securityClock.instant())||grant.sessionId()!=null&&(!session.sessionId().value().equals(grant.sessionId())||!session.origin().equals(grant.origin())))throw SubscriptionRuleErrors.conflict();return grant;
+    }
+    /** Shared operation/account/subscription lock order for v2 phases; never calls a provider. */
+    public <T>T confirmationLocked(SubscriptionCommandContext c,UUID id,UUID operation,java.util.function.Function<State,T> work){
+        return confirmationPhase(c,id,operation,null,work);
+    }
+    public <T>T confirmationLocked(SubscriptionCommandContext c,UUID id,UUID operation,dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt expected,java.util.function.Function<State,T> work){
+        return confirmationPhase(c,id,operation,Objects.requireNonNull(expected),work);
+    }
+    private <T>T confirmationPhase(SubscriptionCommandContext c,UUID id,UUID operation,dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt expected,java.util.function.Function<State,T> work){
+        outside();return translated(()->tx.requiresNew(()->{
+            var fresh=authorized(c,id,operations.lock(operation),true);customer(c);
+            if(!Set.of(SubscriptionOperation.Kind.CREATE,SubscriptionOperation.Kind.RESUME,SubscriptionOperation.Kind.CHANGE,SubscriptionOperation.Kind.RECOVER,SubscriptionOperation.Kind.SETUP).contains(fresh.operation().kind()))throw SubscriptionRuleErrors.conflict();
+            if(fresh.account().provider()!=PaymentProviderType.STRIPE||fresh.account().status()!=PaymentAccountStatus.ACTIVE||!fresh.policy().enabled()||!fresh.subscription().nonTerminal()
+              ||fresh.policy().version()!=fresh.operation().policyVersion()||fresh.operation().status()==SubscriptionOperation.Status.SUCCEEDED||fresh.operation().status()==SubscriptionOperation.Status.FAILED||!recoveryPolicyCurrent(fresh))throw SubscriptionRuleErrors.conflict();
+            if(confirmationAuthority==null)throw SubscriptionRuleErrors.conflict();
+            if(expected==null)ordinaryConfirmation(fresh);else confirmationAuthority.requireConfirmationReceipt(expected,fresh.account(),fresh.subscription(),fresh.operation());
+            return work.apply(fresh);
+        }));
+    }
+    private void ordinaryConfirmation(State state){
+        if(state.account().provider()!=PaymentProviderType.STRIPE)return;
+        if(confirmationAuthority==null)throw SubscriptionRuleErrors.conflict();
+        confirmationAuthority.requireOrdinaryConfirmation(state.account().id(),state.subscription().siteId(),state.subscription().customerId());
+    }
+    private SubscriptionClientGrant ordinaryBillingGrant(State state,String token){
+        ordinaryConfirmation(state);var grant=billingGrant(state,token);
+        if(grant.binding().ownedIntent()!=null||"owned-initial-v1".equals(grant.binding().schema()))throw SubscriptionRuleErrors.conflict();return grant;
+    }
+    SubscriptionClientGrant confirmationRoot(State state,String token){return billingGrant(state,token);}
+    private SubscriptionClientGrant billingGrant(State r,String token){
+        if(token==null||!token.matches("bga1_[A-Za-z0-9_-]{43}"))throw SubscriptionRuleErrors.conflict();
+        var g=actions.billing(digest(token)).orElseThrow(SubscriptionRuleErrors::conflict);
+        if(!g.account().equals(r.account().id())||!g.site().equals(r.subscription().siteId())||!g.customer().equals(r.subscription().customerId())||!g.subscription().equals(r.subscription().id())||!g.operation().equals(r.operation().id())
+            ||!java.security.MessageDigest.isEqual(g.tokenDigest().getBytes(java.nio.charset.StandardCharsets.US_ASCII),digest(token).getBytes(java.nio.charset.StandardCharsets.US_ASCII)))throw SubscriptionRuleErrors.conflict();
+        if(r.operation().kind()==SubscriptionOperation.Kind.CHANGE&&(!g.binding().schema().equals("change-v1")||r.subscription().pendingChange()==null||!r.subscription().pendingChange().operationId().equals(r.operation().id())))throw SubscriptionRuleErrors.conflict();
+        if(r.operation().kind()==SubscriptionOperation.Kind.RECOVER&&(!recoveryPolicyCurrent(r)||!g.binding().schema().equals("recovery-v1")||r.subscription().debt()==null||!SubscriptionRecoveryTransaction.recoveryBill(r.operation()).filter(r.subscription().debt().billingRecordId()::equals).isPresent()))throw SubscriptionRuleErrors.conflict();
+        return g;
+    }
+    private dev.genericpayments.platform.customers.application.model.CustomerSessionContext customer(SubscriptionCommandContext c){
+        if(!(c.actor() instanceof SubscriptionActor.Customer actor)||!securityClock.instant().isBefore(actor.session().expiresAt()))throw SubscriptionRuleErrors.conflict();
+        actor.session().requireScope(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE);return actor.session();
+    }
+    private static void requireSame(State before,State after){if(!before.account().equals(after.account())||before.subscription().revision()!=after.subscription().revision()||before.operation().version()!=after.operation().version())throw SubscriptionRuleErrors.conflict();}
+    private static boolean recoveryPolicyCurrent(State r){return r.operation().kind()!=SubscriptionOperation.Kind.RECOVER||r.policy().enabled()&&r.policy().version()==r.operation().policyVersion();}
+    public boolean browserConfirmationAllowed(ConfirmSubscriptionActionUseCase.Command c,State r){
+        return tx.requiresNew(()->{
+            var fresh=authorized(c.context(),r.subscription().id(),operations.lock(r.operation().id()),true);
+            if(!recoveryPolicyCurrent(fresh))return false;
+            var session=customer(c.context());var now=securityClock.instant();var grant=ordinaryBillingGrant(fresh,c.actionToken());
+            // Reply persistence changes the operation version. The immutable consumed receipt remains the authority.
+            return fresh.account().provider()==PaymentProviderType.STRIPE&&fresh.account().status()==PaymentAccountStatus.ACTIVE
+                &&fresh.policy().enabled()&&fresh.subscription().nonTerminal()&&fresh.operation().status()==SubscriptionOperation.Status.PROCESSING
+                &&!actions.serverConfirmationReserved(grant.id())&&grant.consumedAt()!=null&&grant.supersededAt()==null&&now.isBefore(grant.expiresAt())
+                &&session.sessionId().value().equals(grant.sessionId())&&session.origin().equals(grant.origin())
+                &&grant.clientExpiresAt()!=null&&now.isBefore(grant.clientExpiresAt())
+                &&actions.replay(c.context().siteId(),principal(c.context()),digest(c.context().idempotencyKey()),confirmationFingerprint(c));
+        });
     }
     public SubscriptionOperationResult reply(SubscriptionCommandContext c,State r,Reply reply){
         return tx.requiresNew(()->{
             var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);
+            if(fresh.account().provider()==PaymentProviderType.STRIPE)customer(c);
             if(reply.reference()!=null&&!reply.reference().equals(fresh.subscription().providerReference()))throw SubscriptionRuleErrors.conflict();
-            if(o.status()==SubscriptionOperation.Status.SUCCEEDED)return result(o,null);
-            // Receipts never grant success or entitlement. A continuing failed CREATE may become pending again.
+            if(o.status()==SubscriptionOperation.Status.SUCCEEDED||fresh.account().provider()==PaymentProviderType.STRIPE&&o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);
+            // Receipts never grant success or entitlement. Preserve existing Fake CREATE continuation.
             var status=switch(reply.outcome()){case ACCEPTED,DECLINED->SubscriptionOperation.Status.PROCESSING;case REQUIRES_ACTION->SubscriptionOperation.Status.REQUIRES_ACTION;case UNKNOWN->SubscriptionOperation.Status.UNKNOWN;};
             var saved=save(o,status);var action=reply.action()==null?null:issue(new State(fresh.subscription(),fresh.account(),fresh.policy(),saved,false),reply.action(),clock.instant());
             return result(saved,action);
         });
     }
+    public SubscriptionOperationResult replyPreparedSetup(SubscriptionCommandContext c,State r,String token,OwnedSetupReceipt receipt){
+        return tx.requiresNew(()->{
+            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);customer(c);var grant=ordinaryBillingGrant(fresh,token);
+            if(o.kind()!=SubscriptionOperation.Kind.CREATE||fresh.subscription().providerReference()!=null||grant.binding().flow()!=SubscriptionClientSession.Flow.SETUP||grant.binding().subscriptionReference()!=null||grant.consumedAt()==null
+                ||receipt!=null&&(!receipt.operationId().equals(o.id())||!receipt.stepId().equals(grant.binding().stepId())||!receipt.setupReference().equals(grant.binding().setupReference())))throw SubscriptionRuleErrors.conflict();
+            if(o.status()==SubscriptionOperation.Status.SUCCEEDED||o.status()==SubscriptionOperation.Status.FAILED)return result(o,null);
+            return result(save(o,SubscriptionOperation.Status.PROCESSING),null);
+        });
+    }
+    public void beforePortal(SubscriptionCommandContext c,State r,String url){
+        tx.requiresNew(()->{requirePortal(r,authorized(c,r.subscription().id(),operations.lock(r.operation().id()),true),url);return null;});
+    }
+    private static void requirePortal(State expected,State fresh,String url){
+        SubscriptionPortalService.requireAllowedReturn(fresh.policy(),url);
+        if(!fresh.account().equals(expected.account())||fresh.account().status()!=PaymentAccountStatus.ACTIVE
+            ||!fresh.subscription().nonTerminal()||fresh.subscription().revision()!=expected.subscription().revision()
+            ||fresh.subscription().revision()!=fresh.operation().expectedRevision()||fresh.policy().version()!=fresh.operation().policyVersion()
+            ||fresh.operation().kind()!=SubscriptionOperation.Kind.PORTAL||!fresh.operation().equals(expected.operation()))throw SubscriptionRuleErrors.conflict();
+    }
     public PortalNavigation portal(SubscriptionCommandContext c,State r,PortalNavigation navigation,String url){
         return tx.requiresNew(()->{
-            var o=operations.lock(r.operation().id());var fresh=authorized(c,r.subscription().id(),o,true);
-            SubscriptionPortalService.requireAllowedReturn(fresh.policy(),url);
-            if(!navigation.simulated()||!navigation.expiresAt().isAfter(clock.instant()))throw SubscriptionRuleErrors.conflict();
+            var o=operations.lock(r.operation().id());
+            if(navigation==null)throw SubscriptionRuleErrors.conflict();
+            if(r.account().provider()==PaymentProviderType.STRIPE){
+                if(navigation.simulated()||portalProofs==null||!dev.genericpayments.platform.provider.application.model.StripePortalNavigationUrl.valid(navigation.navigationUrl()))throw SubscriptionRuleErrors.conflict();
+                // Proof locks Site/Customer before Account/lifecycle, in the same publication transaction.
+                portalProofs.requirePublication(r.account(),r.subscription(),o,url,navigation.expiresAt());
+            }else if(!navigation.simulated())throw SubscriptionRuleErrors.conflict();
+            var fresh=authorized(c,r.subscription().id(),o,true);
+            requirePortal(r,fresh,url);
+            if(!navigation.expiresAt().isAfter(r.account().provider()==PaymentProviderType.STRIPE?securityClock.instant():clock.instant()))throw SubscriptionRuleErrors.conflict();
             portals.save(c.siteId(),c.customerId(),r.subscription().id(),o.id(),navigation.expiresAt());
             if(o.status()!=SubscriptionOperation.Status.SUCCEEDED)save(o,SubscriptionOperation.Status.SUCCEEDED);
             return navigation;
@@ -122,7 +243,7 @@ public class SubscriptionInteractionTransaction {
     }
     private SubscriptionOperation save(SubscriptionOperation o,SubscriptionOperation.Status status){return operations.save(new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),status,o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt(),clock.instant(),o.version()+1),o.version());}
     public static SubscriptionOperationResult result(SubscriptionOperation o,NextAction action){return new SubscriptionOperationResult(o.id(),o.subscriptionId(),o.status(),action);}
-    public static Command command(State r){var o=r.operation();return new Command(r.account(),o,r.subscription().billingPrice(),null,r.subscription().providerReference(),null,null,true,o.kind()==SubscriptionOperation.Kind.CREATE&&CreateSubscriptionFingerprint.startsTrial(o.fingerprint()));}
+    public static Command command(State r){var o=r.operation();return new Command(r.account(),o,r.subscription().billingPrice(),null,r.subscription().providerReference(),null,null,o.kind()!=SubscriptionOperation.Kind.PORTAL,o.kind()==SubscriptionOperation.Kind.CREATE&&CreateSubscriptionFingerprint.startsTrial(o.fingerprint()));}
     public static String request(SubscriptionCommandContext c,Object... fields){var b=new StringBuilder();var values=new ArrayList<Object>(Arrays.asList(principal(c),c.siteId(),c.customerId(),c.origin()));values.addAll(Arrays.asList(fields));for(var v:values){var s=String.valueOf(v);b.append(s.length()).append(':').append(s);}return digest(b.toString());}
     private static String confirmationFingerprint(ConfirmSubscriptionActionUseCase.Command c){return request(c.context(),"CONFIRM",c.subscriptionId(),c.operationId(),digest(c.actionToken()));}
     static String digest(String s){return CreateSubscriptionFingerprint.digest(s);}

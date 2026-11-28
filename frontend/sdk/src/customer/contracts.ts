@@ -43,7 +43,7 @@ export interface CustomerClient {
 }
 export type RequestCapability = { kind: "none" } | { kind: "checkout"; token: string } | { kind: "customer"; token: string };
 export type ResponseRule = (status: number, data: unknown) => boolean;
-export type CustomerRequest = (path: string, method: "GET" | "POST" | "DELETE", body?: object, capability?: RequestCapability, idempotency?: string, signal?: AbortSignal, statuses?: readonly number[], cap?: number, rule?: ResponseRule) => Promise<unknown>;
+export type CustomerRequest = (path: string, method: "GET" | "POST" | "DELETE", body?: object, capability?: RequestCapability, idempotency?: string, signal?: AbortSignal, statuses?: readonly number[], cap?: number, rule?: ResponseRule, parseSuccess?: (raw: string) => unknown) => Promise<unknown>;
 const scopes = ["CUSTOMER_READ", "CHECKOUT_CREATE", "IDENTITY_LINK", "SUBSCRIPTION_READ", "SUBSCRIPTION_MANAGE"] as const;
 export function browserOrigin(): string {
   try { const origin = globalThis.location.origin; const url = new URL(origin); if (origin === "null" || !["http:", "https:"].includes(url.protocol) || url.origin !== origin) throw 0; return origin; }

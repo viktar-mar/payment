@@ -108,6 +108,68 @@ public class ProviderInboxPersistenceAdapter implements ProviderInboxPort {
         return liveReference(claim).map(ReferenceRow::receipt);
     }
 
+    // Identity only: immutable V16/V20 context, original Account, committed root mapping.
+    // No lifecycle/payment locks: facts acquire those before writing the inbox, so reversing
+    // that lock order here would introduce a deadlock. A later claim may see uncommitted proof.
+    private static final String BILLING_PAYMENT_CANDIDATES="""
+        select s.provider_reference as reference
+        from subscription_provider_objects o
+        join payments p on p.id=o.payment_id and p.site_id=o.site_id
+          and p.subscription_id=o.subscription_id and p.payment_account_id=o.payment_account_id
+          and p.billing_record_id=o.billing_record_id and p.provider_payment_reference=o.provider_reference
+          and p.source='SUBSCRIPTION'
+        join subscription_billing_records b on b.id=o.billing_record_id and b.site_id=o.site_id
+          and b.subscription_id=o.subscription_id and b.payment_account_id=o.payment_account_id
+          and b.product_id=p.subscription_product_id and b.kind=p.subscription_billing_kind
+          and b.billed_price_id=p.subscription_price_id and b.billed_price_version=p.subscription_price_version
+          and b.previous_price_id is not distinct from p.subscription_previous_price_id
+          and b.previous_price_version is not distinct from p.subscription_previous_price_version
+          and b.period_start=p.subscription_period_start and b.period_end=p.subscription_period_end
+          and b.provider_invoice_reference=p.subscription_invoice_reference
+          and b.currency=p.currency and b.billed_tax_mode=p.tax_mode and b.amount_due_minor>=p.amount_minor
+        join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id
+          and s.payment_account_id=o.payment_account_id and s.customer_id=p.customer_id
+          and s.product_id=b.product_id and s.product_id=p.subscription_product_id
+        join payment_accounts a on a.id=o.payment_account_id and a.provider='STRIPE' and a.account_mode='SANDBOX'
+        join subscription_provider_objects root on root.provider_type=o.provider_type
+          and root.payment_account_id=o.payment_account_id and root.site_id=o.site_id
+          and root.subscription_id=o.subscription_id and root.object_type='SUBSCRIPTION'
+          and root.provider_reference=s.provider_reference
+        where o.provider_type='STRIPE' and o.payment_account_id=? and o.object_type='PAYMENT'
+          and o.provider_reference=? and o.payment_id is not null and o.billing_record_id is not null
+          and s.provider_reference ~ '^sub_[A-Za-z0-9]{1,251}$'
+        limit 2
+        """;
+
+    @Override @Transactional(propagation=Propagation.REQUIRES_NEW)
+    public boolean promoteBillingPaymentReference(Claim claim,ProviderReferenceReceipt expected) {
+        Objects.requireNonNull(claim);Objects.requireNonNull(expected);
+        if(expected.provider()!=PaymentProviderType.STRIPE||expected.objectType()!=ProviderReferenceReceipt.ObjectType.PAYMENT)return false;
+        var row=liveReference(claim).orElseThrow(()->new IllegalStateException("CLAIM_LOST"));
+        if(!row.receipt().equals(expected)||row.attempts()<1||row.attempts()>12)throw new IllegalStateException("CLAIM_LOST");
+        var candidates=jdbc.query(BILLING_PAYMENT_CANDIDATES,(r,n)->r.getString("reference"),expected.accountId().value(),expected.objectId());
+        Instant now=referenceClock.instant();
+        if(!row.expires().isAfter(now))throw new IllegalStateException("CLAIM_LOST");
+        if(candidates.size()!=1)return false;
+        int changed=jdbc.update("with candidates as ("+BILLING_PAYMENT_CANDIDATES+"""
+            ), owned as (select min(reference) as reference from candidates having count(*)=1)
+            update provider_inbox i set event_family='SUBSCRIPTION',event_type='SUBSCRIPTION_CHANGED',
+              provider_object_id=owned.reference,reference_object_type=null,provider_event_type=null,provider_api_version=null,
+              status='PENDING',lease_owner=null,lease_expires_at=null,error_category=null,next_attempt_at=i.received_at
+            from owned where i.id=? and i.event_family='PROVIDER_REFERENCE' and i.status='PROCESSING'
+              and i.lease_owner=? and i.lease_expires_at>? and i.attempt_count between 1 and 12
+              and i.provider_type='STRIPE' and i.reference_object_type='PAYMENT' and i.payment_account_id=?
+              and i.provider_event_id=? and i.provider_object_id=? and i.provider_event_type=?
+              and i.provider_api_version=? and i.occurred_at=? and i.received_at=? and owned.reference=?
+            """,expected.accountId().value(),expected.objectId(),claim.id(),claim.owner(),Timestamp.from(now),
+            expected.accountId().value(),expected.eventId(),expected.objectId(),expected.providerEventType(),expected.apiVersion(),
+            Timestamp.from(expected.occurredAt()),Timestamp.from(expected.receivedAt()),candidates.getFirst());
+        // Preserve the original admission hash, timestamps, safe payload and cumulative attempts.
+        // Crossing the original expiry after UPDATE must roll the independent transaction back.
+        if(changed!=1||!row.expires().isAfter(referenceClock.instant()))throw new IllegalStateException("CLAIM_LOST");
+        return true;
+    }
+
     @Override @Transactional(propagation=Propagation.MANDATORY)
     public ProviderReferenceReceipt lockReference(Claim claim) {
         return liveReference(claim).orElseThrow(() -> new IllegalStateException("CLAIM_LOST")).receipt();

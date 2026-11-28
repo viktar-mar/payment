@@ -19,7 +19,7 @@ defaults:
 jobs:
   backend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: .
@@ -37,6 +37,11 @@ jobs:
           java-version: '25'
           cache: maven
           cache-dependency-path: backend/pom.xml
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('backend/mvnw', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
       - name: Check owned-test container tooling
         run: |
           docker version
@@ -44,13 +49,118 @@ jobs:
           docker buildx version
       - name: Prepare local test issuer
         run: node infrastructure/init-local-customer-issuer.mjs
+      - name: Verify failed-renewal scenario
+        working-directory: backend
+        run: ./mvnw -B -ntp '-Dtest=dev.genericpayments.acceptance.runtime.OwnedBillingFailedRenewalScenarioIntegrationTest' test
       - name: Verify backend
         working-directory: backend
-        run: ./mvnw -B -ntp verify
+        run: ./mvnw -B -ntp '-Dsurefire.excludes=**/*$*,dev/genericpayments/platform/provider/adapter/out/persistence/OwnedFailedRenewalIntegrationTest.java' verify
+      - name: Verify dedicated first-payment runtime packaging without launching it
+        run: |
+          set -euo pipefail
+          packaging_root=$(mktemp -d)
+          trap 'rm -rf "$packaging_root"' EXIT
+          sh backend/export-billing-first-payment-runtime.sh backend/target/test-classes "$packaging_root/runtime"
+          backend_jar=$(realpath backend/target/payment-platform-backend-*.jar)
+          jar tf "$backend_jar" > "$packaging_root/entries.txt"
+          if grep -Eq 'OwnedBillingFirstPayment|OwnedSubscriptionBillingTime|org/junit/|org/mockito/|org/testcontainers/' "$packaging_root/entries.txt"; then
+            echo 'first_payment_production_jar_isolation_failed'
+            exit 1
+          fi
+          (cd "$packaging_root" && jar xf "$backend_jar" BOOT-INF/lib)
+          jdeps --multi-release 25 --ignore-missing-deps -verbose:class -filter:none \
+            --class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*" \
+            "$packaging_root/runtime" > "$packaging_root/dependencies.txt"
+          if grep -Eq 'not found|org\.junit|org\.mockito|org\.testcontainers|org\.springframework\.test|org\.springframework\.boot\.test' "$packaging_root/dependencies.txt"; then
+            echo 'first_payment_runtime_dependency_closure_failed'
+            cat "$packaging_root/dependencies.txt"
+            exit 1
+          fi
+          echo 'first_payment_runtime_packaging_verified_without_launch'
+      - name: Verify dedicated first-renewal runtime packaging without launching it
+        run: |
+          set -euo pipefail
+          packaging_root=$(mktemp -d)
+          trap 'rm -rf "$packaging_root"' EXIT
+          sh backend/export-billing-first-renewal-runtime.sh backend/target/test-classes "$packaging_root/runtime"
+          backend_jar=$(realpath backend/target/payment-platform-backend-*.jar)
+          jar tf "$backend_jar" > "$packaging_root/entries.txt"
+          if grep -Eq 'OwnedBillingFirstPayment|OwnedBillingFirstRenewal|OwnedSubscriptionBillingTime|OwnedFirstRenewalBillingTime|org/junit/|org/mockito/|org/testcontainers/' "$packaging_root/entries.txt"; then
+            echo 'first_renewal_production_jar_isolation_failed'
+            exit 1
+          fi
+          (cd "$packaging_root" && jar xf "$backend_jar" BOOT-INF/lib)
+          jdeps --multi-release 25 --ignore-missing-deps -verbose:class -filter:none \
+            --class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*" \
+            "$packaging_root/runtime" > "$packaging_root/dependencies.txt"
+          if grep -Eq 'not found|org\.junit|org\.mockito|org\.testcontainers|org\.springframework\.test|org\.springframework\.boot\.test' "$packaging_root/dependencies.txt"; then
+            echo 'first_renewal_runtime_dependency_closure_failed'
+            cat "$packaging_root/dependencies.txt"
+            exit 1
+          fi
+          echo 'first_renewal_runtime_packaging_verified_without_launch'
+      - name: Verify dedicated failed-renewal runtime packaging without launching it
+        run: |
+          set -euo pipefail
+          packaging_root=$(mktemp -d)
+          trap 'rm -rf "$packaging_root"' EXIT
+          sh backend/export-billing-failed-renewal-runtime.sh "$PWD/backend/target/test-classes" "$packaging_root/runtime"
+          backend_jar=$(realpath backend/target/payment-platform-backend-*.jar)
+          jar tf "$backend_jar" > "$packaging_root/entries.txt"
+          if grep -Eq 'OwnedBillingFirstPayment|OwnedBillingFailedRenewal|FailureArmEvidence|OwnedSubscriptionBillingTime|OwnedFirstRenewalBillingTime|OwnedFailedRenewalBillingTime|OwnedFailedGraceBillingTime|OwnedGraceSubscriptionRows|/platform/support/TestClock|org/junit/|org/mockito/|org/testcontainers/|org/springframework/(boot/)?test/|BOOT-INF/lib/(junit|mockito|testcontainers|spring-test-|spring-boot-test-)' "$packaging_root/entries.txt"; then
+            echo 'failed_renewal_production_jar_isolation_failed'
+            exit 1
+          fi
+          (cd "$packaging_root" && jar xf "$backend_jar" BOOT-INF/lib)
+          jdeps --multi-release 25 --ignore-missing-deps -verbose:class -filter:none \
+            --class-path "backend/target/classes:$packaging_root/BOOT-INF/lib/*" \
+            "$packaging_root/runtime" > "$packaging_root/dependencies.txt"
+          if grep -Eq 'not found|org\.junit|org\.mockito|org\.testcontainers|org\.springframework\.test|org\.springframework\.boot\.test' "$packaging_root/dependencies.txt"; then
+            echo 'failed_renewal_runtime_dependency_closure_failed'
+            cat "$packaging_root/dependencies.txt"
+            exit 1
+          fi
+          echo 'failed_renewal_runtime_packaging_verified_without_launch'
+
+  backend-owned-failed-renewal:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('backend/mvnw', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
+      - name: Check owned-test container tooling
+        run: |
+          docker version
+          docker compose version
+          docker buildx version
+      - name: Prepare local test issuer
+        run: node infrastructure/init-local-customer-issuer.mjs
+      - name: Verify owned failed-renewal backend
+        working-directory: backend
+        run: ./mvnw -B -ntp '-Dtest=dev.genericpayments.platform.provider.adapter.out.persistence.OwnedFailedRenewalIntegrationTest' test
 
   frontend:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: .
@@ -69,6 +179,17 @@ jobs:
           cache-dependency-path: |
             frontend/pnpm-lock.yaml
             examples/demo-site/pnpm-lock.yaml
+      - uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+          cache-dependency-path: backend/pom.xml
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('backend/mvnw', 'backend/.mvn/wrapper/maven-wrapper.properties') }}
       - name: Check owned-test container tooling
         run: |
           docker version
@@ -93,14 +214,152 @@ jobs:
         run: pnpm --dir examples/demo-site install --frozen-lockfile
       - name: Verify demo return handling and build
         run: |
-          pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/vite-return-privacy.test.ts
+          pnpm --dir examples/demo-site exec vitest run src/payment-return.test.ts src/subscription-return.test.ts src/vite-return-privacy.test.ts
           pnpm --dir examples/demo-site build
       - name: Install offline browser
         run: pnpm --dir examples/demo-site exec playwright install --with-deps chromium
       - name: Verify synthetic native Node support fixtures
-        run: node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts
+        run: node --test --test-timeout=60000 --test-concurrency=1 examples/demo-site/tests/support/*.test.ts examples/demo-site/scripts/profile*.test.mjs
       - name: Verify built offline return privacy with Chromium
         run: pnpm --dir examples/demo-site exec playwright test --config playwright.offline.config.ts --workers=1 --retries=0
+      - name: Verify default Fake browser journeys in a fresh owned environment
+        run: |
+          set +x
+          node --input-type=module <<'NODE'
+          import {randomBytes, randomUUID} from 'node:crypto';
+          import {chmodSync, copyFileSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync} from 'node:fs';
+          import {join} from 'node:path';
+          import {createServer} from 'node:net';
+          import {spawnSync} from 'node:child_process';
+          import {initializeLocalCustomerIssuer} from './infrastructure/init-local-customer-issuer.mjs';
+
+          // Pass only tool locations and fresh inputs; never inherit local/provider keys.
+          const env = Object.fromEntries(['PATH', 'HOME', 'JAVA_HOME', 'PNPM_HOME', 'RUNNER_TEMP', 'TMPDIR', 'CI'].filter(key => process.env[key]).map(key => [key, process.env[key]]));
+          env.CI = 'true';
+          const run = (command, args, options = {}) => {
+            const result = spawnSync(command, args, {env, timeout: 30000, maxBuffer: 1048576, encoding: 'utf8', stdio: 'pipe', ...options});
+            if (result.error || result.status !== 0) throw new Error(`Hosted Fake CI command failed: ${command}`);
+            return result.stdout?.trim() ?? '';
+          };
+          const root = mkdtempSync(join(process.env.RUNNER_TEMP, 'payment-fake-'));
+          chmodSync(root, 0o700);
+          Object.assign(env, {
+            PAYMENT_FAKE_CI_RUNTIME: join(root, 'runtime'), PAYMENT_FAKE_CI_TIME: join(root, 'task17-time-fake'),
+            PAYMENT_FAKE_CI_ISSUER: join(root, 'customer-issuer-private.jwks.json'), PAYMENT_FAKE_CI_EMPTY_ENV: join(root, 'empty.env'),
+            PAYMENT_E2E_COMPOSE_PROJECT: 'task17-ci-' + randomUUID(), PAYMENT_E2E_SITE_RUN: randomBytes(6).toString('hex'),
+            PAYMENT_POSTGRES_HOST_PORT: '25432', PAYMENT_BACKEND_HOST_PORT: '28080', PAYMENT_MAILPIT_HOST_PORT: '28025',
+            PAYMENT_MAILPIT_SMTP_HOST_PORT: '21025', PAYMENT_ADMIN_HOST_PORT: '23000', PAYMENT_FAKE_AUTO_SUCCESS: 'false',
+            PAYMENT_E2E_BACKEND_URL: 'http://127.0.0.1:28080', PAYMENT_E2E_ADMIN_URL: 'http://127.0.0.1:23000',
+            PAYMENT_E2E_MAILPIT_URL: 'http://127.0.0.1:28025', PAYMENT_STAGE4_CONTROL_URL: 'http://127.0.0.1:28081/time',
+          });
+          for (const key of ['PAYMENT_DATA_ENCRYPTION_KEY', 'PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY', 'PAYMENT_CUSTOMER_DIGEST_KEY_V1', 'PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1']) env[key] = randomBytes(32).toString('base64');
+          for (const key of ['PAYMENT_DB_PASSWORD', 'PAYMENT_ADMIN_BOOTSTRAP_PASSWORD', 'PAYMENT_STAGE4_CONTROL_KEY']) env[key] = randomBytes(32).toString('base64url');
+          env.PAYMENT_ADMIN_BOOTSTRAP_USERNAME = 'ci-' + randomBytes(8).toString('hex');
+          env.PAYMENT_E2E_ADMIN_USERNAME = env.PAYMENT_ADMIN_BOOTSTRAP_USERNAME;
+          env.PAYMENT_E2E_ADMIN_PASSWORD = env.PAYMENT_ADMIN_BOOTSTRAP_PASSWORD;
+          env.PAYMENT_E2E_DATABASE_URL = `postgres://payment:${encodeURIComponent(env.PAYMENT_DB_PASSWORD)}@127.0.0.1:25432/payment`;
+          env.PAYMENT_LOCAL_UID = run('id', ['-u']); env.PAYMENT_LOCAL_GID = run('id', ['-g']);
+          if (!/^[1-9][0-9]*$/.test(env.PAYMENT_LOCAL_UID) || !/^[1-9][0-9]*$/.test(env.PAYMENT_LOCAL_GID)) throw new Error('Non-root runner required');
+          const journeys = `success decline processing unknown failure reload
+          recoverlogout recoverexpiry navigation customer expiry storage
+          racecheckout raceconfirm racehistory racelogout racehistoryerror racelogouterror racebusy
+          scope second pending admin unavailable config delivery
+          donateanon donatecustomer donateinvalid donatemixed donaterevoked donatepolicy donaterace
+          donateoutdraft donateoutintent donateoutok donateouterr adminrefund admincampaign adminredact
+          sub-admin sub-admin-read sub-admin-dialog sub-portal sub-journey sub-locale
+          sub-logout sub-customer-switch sub-disconnect`;
+          env.PAYMENT_TELEMETRY_SITEKEYS = journeys.trim().split(/\s+/).map(journey => `t12-${env.PAYMENT_E2E_SITE_RUN}-${journey}-r0-site`).join(',');
+          writeFileSync(env.PAYMENT_FAKE_CI_EMPTY_ENV, '', {flag: 'wx', mode: 0o600});
+          mkdirSync(env.PAYMENT_FAKE_CI_TIME, {mode: 0o700});
+          initializeLocalCustomerIssuer(env.PAYMENT_FAKE_CI_ISSUER);
+
+          for (const port of [25432, 28080, 28025, 21025, 23000, 28081, 4173]) {
+            await new Promise((resolve, reject) => {
+              const server = createServer();
+              server.once('error', () => reject(new Error('Hosted Fake CI port already occupied')));
+              server.listen({host: '127.0.0.1', port, exclusive: true}, () => server.close(resolve));
+            });
+          }
+          const project = env.PAYMENT_E2E_COMPOSE_PROJECT;
+          for (const args of [
+            ['ps', '-aq', '--filter', `label=com.docker.compose.project=${project}`],
+            ['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+            ['network', 'ls', '-q', '--filter', `label=com.docker.compose.project=${project}`],
+          ]) if (run('docker', args)) throw new Error('Fresh Compose project required');
+          run('./mvnw', ['-B', '-ntp', '-DskipTests', 'package'], {cwd: 'backend', timeout: 600000, stdio: 'inherit'});
+          const jar = run('jar', ['tf', 'backend/target/payment-platform-backend-0.1.0-SNAPSHOT.jar']);
+          if (!jar.split('\n').includes('org/springframework/boot/loader/launch/PropertiesLauncher.class')) throw new Error('Boot PropertiesLauncher missing');
+          const packagePath = 'dev/genericpayments/acceptance/runtime';
+          const classes = ['OwnedSubscriptionRuntime.class', 'OwnedSubscriptionRuntime$1.class', 'OwnedSubscriptionRuntime$BusinessClock.class'];
+          const compiled = readdirSync(join('backend/target/test-classes', packagePath)).filter(name => /^OwnedSubscriptionRuntime(?:\$.*)?\.class$/.test(name)).sort();
+          if (JSON.stringify(compiled) !== JSON.stringify([...classes].sort())) throw new Error('Owned launcher class tree changed');
+          const destination = join(env.PAYMENT_FAKE_CI_RUNTIME, packagePath);
+          mkdirSync(destination, {recursive: true, mode: 0o700});
+          for (const name of classes) { copyFileSync(join('backend/target/test-classes', packagePath, name), join(destination, name)); chmodSync(join(destination, name), 0o600); }
+
+          const compose = ['compose', '--env-file', env.PAYMENT_FAKE_CI_EMPTY_ENV,
+            '-p', project, '-f', 'infrastructure/compose.yaml', '-f', 'infrastructure/compose.local-user.yaml', '-f', 'infrastructure/compose.fake-e2e.yaml'];
+          const services = ['postgres', 'mailpit', 'backend', 'admin'];
+          const owned = new Map();
+          const verify = (service, id) => {
+            if (!/^[0-9a-f]{64}$/.test(id)) throw new Error('Full owned container ID required');
+            const actual = run('docker', ['inspect', '--format', '{{.Id}}|{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}', id]);
+            if (actual !== `${id}|${project}|${service}`) throw new Error('Owned container identity mismatch');
+          };
+          const capture = () => {
+            let invalid = false;
+            for (const service of services) {
+              if (owned.has(service)) continue;
+              try {
+                const id = run('docker', [...compose, 'ps', '--all', '--quiet', '--no-trunc', service]);
+                if (id) { verify(service, id); owned.set(service, id); }
+              } catch { invalid = true; }
+            }
+            if (invalid) throw new Error('Unable to capture exact owned service identities');
+          };
+          let failure = false, cleanupFailed = false;
+          // finally is installed before the first container can be created.
+          try {
+            run('docker', [...compose, 'up', '--build', '-d', '--wait', '--wait-timeout', '180', ...services], {timeout: 900000, stdio: 'inherit'});
+            capture();
+            if (owned.size !== services.length) throw new Error('Missing owned service');
+            env.PAYMENT_E2E_MAILPIT_OWNER = owned.get('mailpit');
+            const deadline = Date.now() + 30000;
+            let ready = false;
+            while (Date.now() < deadline && !ready) {
+              try {
+                const response = await fetch(env.PAYMENT_STAGE4_CONTROL_URL, {headers: {Authorization: 'Bearer ' + env.PAYMENT_STAGE4_CONTROL_KEY}, redirect: 'error', signal: AbortSignal.timeout(2000)});
+                if (response.status !== 200) { await response.body?.cancel(); throw new Error('Control not ready'); }
+                const reader = response.body.getReader();
+                let body = '', bytes = 0;
+                try {
+                  for (;;) {
+                    const chunk = await reader.read(); if (chunk.done) break;
+                    bytes += chunk.value.byteLength;
+                    body += Buffer.from(chunk.value).toString('utf8');
+                    if (bytes > 64 || body.length > 64) { await reader.cancel(); throw new Error('Control response too large'); }
+                  }
+                } finally { reader.releaseLock(); }
+                ready = body.length > 0 && Number.isFinite(Date.parse(body));
+              } catch { /* Bounded readiness; capability/body/errors stay private. */ }
+              if (!ready) await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            if (!ready) throw new Error('Authenticated owned business clock not ready');
+            run('pnpm', ['--dir', 'examples/demo-site', 'exec', 'playwright', 'test', '--config', 'playwright.config.ts', '--workers=1', '--retries=0'], {timeout: 1500000, stdio: 'inherit'});
+          } catch {
+            failure = true;
+            console.error('Hosted default Fake browser startup or acceptance failed; sensitive diagnostics suppressed.');
+          } finally {
+            // Capture partial startup too. Never replace an original ID or remove state.
+            try { capture(); } catch { cleanupFailed = true; }
+            for (const [service, id] of owned) {
+              try { verify(service, id); run('docker', ['stop', '--time', '10', id], {timeout: 20000}); }
+              catch { cleanupFailed = true; }
+            }
+            if (cleanupFailed) console.error('Hosted Fake CI exact-owner stop failed; retained state was not removed.');
+          }
+          process.exitCode = failure ? 1 : cleanupFailed ? 1 : 0;
+          NODE
 
   infrastructure:
     runs-on: ubuntu-24.04

@@ -1,0 +1,61 @@
+# Owned payment-allocation diagnostics implementation plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. One coupled task, genuine TDD, independent task and final current-change reviews.
+
+**Goal:** Correct the proven ambiguity of the owned InvoicePayment failure while preserving every financial admission predicate.
+**Architecture:** The existing six-clause paymentGraph proof gains only finite first-false provenance. Sequential getter capture distinguishes successfully returned Java null from an explicit mismatch; the existing private DTO, owner, parser and reporter carry one closed reason after cleanup.
+**Tech Stack:** Java25, stripe-java34.0.0/API2026-09-30.endive, cached Jupiter6 and Node25 built-in tests; no dependencies.
+**Spec:** docs/superpowers/specs/2026-10-29-billing-clock-confirmation.md and docs/superpowers/specs/2026-10-29-billing-clock-subscriptions.md. Architecture gate and addendum copied to this plan's workspace bind the diagnostic-only ruling.
+
+## Evidence and decision
+
+Native run3a7d13c6-0a53-4cc3-936e-2c7a971a90d6 at ccfcd9b22d345b403fb543e2169e9e64d74f2b24 stopped PREPARE_SERVER_ACTION_GRAPH_PAYMENT_ALLOCATION. All7containers are independently stopped;20infra intents ACK, client CREATEdispatch/noACK/noConfirm. Runtime ledger literally remains PENDING. The combined label identifies none of the six failed fields or values. Selected cached SDK has direct nullable boxed getters and no defaults, with no cached official source/schema establishing open-payment wire semantics. Nullable SDK/fixture shape does not justify admission changes. The established defect is diagnostic ambiguity, not a proven financial-contract or Stripe defect.
+
+Ruling: retain all six assertions and separate OPEN observation/action/CASH proof levels; add11closed reasons so a future separately authorized observation need not spend another attempt merely distinguishing unavailable from known mismatch. Cost: finite mappings/tests and continued rejection of incomplete graphs; native cause and acceptance remain unknown. No retries or native authority follow from this plan.
+
+## Global Constraints
+
+- Existing isolated codex/stripe-billing-5b worktree; base ccfcd9b22d345b403fb543e2169e9e64d74f2b24. No Docker/daemon/Stripe/Sandbox/network, financial operations, DB/SQL/Spring/application context/server/listener/browser, Python, installs, private/env/key/CLI/raw-native/project archive access. Static selected cached public SDK artifacts and the copied safe native summary are permitted.
+- Never replay/reset/adopt/reconcile any CREATE/DISPATCHING, including run3a7. Preserve old/current reports, data, containers, volumes and all SDD evidence/worktrees. No cleanup, push/CI/native run this task. Root may make one reviewed local commit.
+- No admission change: keep status=open, default=Boolean.TRUE, requested=exact due, paid=explicit zero, payment present and type=payment_intent. Keep ordinary/change/resume/recovery and owned action/material/preconfirm acceptance/rejection, OPEN descriptive normalization, strict independent CASH/PI/Charge/reverse proof, off-Stripe scoped policy, durable authority, receipts, roots, UTC/clocks, request/dispatch budgets and public mismatch exceptions unchanged.
+- Preserve original short-circuit getter order: status; default; requested; paid; first getPayment for presence; actual SECOND getPayment followed by getType. Fetch each local only immediately before its check after previous success. No prefetch, eager six-argument call, duplicate classification reads or reuse of the first Payment object for type.
+- UNAVAILABLE means a reached getter successfully returned Java null, covering omission/JSON null together, never wire optionality or financial meaning. A throwing getter/second getPayment/null dereference/parser failure stays generic; do not catch/classify messages or manufacture a field reason.
+- Only typed first-false reason may enter existing owned action diagnostic metadata; never provider values, IDs, amounts/signs/deltas, actual status/type strings, raw payloads, exceptions or new counters/DTO fields. Old coarse stage stays compatible; exact allowlists and existing160-character one-line cap remain.
+- Tests only synthetic/inert. Fresh explicit javac --release25 -proc:none -implicit:none -sourcepath '' and named Jupiter selectors; all FIVE launcher auto-registration flags OFF, extension autodetection/parallel OFF. No Maven/default suite/package scan or Playwright invocation. Cached unchanged target support is a disclosed transitive fallback, never full fresh backend proof.
+
+## Review Focus
+
+- A false earlier clause must suppress all later getters and keep first reason; throwing getters supply no false-clause provenance.
+- Earlier settlement rejection must keep its earlier label; new PAYMENT/TYPE/STATUS null reasons may require a direct narrow-boundary test, not weakened normalization.
+- Ordinary, material/preconfirm, full CASH and durable authority behavior must remain identical and no root/no POST refusals retained.
+- Finite labels must survive mapper/adapter/scenario/Handler/Node/owner/reporter while forged aliases, values, duplicates, extra fields, prefixes/suffixes and wrong statuses remain refused.
+- Unavailable vs mismatch distinction must not be reported as actual old native value/cause, verified provider semantics or native first-payment/full5B acceptance.
+
+### Task 1: Preserve allocation contract and carry exact safe first-failure reasons
+
+**Files:**
+- Modify backend/src/main/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingSnapshotMapper.java and StripeBillingClockActionAdapter.java in that directory.
+- Modify backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentScenario.java and OwnedBillingFirstPaymentRuntime.java only finite stage allowlists.
+- Modify backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/StripeBillingOwnedConfirmationSdkTest.java; extend existing billing/StripeBillingSettlementEvaluationTest.java only for the focused real helper/getter boundary if needed. No new framework/test API or test-only production hook.
+- Modify backend/src/test/java/dev/genericpayments/acceptance/runtime/OwnedBillingFirstPaymentRuntimeTest.java only inert Handler/static stage mapping tests.
+- Modify infrastructure/stripe-billing-first-payment-runtime.mjs and infrastructure/stripe-billing-first-payment.test.mjs; modify examples/demo-site/tests/support/stripe-billing-first-payment.test.ts. Reporter production delegates to the existing shared parser and needs no change.
+- Clarify both specs above and docs/local-development.md with whole six-field application contract, selected SDK evidence limits, finite labels and native boundary. No schema/config/protocol/dependency/browser UI changes.
+
+**Interfaces:**
+- Consumes existing shared paymentGraph, Read.actionFailure/requireOwned, OwnedActionFailure.guard/settlement, selectionFailureStage, ACTION_SELECT mapping, exact authenticated400 two-field stopped envelope, Node owned-error diagnostic WeakMap, one final line parser/reporter.
+- Produces exactly11 reasons under ACTION_GRAPH_PAYMENT_ALLOCATION_: STATUS_UNAVAILABLE, STATUS_NOT_OPEN, DEFAULT_UNAVAILABLE, DEFAULT_NOT_TRUE, AMOUNT_REQUESTED_UNAVAILABLE, AMOUNT_REQUESTED_MISMATCH, AMOUNT_PAID_UNAVAILABLE, AMOUNT_PAID_NONZERO, PAYMENT_UNAVAILABLE, TYPE_UNAVAILABLE, TYPE_UNEXPECTED. Node retains existing PREPARE_SERVER_ prefix. Keep ACTION_GRAPH_PAYMENT_ALLOCATION fallback accepted.
+- Use a separate finite package-private allocation reason enum/carrier accessor and private Read requirement helper; helper names can follow existing style. Store only enum provenance at the first rejecting boundary. Each required comparison remains identical; no public bypass or new observer/fixture request.
+
+- [ ] Read copied contract/source/gate/addendum reports; audit exact test closure and static input/dependency existence. Create fresh task-specific /private/tmp output; previous runner may be read only as reference, never run/overwrite. Copy all final commands/logs/hashes into this plan's evidence workspace.
+- [ ] Before production edits add behavioral RED for full owned action rows: canceled->STATUS_NOT_OPEN; default missing/null->DEFAULT_UNAVAILABLE and false->DEFAULT_NOT_TRUE; requested missing/null->AMOUNT_REQUESTED_UNAVAILABLE and0/-1/999/1001->AMOUNT_REQUESTED_MISMATCH at due1000; paid missing/null->AMOUNT_PAID_UNAVAILABLE and+1/-1->AMOUNT_PAID_NONZERO. Assert6inert GETs, no PI read/root/POST. Run across existing indicator omitted/null/zero and duplicate-flat exact/omitted/null without changing their policy.
+- [ ] Add a real narrow paymentGraph evaluation test with actual selected SDK models to cover all11reasons, first-of-multiple-invalid priority and successful baseline. Earlier normalization retains its payment/type/status refusals. Assert literal getter order and exact counts (including2getPayment), later getter suppression after every failure, and generic provenance if each reached getter or second getPayment/getType throws. Do not assert source text/constants alone or expose test hooks in production.
+- [ ] Keep existing positive full action->binding/root/material/preconfirm->one inert confirm->independent CASH, noAdjustments, other money/list/ownership/PI/Charge/reverse/authority tests as related regression. Add/check ordinary and owned material/preconfirm negative equivalence (no confirm POST), old coarse fallback, first failure latch after success/other failure, reentrant/concurrent allocation-vs-generic provenance isolation. Do not weaken rejection rows to force new labels.
+- [ ] Add actual Java Handler/static scenario mapping, Node private-runtime/owner/formatter/parser and reporter behavior tests for all11literal stages. Assert exact400 code/stage envelope and first cause captured before abort, one diagnostic after close, no ACK/confirm/observe on rejection, cleanup once, old generic compatibility; reject forged labels (suffix/prefix/digit/newline/raw secret/escaped aliases), duplicate keys, extra fields, wrong code/status, foreign throwing metadata. Expected strings must be literal independent fixtures, not derived from production sets.
+- [ ] Observe genuine expected RED before implementing minimal source/provenance and exact allowlist changes. Compilation/linkage/setup errors do not count as RED. Preserve original conditions, exception and read behavior; only successful typed-null/mismatch classification at first false check changes diagnostics.
+- [ ] Run focused GREEN then one related full explicit pure set. Fresh compile15billing sources, both inert fixtures, changed runtime/scenario and their relevant runtime support sources, three existing pure test classes plus named RuntimeTest methods only. All five launcher flags off. Read source-recon exact seven RuntimeTest selectors (Handler/static mapping only), never select full RuntimeTest. Run exactly: /opt/homebrew/bin/node --test --test-timeout=60000 --test-concurrency=1 infrastructure/stripe-billing-first-payment.test.mjs examples/demo-site/tests/support/stripe-billing-first-payment.test.ts. No wildcard/defaultPlaywright/export-native/integration test. Record limitations for cached transitive classes and no full build/CI/native.
+- [ ] Document contract/labels accurately: SDK nullable representation is not wire-validity proof; UNAVAILABLE does not distinguish omitted vs explicit null, mismatches reveal no value; actual past failure field/value and provider outcome remain UNKNOWN, first-payment/full5B NOT_ACCEPTED, current CREATE consumed/uncertain/nonretryable. No native permission is granted.
+- [ ] Self-review diff, git diff --check, exact source/evidence hashes; freeze source and write task-1-report.md. No implementer commit/push/subagents. Root packages frozen diff and runs independent task/final gates, then one reviewed local commit at most. Preserve all evidence/worktree.
+
+## Completion
+
+Both independent reviews clean with no unresolved Important/Critical findings. Final user result must identify this as diagnostic ambiguity correction, not a native financial fix; surface the no-admission-change and11-label rulings/cost. No new Sandbox attempt, data recovery or publication follows automatically.

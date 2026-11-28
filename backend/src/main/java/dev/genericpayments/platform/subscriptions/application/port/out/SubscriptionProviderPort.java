@@ -3,10 +3,19 @@ import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 public interface SubscriptionProviderPort {
     Capabilities capabilities(PaymentAccount account);
+    default CreatePreparation prepareCreate(Command command){return new ReadyForCreate();}
+    default SetupContinuationResult continueOriginalSetup(Command command,SetupContinuationFence fence){return new SetupContinuationResult(null);}
+    default OwnedSetupReceipt confirmPreparedSetup(Command command,String token){throw new UnsupportedOperationException();}
     Reply create(Command command);
     ProviderQuote preview(QuoteRequest request);
     Reply change(Command command);
     Reply clearChange(Command command);
+    /** Explicit same-key retry only; providers opt in after proving an original dispatch. */
+    default Reply continueOriginalPlan(Command command){return null;}
+    /** Explicit original cancellation retry only; read workflows never invoke this hook. */
+    default Reply continueOriginalCancellation(Command command){return null;}
+    /** Explicit same-owner server pay replay only; observing an invoice never invokes this hook. */
+    default Reply continueOriginalRecovery(Command command){return null;}
     Reply cancel(Command command,boolean immediate);
     Reply withdrawCancel(Command command);
     Reply setup(Command command);

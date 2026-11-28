@@ -65,6 +65,7 @@ public class StripeRecoveryProofAdapter implements ProviderRecoveryProofPort {
     @Override
     @Transactional(propagation = Propagation.SUPPORTS, readOnly = true)
     public RecoveryRequestSnapshot request(ProviderOperation operation) {
+        if(operation.kind()==ProviderOperation.Kind.TEST_CLOCK_ADVANCE||operation.kind().dedicatedDispatch())throw mismatch();
         var account = accounts.findById(operation.accountId())
                 .orElseThrow(StripeRecoveryProofAdapter::mismatch);
         credentials.resolve(account);
@@ -178,6 +179,7 @@ public class StripeRecoveryProofAdapter implements ProviderRecoveryProofPort {
                     case REFUND_CREATE -> "re_";
                     case PRODUCT_CREATE -> "prod_";
                     case PRICE_CREATE -> "price_";
+                    default -> throw mismatch();
                 };
         if (!StripePaymentSnapshotMapper.validReference(reference, prefix)
                 || !StripePaymentSnapshotMapper.validReference(eventId, "evt_")) throw mismatch();
@@ -191,6 +193,7 @@ public class StripeRecoveryProofAdapter implements ProviderRecoveryProofPort {
                         case REFUND_CREATE -> "refund.created";
                         case PRODUCT_CREATE -> "product.created";
                         case PRICE_CREATE -> "price.created";
+                        default -> throw mismatch();
                     };
             if (event == null
                     || !eventId.equals(event.getId())
@@ -217,6 +220,7 @@ public class StripeRecoveryProofAdapter implements ProviderRecoveryProofPort {
                         case REFUND_CREATE -> object instanceof com.stripe.model.Refund;
                         case PRODUCT_CREATE -> object instanceof com.stripe.model.Product;
                         case PRICE_CREATE -> object instanceof com.stripe.model.Price;
+                        default -> throw mismatch();
                     };
             if (!kind) throw mismatch();
             switch (snapshot) {

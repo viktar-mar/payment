@@ -1,4 +1,11 @@
+import {FAILED_RENEWAL_CLI_PROFILE_RUN_ID,billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID,billingOptionalTrialOptIn,validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
+import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
+import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,billingAcceptanceProfileRunId,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {proveOwnedBillingRequiredTrialEvidence} from './stripe-billing-required-trial-evidence.mjs';
+import {billingBounded} from './stripe-billing-limits.mjs';
 import {execFile,spawn} from 'node:child_process';
 import {lstat,realpath,readdir,open} from 'node:fs/promises';
 import {constants} from 'node:fs';
@@ -9,11 +16,13 @@ import {manualRefundOptIn} from './stripe-manual-refund-options.mjs';
 import {manualRefundRemainderOptIn} from './stripe-manual-refund-remainder-options.mjs';
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const RUNS=ROOT+'/test-results/stripe-sandbox';
 const ACCOUNT='acct_1UPiMpELswAd8tpR',VERSION='2026-09-30.endive';
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const PREFIX=Object.freeze(['-p','(version 1)(allow default)(deny process-exec (literal "/usr/bin/security"))','/opt/homebrew/bin/stripe']);
 const EVENTS='payment_intent.processing,payment_intent.requires_action,payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled,refund.created,refund.updated,refund.failed';
+const BILLING_EVENTS='payment_intent.processing,payment_intent.requires_action,payment_intent.succeeded,payment_intent.payment_failed,payment_intent.canceled,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,customer.subscription.paused,customer.subscription.resumed,customer.subscription.trial_will_end,invoice.created,invoice.updated,invoice.finalized,invoice.finalization_failed,invoice.paid,invoice.payment_failed,invoice.payment_action_required,invoice.voided,invoice.marked_uncollectible';
 function executeAwaited(execute,file,args,options) {
   return new Promise((resolveExecution,rejectExecution)=>{
     let callbackDone=false,closed=false,failed=false,result;
@@ -29,7 +38,7 @@ const fail=()=>{throw null;};
 const fixed=code=>new Error('stripe_sandbox_cli_'+code);
 const object=value=>value!==null&&typeof value==='object'&&!Array.isArray(value);
 // Closed purposes are private capabilities, never caller-supplied modes or flags.
-const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder');
+const SANDBOX=Symbol('sandbox'),REFUND=Symbol('refund'),REMAINDER=Symbol('remainder'),BILLING=Symbol('billing'),FIRST_PAYMENT=Symbol('first-payment'),FIRST_RENEWAL=Symbol('first-renewal'),FAILED_RENEWAL=Symbol('failed-renewal'),OPTIONAL_TRIAL=Symbol('optional-trial');
 const ORIGINAL='031b5ae7-6603-4339-b1b3-77231291ff34',PRIOR='34941d87-12d3-4c74-8c5a-b62b7c914390';
 function exactData(value,keys){
   if(!object(value)||![Object.prototype,null].includes(Object.getPrototypeOf(value)))fail();
@@ -65,11 +74,36 @@ export async function createManualRefundCliAdapter(options,dependencies={}) {
 export async function createSandboxCliAdapter(options,dependencies={}) {
   return createCliAdapter(options,dependencies,SANDBOX);
 }
+/** The caller supplies an owned configuration and two bootstrap capabilities, never commands. */
+export async function createBillingFirstPaymentCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_PAYMENT);}
+export async function createBillingFailedRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FAILED_RENEWAL);}
+export async function createBillingFirstRenewalCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,FIRST_RENEWAL);}
+export async function createOwnedBillingOptionalTrialCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,OPTIONAL_TRIAL);}
+export async function createBillingCliAdapter(options,dependencies={}){return createBillingModeCliAdapter(options,dependencies,BILLING);}
+async function createBillingModeCliAdapter(options,dependencies,purpose) {
+  let selected,configuration,invoiceForwardTarget;
+  try{
+    const keys=['configuration','cliDirectory','verifyForwardTarget','persistWebhookSecret'];
+    const hasIngress=Object.hasOwn(options,'invoiceIngress');
+    selected=exactData(options,hasIngress?[...keys,'invoiceIngress']:keys);configuration=(purpose===OPTIONAL_TRIAL?validateBillingOptionalTrialOptions:purpose===FAILED_RENEWAL?validateBillingFailedRenewalOptions:purpose===FIRST_RENEWAL?validateBillingFirstRenewalOptions:purpose===FIRST_PAYMENT?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(selected.configuration);
+    if(!configuration||hasIngress!==(purpose===BILLING&&configuration.selectedCase==='initial_missed_reordered'))fail();
+    if(hasIngress){
+      const {ownedInvoiceForwardTarget}=await import('./stripe-billing-invoice-ingress.mjs');
+      invoiceForwardTarget=()=>ownedInvoiceForwardTarget(selected.invoiceIngress,configuration);
+      invoiceForwardTarget();
+    }
+  }
+  catch{throw fixed('OPT_IN_REQUIRED');}
+  return createCliAdapter({...configuration,invoiceIngress:selected.invoiceIngress,invoiceForwardTarget,cliDirectory:selected.cliDirectory,backendPort:configuration.ports.backend,accountKey:'stripe-sandbox-default',verifyForwardTarget:selected.verifyForwardTarget,persistWebhookSecret:selected.persistWebhookSecret},dependencies,purpose);
+}
 async function createCliAdapter(options,dependencies,purpose) {
-  const remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const optionalTrial=purpose===OPTIONAL_TRIAL,failedRenewal=purpose===FAILED_RENEWAL,firstRenewal=purpose===FIRST_RENEWAL;
+  const firstPayment=purpose===FIRST_PAYMENT||firstRenewal||failedRenewal||optionalTrial,billingMode=purpose===BILLING||firstPayment,remainderMode=purpose===REMAINDER,refundMode=purpose===REFUND||remainderMode;
+  const verifyListenerClose=failedRenewal||optionalTrial;
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
-  if(!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billingMode&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billingMode&&!remainderMode&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false,manualPaymentMode=false,threeDSecure=false;
   try{
     const key='PAYMENT_STRIPE_SANDBOX_MANUAL_3DS',selected=Object.getOwnPropertyDescriptor(rawEnv??{},key);
@@ -78,14 +112,20 @@ async function createCliAdapter(options,dependencies,purpose) {
     threeDSecure=selected?.value==='true';if(threeDSecure&&(refundMode||!manualPaymentOptIn(rawEnv)))fail();
   }catch{throw fixed('OPT_IN_REQUIRED');}
   try {const optIn=rawEnv;manualPaymentMode=!refundMode&&optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true';enabled=remainderMode?manualRefundRemainderOptIn(optIn):refundMode?manualRefundOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPaymentMode?manualPaymentOptIn(optIn):optIn?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&optIn?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&optIn.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  if(billingMode)enabled=(optionalTrial?billingOptionalTrialOptIn:failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw new Error('stripe_sandbox_cli_OPT_IN_REQUIRED');
+  const profileRunId=optionalTrial?Object.getOwnPropertyDescriptor(rawEnv,OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID)?.value:
+    failedRenewal?Object.getOwnPropertyDescriptor(rawEnv,FAILED_RENEWAL_CLI_PROFILE_RUN_ID)?.value
+    :purpose===BILLING?billingAcceptanceProfileRunId(rawEnv):undefined;
+  const requiredTrialCase=purpose===BILLING&&options.selectedCase==='initial_required_trial';
+  if((requiredTrialCase||optionalTrial)&&!profileRunId)throw fixed('OPT_IN_REQUIRED');
   let runId,cliDirectory,backendPort,persistSecret,verifyTarget,io;
   try {
     const env=rawEnv;
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))fail();
     runId=options.runId;cliDirectory=options.cliDirectory;backendPort=options.backendPort;
     const binding=options.approvedBinding;
-    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||cliDirectory!==ROOT+'/test-results/stripe-sandbox/'+runId+'/cli'
+    if(typeof runId!=='string'||!UUID.test(runId)||EXHAUSTED.has(runId)||cliDirectory!==RUNS+'/'+runId+'/cli'
       ||!Number.isInteger(backendPort)||backendPort<1024||backendPort>65535||options.accountKey!=='stripe-sandbox-default'
       ||binding?.externalAccountId!==ACCOUNT||binding?.apiVersion!==VERSION)fail();
     persistSecret=options.persistWebhookSecret;verifyTarget=options.verifyForwardTarget;
@@ -102,51 +142,166 @@ async function createCliAdapter(options,dependencies,purpose) {
   let refundDeadline=null,refundOwner=null,refundBinding=null,refundBindUsed=false,refundFailed=false,refundStarted=false,refundCharge=null,partialReference=null,partialRefundId=null;
   let remainderTarget=null,priorIdentity=null,priorEventType=null,remainderIdentity=null,remainderEventType=null;
   const remainderSignals=new Set();
+  let billingGraph=null,billingFailed=false,billingBound=false,billingStarted=false,billingDeadline=null,billingSignal;
+  const cancellationCase=purpose===BILLING&&options.selectedCase==='initial_cancel_withdraw';
+  const retryCase=purpose===BILLING&&options.selectedCase==='initial_decline_retry';
+  const invoiceCase=purpose===BILLING&&options.selectedCase==='initial_missed_reordered';
+  let invoiceReads=0,invoiceWitness;
+  const initial3ds=purpose===BILLING&&options.selectedCase==='initial_3ds';
+  let retryNext='declined',retryWitness;
+  let cancellationNext='initial',originalCancellationCash;
+  let requiredTrialStarted=false,requiredTrialInFlight;
+  const drainableListener=requiredTrialCase||optionalTrial;
+  const rejectOverlap=cancellationCase||retryCase||invoiceCase||drainableListener;
 
-  function check(context) {if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline)||remainderMode&&!context.cleanup&&[...remainderSignals].some(s=>s.aborted))fail();}
-  async function operation(code,limits,body) {
-    if(busy)throw fixed('BUSY');
+  function check(context) {
+    if(context.signal.aborted||Date.now()>=(context.proofDeadline??context.deadline))fail();
+    if(!context.cleanup){
+      if(remainderMode&&[...remainderSignals].some(s=>s.aborted))fail();
+      if(billingMode&&billingSignal?.aborted||rejectOverlap&&billingFailed)fail();
+    }
+  }
+  function operation(code,limits,body) {
+    const drainable=drainableListener&&code!=='STOP'&&!busy;
+    const running=runOperation(code,limits,body);
+    if(!drainable)return running;
+    requiredTrialInFlight=running;
+    return running.finally(()=>{
+      if(requiredTrialInFlight===running)requiredTrialInFlight=undefined;
+    });
+  }
+  async function runOperation(code,limits,body) {
+    if(billingMode&&billingFailed&&code!=='STOP')throw fixed(code);
+    if(busy){
+      if(rejectOverlap&&code!=='STOP')billingFailed=true;
+      throw fixed('BUSY');
+    }
     busy=true;let timer,external,onAbort;
     const controller=new AbortController();
     try {
       const deadline=limits?.deadline;external=limits?.signal;
       if(!Number.isFinite(deadline)||deadline<=Date.now()||(external!==undefined&&!(external instanceof AbortSignal)))fail();
+      if(billingMode){if(billingDeadline===null){if(deadline>Date.now()+45*60000)fail();billingDeadline=deadline;billingSignal=external;}if(deadline>billingDeadline+(code==='STOP'?120000:0))fail();
+        if(code!=='STOP'&&billingSignal)external=external?AbortSignal.any([billingSignal,external]):billingSignal;}
       if(refundMode){if(refundDeadline===null){if(deadline>Date.now()+1800000)fail();refundDeadline=deadline;}if(code==='STOP'?deadline>refundDeadline+120000:deadline!==refundDeadline)fail();}
       if(remainderMode&&code!=='STOP'&&external)remainderSignals.add(external);
       if(remainderMode&&code!=='STOP'&&remainderSignals.size)external=AbortSignal.any([...remainderSignals]);
       onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});
       if(external?.aborted)controller.abort();
-      const boundedProof=remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code);
-      const proofDeadline=boundedProof?Math.min(deadline,Date.now()+45000):deadline;
+      const maximum=code==='CLI_PROFILE'?10000:remainderMode&&['PRIOR_PARTIAL','REMAINDER'].includes(code)?45000:
+        code==='BILLING_REQUIRED_TRIAL'?120000:null;
+      const proofDeadline=maximum===null?deadline:Math.min(deadline,Date.now()+maximum);
       timer=io.setTimeout(onAbort,Math.min(proofDeadline-Date.now(),2147483647));
-      const context={deadline,signal:controller.signal,...(boundedProof?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
-      return await body(context);
-    } catch {throw fixed(code);}
+      const context={deadline,signal:controller.signal,...(maximum!==null?{proofDeadline}:{}),...(code==='STOP'?{cleanup:true}:{})};check(context);
+      const result=await body(context);if(billingMode)check(context);return result;
+    } catch {if(billingMode)billingFailed=true;throw fixed(code);}
     finally {try {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);} catch {} busy=false;}
   }
+  const validPrivateFile=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isInteger(s.size)&&s.size>=0&&s.size<=65536;
   async function privateFile(path) {
-    const valid=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isInteger(s.size)&&s.size>=0&&s.size<=65536;
-    if(!valid(await io.lstat(path))||await io.realpath(path)!==path)fail();
+    if(!validPrivateFile(await io.lstat(path))||await io.realpath(path)!==path)fail();
     const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW);
-    try {if(!valid(await file.stat()))fail();} finally {await file.close();}
+    try {if(!validPrivateFile(await file.stat()))fail();} finally {await file.close();}
   }
-  async function privateTree(context) {
-    for(const path of [cliDirectory,cliDirectory+'/home',cliDirectory+'/config',cliDirectory+'/config/stripe']) {
-      check(context);const s=await io.lstat(path);
-      if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700||await io.realpath(path)!==path)fail();
-    }
+  async function privateDirectory(path,context) {
+    check(context);const s=await io.lstat(path);
+    if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700||await io.realpath(path)!==path)fail();
+  }
+  async function privateTree(context,requireCredentials=Boolean(profileRunId)) {
+    for(const path of [cliDirectory,cliDirectory+'/home',cliDirectory+'/config',cliDirectory+'/config/stripe'])await privateDirectory(path,context);
     await privateFile(cliDirectory+'/config/stripe/config.toml');
     // Directory enumeration distinguishes absent credentials without inspecting thrown errors.
     const names=await io.readdir(cliDirectory+'/config/stripe');
-    if(names.includes('credentials.json'))await privateFile(cliDirectory+'/config/stripe/credentials.json');
+    if(requireCredentials||names.includes('credentials.json'))await privateFile(cliDirectory+'/config/stripe/credentials.json');
     check(context);
   }
-  async function command(commandArgs,context) {
+  function sameProfileFile(actual,expected) {
+    return validPrivateFile(actual)&&actual.dev===expected.dev&&actual.ino===expected.ino&&actual.size===expected.size
+      &&actual.mtimeMs===expected.mtimeMs&&actual.ctimeMs===expected.ctimeMs;
+  }
+  async function profileFileInfo(path,context) {
+    check(context);
+    const info=await io.lstat(path);
+    check(context);
+    if(!validPrivateFile(info)||await io.realpath(path)!==path)fail();
+    check(context);
+    return info;
+  }
+  async function readProfileFile(path,context) {
+    const info=await profileFileInfo(path,context);
+    if(info.size===0)fail();
+    check(context);
+    const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try {
+      check(context);
+      if(!sameProfileFile(await file.stat(),info))fail();
+      const buffer=Buffer.alloc(info.size+1);
+      check(context);
+      const {bytesRead}=await file.read(buffer,0,buffer.length,0);
+      check(context);
+      if(bytesRead!==info.size||!sameProfileFile(await file.stat(),info))fail();
+      return {path,info,contents:buffer.subarray(0,bytesRead)};
+    } finally {await file.close();}
+  }
+  async function savedProfileDirectory(context) {
+    const prior=RUNS+'/'+profileRunId,source=prior+'/cli/config/stripe';
+    for(const path of [RUNS,prior,prior+'/cli',prior+'/cli/config',source])await privateDirectory(path,context);
+    return source;
+  }
+  function savedProfileExpiration(credentials) {
+    const metadata=JSON.parse(credentials.contents.toString('utf8'));
+    const expires=object(metadata)&&metadata.oauth_uat_expires_at;
+    if(typeof expires!=='string'||!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(expires))fail();
+    const timestamp=Date.parse(expires);
+    if(!Number.isFinite(timestamp)||new Date(timestamp).toISOString().slice(0,19)!==expires.slice(0,19))fail();
+    return timestamp;
+  }
+  async function checkSavedProfile(context) {
+    const source=await savedProfileDirectory(context);
+    if(!(await profileFileInfo(source+'/config.toml',context)).size)fail();
+    const credentials=await readProfileFile(source+'/credentials.json',context);
+    try {return savedProfileExpiration(credentials)<=Date.now()?'EXPIRED':'READY';}
+    finally {credentials.contents.fill(0);}
+  }
+  async function seedProfile(context) {
+    const source=await savedProfileDirectory(context);
+    const target=cliDirectory+'/config/stripe',targetConfig=target+'/config.toml';
+    await privateDirectory(RUNS+'/'+runId,context);
+    await privateTree(context,false);
+    const configuration=await readProfileFile(source+'/config.toml',context);
+    const credentials=await readProfileFile(source+'/credentials.json',context);
+    for(const snapshot of [configuration,credentials]){
+      if(!sameProfileFile(await profileFileInfo(snapshot.path,context),snapshot.info))fail();
+    }
+
+    // The destination belongs to the fresh run and starts with a blank config.
+    const targetInfo=await profileFileInfo(targetConfig,context);
+    if(targetInfo.size!==0)fail();
+    if(optionalTrial&&savedProfileExpiration(credentials)<=Date.now())fail();
+    const configFile=await io.open(targetConfig,constants.O_WRONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+    try {
+      if(!sameProfileFile(await configFile.stat(),targetInfo))fail();
+      check(context);
+      const credentialsFile=await io.open(target+'/credentials.json',constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+      try {
+        if(!validPrivateFile(await credentialsFile.stat()))fail();
+        await credentialsFile.writeFile(credentials.contents);
+        await credentialsFile.sync();
+      } finally {await credentialsFile.close();}
+      check(context);
+      await configFile.writeFile(configuration.contents);
+      await configFile.sync();
+    } finally {await configFile.close();}
+  }
+  async function command(commandArgs,context,guard) {
+    guard?.(context);
     await privateTree(context);check(context);
+    guard?.(context);
     if(remainderMode&&refundBinding)refundListener(context);
-    const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
+    const result=await io.execute('/usr/bin/sandbox-exec',[...args,...commandArgs,...(billingMode&&commandArgs[0]==='get'?['--stripe-version',VERSION]:[])],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe'],
       timeout:Math.min(context.manual||refundMode?10000:20000,Math.max(1,(context.proofDeadline??context.deadline)-Date.now())),maxBuffer:65536,signal:context.signal});
     check(context);
+    guard?.(context);
     if(remainderMode&&refundBinding)refundListener(context);
     if(typeof result.stdout!=='string'||typeof result.stderr!=='string'||Buffer.byteLength(result.stdout)+Buffer.byteLength(result.stderr)>65536)fail();
     return result;
@@ -155,20 +310,25 @@ async function createCliAdapter(options,dependencies,purpose) {
     const json=withHeaders?result.stdout.split(/\r?\n/).filter(line=>!line.startsWith('< ')&&!line.startsWith('> ')).join('\n'):result.stdout;
     const body=JSON.parse(json);if(!object(body))fail();return body;
   }
-  async function binding(context) {
-    const version=await command(['--version'],context);
-    if(!['stripe version 1.52.0','stripe version 1.52.0\n'].includes(version.stdout)||version.stderr!=='')fail();
-    const identity=parseBody(await command(['whoami','--format','json'],context));
-    if(identity.account_id!==ACCOUNT||identity.mode!=='test'||!Array.isArray(identity.authorized_accounts)||identity.authorized_accounts.length!==1)fail();
-    const account=identity.authorized_accounts[0];
-    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live'))fail();
-    const result=await command(['get','/v1/balance','--show-headers'],context),body=parseBody(result,true);
+  function pinnedResponse(result) {
     const lines=(result.stdout+'\n'+result.stderr).split(/\r?\n/),statuses=[],versions=[];
     for(const line of lines) {
       if(/^<\s*HTTP/i.test(line)) {const match=/^< HTTP(?:\/1\.1|\/2)? 200(?: [A-Za-z ]+)?$/.exec(line);if(!match)fail();statuses.push(line);}
       if(/^<\s*stripe-version\b/i.test(line)) {const match=/^< stripe-version: ([^\s]+)$/i.exec(line);if(!match)fail();versions.push(match[1]);}
     }
-    if(statuses.length!==1||versions.length!==1||versions[0]!==VERSION||body.object!=='balance'||body.livemode!==false)fail();
+    if(statuses.length!==1||versions.length!==1||versions[0]!==VERSION)fail();
+    return parseBody(result,true);
+  }
+  async function binding(context,guard) {
+    const version=await command(['--version'],context,guard);
+    if(!['stripe version 1.52.0','stripe version 1.52.0\n'].includes(version.stdout)||version.stderr!=='')fail();
+    const identity=parseBody(await command(['whoami','--format','json'],context,guard));
+    if(identity.account_id!==ACCOUNT||identity.mode!=='test'||!Array.isArray(identity.authorized_accounts)||identity.authorized_accounts.length!==1)fail();
+    const account=identity.authorized_accounts[0];
+    if(!object(account)||account.id!==ACCOUNT||!Array.isArray(account.modes)||!account.modes.includes('test')||account.modes.includes('live')
+      ||profileRunId&&account.modes.length!==1)fail();
+    const body=pinnedResponse(await command(['get','/v1/balance','--show-headers'],context,guard));
+    if(body.object!=='balance'||body.livemode!==false)fail();
     return true;
   }
   function controlled(promise,context) {
@@ -181,13 +341,13 @@ async function createCliAdapter(options,dependencies,purpose) {
     });
   }
   async function waitExit(record,ms) {
-    if(refundMode?record.closed:record.exited)return true;
+    if(refundMode||billingMode?record.closed:record.exited)return true;
     let timer;
     try {return await Promise.race([record.termination.then(()=>true),new Promise(resolveWait=>{timer=io.setTimeout(()=>resolveWait(false),ms);})]);}
     finally {io.clearTimeout(timer);}
   }
   async function terminate(record,budget=10000) {
-    if(refundMode?record.closed:record.exited)return true;
+    if(refundMode||billingMode?record.closed:record.exited)return true;
     // The process object and positive PID are captured once; no PID-based/global kill.
     if(owner!==record||record.child.pid!==record.pid) {uncertain=true;return false;}
     try {record.child.kill('SIGINT');} catch {}
@@ -199,8 +359,8 @@ async function createCliAdapter(options,dependencies,purpose) {
     uncertain=true;return false;
   }
   function listen(context) {
-    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',EVENTS,'--events-from','@self','--forward-to',
-      'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
+    const child=io.spawn('/usr/bin/sandbox-exec',[...args,'listen','--events',invoiceCase?'invoice.finalized,invoice.paid':billingMode?BILLING_EVENTS:EVENTS,'--events-from','@self','--forward-to',
+      invoiceCase?options.invoiceForwardTarget():'http://127.0.0.1:'+backendPort+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default'],{cwd:ROOT,env,shell:false,stdio:['ignore','pipe','pipe']});
     const pid=child.pid;
     if(!Number.isInteger(pid)||pid<=0) {uncertain=true;child.on('error',()=>{});fail();}
     let resolveReady,rejectReady,resolveExit;
@@ -209,9 +369,10 @@ async function createCliAdapter(options,dependencies,purpose) {
     record.readiness.catch(()=>{});
     record.termination=new Promise(resolveWait=>{resolveExit=resolveWait;});
     owner=record;
-    const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);};
-    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode)resolveExit();});
-    if(refundMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();});
+    const listenerLost=()=>{if(invoiceCase&&!record.stopping)options.invoiceIngress.listenerLost();};
+    const invalidate=()=>{record.valid=false;record.invalidated=true;rejectReady(null);listenerLost();};
+    child.on('exit',()=>{record.exited=true;record.valid=false;if(!record.stopping)record.invalidated=true;rejectReady(null);if(!refundMode&&!billingMode)resolveExit();listenerLost();});
+    if(refundMode||billingMode)child.on('close',()=>{record.closed=true;record.exited=true;record.valid=false;rejectReady(null);resolveExit();listenerLost();});
     child.on('error',invalidate);
     function line(raw) {
       const text=raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g,'').replace(/\r$/,'');
@@ -225,6 +386,7 @@ async function createCliAdapter(options,dependencies,purpose) {
       Promise.resolve().then(()=>{if(!record.valid||record.exited)fail();return persistSecret(originalSecret,...(refundMode?[context]:[]));}).then(result=>{
         record.persisting=false;
         if(result!==true||!record.valid||record.exited||context.signal.aborted) {uncertain=true;invalidate();return;}
+        if(invoiceCase){try{if(options.invoiceIngress.signingKey(originalSecret)!==true)fail();}catch{invalidate();return;}}
         record.persisted=true;record.ready=true;resolveReady(true);
       },()=>{record.persisting=false;uncertain=true;invalidate();});
     }
@@ -267,13 +429,19 @@ async function createCliAdapter(options,dependencies,purpose) {
     }
   }
   async function stopListener(context) {
-    if(uncertain)fail();
-    if(owner===null)return true;
-    if(owner.explicitStop&&owner.exited)return true;
-    check(context);
     const record=owner;
+    // A failed-renewal webhook write can stay unresolved after its child closes.
+    // After teardown, wait only for that child's close within this cleanup deadline.
+    if(uncertain){
+      if(!verifyListenerClose||!record||record.child.pid!==record.pid)fail();
+      await controlled(record.termination,context);
+    }
+    if(record===null)return true;
+    if(!verifyListenerClose&&record.explicitStop&&(billingMode?record.closed:record.exited))return true;
+    check(context);
     record.stopping=true;
     if(!await terminate(record,Math.min(10000,Math.max(2,context.deadline-Date.now()))))fail();
+    if(verifyListenerClose&&(record!==owner||record.child.pid!==record.pid||!record.closed))fail();
     check(context);record.explicitStop=true;
     return true;
   }
@@ -366,10 +534,7 @@ async function createCliAdapter(options,dependencies,purpose) {
         ||ep.status!=='succeeded'||ep.amount!==2000||ep.amount_received!==2000||ep.currency!=='eur'||ep.latest_charge!==c.id||ep.customer!==null||ep.capture_method!=='automatic'
         ||!Array.isArray(ep.payment_method_types)||ep.payment_method_types.length!==1||ep.payment_method_types[0]!=='card'
         ||ep.metadata?.payment_id!==manual.paymentId||ep.metadata?.site_id!==manual.siteId||ep.metadata?.source!=='CATALOG')fail();
-      if(threeDSecure){
-        const evidence=c.payment_method_details.card?.three_d_secure;
-        if(!object(evidence)||evidence.result!=='authenticated'||evidence.authentication_flow!=='challenge'||typeof evidence.version!=='string'||!/^2\.[0-9]+\.[0-9]+$/.test(evidence.version)||/[\r\n]/.test(evidence.version))fail();
-      }
+      if(threeDSecure)requireAuthenticatedChallenge(c);
       return Object.freeze({captured:true,eventVerified:true,...(threeDSecure?{threeDSecureAuthenticated:true}:{})});
     });
   }
@@ -550,6 +715,261 @@ async function createCliAdapter(options,dependencies,purpose) {
       return Object.freeze({providerVerified:true,webhookVerified:true});
     });
   }
+  function billingListener(context){
+    check(context);
+    if(!billingBound||!owner||!owner.valid||!owner.ready||!owner.persisted||owner.exited||owner.closed||owner.invalidated||owner.child.pid!==owner.pid||uncertain)fail();
+  }
+  function assertBillingListener(limits){
+    try{const d=Object.getOwnPropertyDescriptors(limits??{}),deadline=d.deadline?.value,signal=d.signal?.value;
+      if(billingFailed||!Number.isSafeInteger(deadline)||deadline>Date.now()+45*60000||deadline>billingDeadline||deadline<=Date.now()||!Object.hasOwn(d.deadline??{},'value')||d.signal&&!Object.hasOwn(d.signal,'value')||signal!==undefined&&!(signal instanceof AbortSignal))fail();
+      billingListener({deadline,signal:signal??{aborted:false}});return true;
+    }catch{billingFailed=true;throw fixed('BILLING_LISTENER');}
+  }
+  function requiredTrialReadArgs(request){
+    const {method,path,parameters,runId:requestedRun,expectedSource}=exactData(request,['method','path','parameters','runId','expectedSource']);
+    if(method!=='GET'||requestedRun!==runId||expectedSource!==options.expectedSource||typeof path!=='string')fail();
+    const ref=(value,prefix)=>typeof value==='string'&&value.length<=255
+      &&new RegExp('^'+prefix+'_[A-Za-z0-9]+$').test(value);
+    const resource=/^\/v1\/(customers|setup_intents|payment_methods|subscriptions|invoices)\/([A-Za-z0-9_]+)$/.exec(path);
+    const args=['get',path,'--show-headers'];
+    if(resource){
+      const [,collection,id]=resource;
+      const prefix={customers:'cus',setup_intents:'seti',payment_methods:'pm',subscriptions:'sub',invoices:'in'}[collection];
+      if(!ref(id,prefix))fail();
+      if(collection!=='invoices'){
+        exactData(parameters,[]);
+        return args;
+      }
+      if(exactData(parameters,['expand[]'])['expand[]']!=='amount_paid_off_stripe')fail();
+      return [...args,'-d','expand[]=amount_paid_off_stripe'];
+    }
+    const filter={
+      '/v1/invoices':['subscription','sub',2],
+      '/v1/invoice_payments':['invoice','in',1],
+      '/v1/payment_intents':['customer','cus',1],
+      '/v1/charges':['customer','cus',1],
+    };
+    if(!Object.hasOwn(filter,path))fail();
+    const [key,prefix,limit]=filter[path],values=exactData(parameters,[key,'limit']);
+    if(!ref(values[key],prefix)||values.limit!==limit)fail();
+    return [...args,'-d',key+'='+values[key],'-d','limit='+limit];
+  }
+  async function proveOwnedBillingRequiredTrial(fixture,readOnly,limits){
+    const code='BILLING_REQUIRED_TRIAL';
+    if(requiredTrialStarted)throw fixed(code);
+    requiredTrialStarted=true;
+    return operation(code,limits,async context=>{
+      billingListener(context);
+      if(typeof readOnly!=='function')fail();
+      await binding(context,billingListener);
+      const configuration=Object.freeze({selectedCase:options.selectedCase,runId,
+        expectedSource:options.expectedSource,approvedBinding:options.approvedBinding});
+      const activeLimits={deadline:context.proofDeadline,signal:context.signal};
+      let pendingRead;
+      try {
+        const evidence=await proveOwnedBillingRequiredTrialEvidence({configuration,fixture},activeLimits,{
+          readOnly:async(request,active)=>{
+            billingListener(active);
+            const rows=await readOnly(request,active);
+            billingListener(active);
+            return rows;
+          },
+          readProvider:(request,active)=>{
+            pendingRead=(async()=>{
+              const response=await command(requiredTrialReadArgs(request),active,billingListener);
+              const body=pinnedResponse(response);
+              if(body.account!==undefined&&body.account!==ACCOUNT
+                ||body.livemode!==false&&(body.object!=='list'||body.livemode!==undefined))fail();
+              return {externalAccountId:ACCOUNT,apiVersion:VERSION,livemode:false,body};
+            })();
+            return pendingRead;
+          },
+        });
+        billingListener(context);
+        return evidence;
+      } finally {
+        // The evidence timeout can win before a signaled CLI process has closed.
+        await pendingRead?.catch(()=>{});
+      }
+    });
+  }
+  const stopOwnedListener=limits=>operation('STOP',limits,async context=>{
+    if(billingMode)billingFailed=true;
+    return stopListener(context);
+  });
+  async function stopRequiredTrialListener(limits){
+    const running=requiredTrialInFlight;
+    if(!running)return stopOwnedListener(limits);
+    try {
+      const {deadline,signal}=limits;
+      if(billingDeadline===null||deadline>billingDeadline+120000)fail();
+      const cleanupLimits={deadline,signal};
+      await billingBounded(cleanupLimits,()=>running.catch(()=>{}),deadline-Date.now());
+      return stopOwnedListener(cleanupLimits);
+    } catch {throw fixed('STOP');}
+  }
+  function checkedBillingGraph(value,allowMissingPeriod=false){
+    const keys=['runId','expectedSource','accountId','siteId','customerId','subscriptionId','operationId','priceId','priceVersion','customerReference','subscriptionReference','productReference','priceReference','invoiceReference','allocationReference','intentReference','periodStart','periodEnd'];
+    const v=exactData(value,keys);
+    if(v.runId!==runId||v.expectedSource!==options.expectedSource||!['accountId','siteId','customerId','subscriptionId','operationId','priceId'].every(k=>typeof v[k]==='string'&&UUID.test(v[k]))||v.priceVersion!==1)fail();
+    for(const [name,prefix] of Object.entries({customer:'cus',subscription:'sub',product:'prod',price:'price',invoice:'in',allocation:'inpay',intent:'pi'}))if(typeof v[name+'Reference']!=='string'||!new RegExp('^'+prefix+'_[A-Za-z0-9_]{1,200}$').test(v[name+'Reference']))fail();
+    if(!(allowMissingPeriod&&v.periodStart===null&&v.periodEnd===null)
+        &&(!Number.isSafeInteger(v.periodStart)||v.periodStart<=0||!Number.isSafeInteger(v.periodEnd)||v.periodEnd<=v.periodStart))fail();
+    return Object.freeze(v);
+  }
+  function bindOwnedBillingGraph(value,context){
+    billingListener(context);if(billingGraph)fail();
+    billingGraph=checkedBillingGraph(value);return true;
+  }
+  function requireAuthenticatedChallenge(charge){
+    const evidence=charge.payment_method_details?.card?.three_d_secure;
+    if(!object(evidence)||evidence.result!=='authenticated'||evidence.authentication_flow!=='challenge'
+      ||typeof evidence.version!=='string'||!/^2\.[0-9]+\.[0-9]+$/.test(evidence.version)||/[\r\n]/.test(evidence.version))fail();
+  }
+  async function observeOwnedBillingGraph(context,phase='initial',retryReceipt){
+    billingListener(context);if(!billingGraph)fail();const t={...billingGraph};
+    const declined=phase==='declined';
+    if(cancellationCase&&phase!==cancellationNext)fail();
+    await binding(context);billingListener(context);
+    const require=value=>{if(!value)fail();};
+    const exact=(v,id,type)=>require(v?.id===id&&v.object===type&&v.livemode===false&&(v.account===undefined||v.account===ACCOUNT));
+    const empty=v=>Array.isArray(v)&&v.length===0;
+    const metadata=(v,expected)=>require(object(v)&&Object.entries(expected).every(([k,x])=>v[k]===x));
+    async function read(path,filters=[]){billingListener(context);const value=parseBody(await command(['get',path,...filters.flatMap(([k,v])=>['-d',k+'='+v])],context));billingListener(context);return value;}
+    async function pages(path,filters=[]){
+      const data=[],seen=new Set();let after=null;
+      for(let page=0;page<4;page++){
+        const v=await read(path,[...filters,['limit',100],...(after?[['starting_after',after]]:[])]);
+        require(v.object==='list'&&Array.isArray(v.data)&&v.data.length<=100&&typeof v.has_more==='boolean');
+        for(const row of v.data){require(object(row)&&typeof row.id==='string'&&/^[a-z]+_[A-Za-z0-9_]{1,200}$/.test(row.id)&&!seen.has(row.id));seen.add(row.id);data.push(row);}
+        if(!v.has_more)return data;require(v.data.length>0);after=v.data.at(-1).id;
+      }fail();
+    }
+    const customer=await read('/v1/customers/'+t.customerReference);exact(customer,t.customerReference,'customer');require(customer.deleted!==true&&customer.test_clock===null);
+    const local={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};metadata(customer.metadata,local);
+    function subscriptionItem(subscription){
+      exact(subscription,t.subscriptionReference,'subscription');
+      metadata(subscription.metadata,{...local,subscription_id:t.subscriptionId,operation_id:t.operationId});
+      require(subscription.customer===t.customerReference&&subscription.status===(declined?'incomplete':'active')&&subscription.currency==='eur'&&subscription.latest_invoice===t.invoiceReference&&subscription.trial_start===null&&subscription.trial_end===null&&subscription.test_clock===null);
+      require(subscription.items?.object==='list'&&subscription.items.has_more===false&&Array.isArray(subscription.items.data)&&subscription.items.data.length===1);
+      const item=subscription.items.data[0];
+      if((declined||invoiceCase)&&t.periodStart===null){
+        require(Number.isSafeInteger(item.current_period_start)&&item.current_period_start>0
+          &&Number.isSafeInteger(item.current_period_end)&&item.current_period_end>item.current_period_start);
+        t.periodStart=item.current_period_start;t.periodEnd=item.current_period_end;
+      }
+      require(/^si_[A-Za-z0-9_]{1,200}$/.test(item.id)&&item.object==='subscription_item'&&item.subscription===t.subscriptionReference&&item.quantity===1&&item.price?.id===t.priceReference&&item.current_period_start===t.periodStart&&item.current_period_end===t.periodEnd);
+      return item;
+    }
+    function cancellationTerms(subscription,item){
+      const now=Math.floor(Date.now()/1000);
+      require(t.periodStart<=now&&now<t.periodEnd&&subscription.schedule===null&&subscription.pending_update===null&&subscription.pause_collection===null
+        &&subscription.ended_at===null&&subscription.collection_method==='charge_automatically'&&empty(subscription.discounts));
+      require(Number.isSafeInteger(subscription.billing_cycle_anchor)&&subscription.billing_cycle_anchor>0
+        &&(subscription.default_payment_method===null||typeof subscription.default_payment_method==='string'&&/^pm_[A-Za-z0-9_]{1,200}$/.test(subscription.default_payment_method))
+        &&subscription.default_source===null);
+      if(phase==='scheduled')require(subscription.cancel_at===t.periodEnd&&typeof subscription.cancel_at_period_end==='boolean');
+      else require(subscription.cancel_at===null&&subscription.cancel_at_period_end===false);
+      return {itemId:item.id,billingCycleAnchor:subscription.billing_cycle_anchor,defaultPaymentMethod:subscription.default_payment_method};
+    }
+    const subscription=await read('/v1/subscriptions/'+t.subscriptionReference),item=subscriptionItem(subscription);
+    const terms=cancellationCase?cancellationTerms(subscription,item):null;
+    const price=await read('/v1/prices/'+t.priceReference);exact(price,t.priceReference,'price');metadata(price.metadata,{local_price_id:t.priceId,local_price_version:String(t.priceVersion)});
+    require(price.product===t.productReference&&price.active===true&&price.unit_amount===2000&&price.currency==='eur'&&price.type==='recurring'&&price.tax_behavior==='inclusive'&&price.recurring?.interval==='month'&&price.recurring.interval_count===1&&price.recurring.usage_type==='licensed');
+    const invoice=await read('/v1/invoices/'+t.invoiceReference,cancellationCase||retryCase||initial3ds||invoiceCase?[['expand[]','amount_paid_off_stripe']]:[]);
+    exact(invoice,t.invoiceReference,'invoice');
+    require(invoice.customer===t.customerReference&&invoice.parent?.type==='subscription_details'&&invoice.parent.subscription_details?.subscription===t.subscriptionReference&&invoice.billing_reason==='subscription_create'&&invoice.status===(declined?'open':'paid')&&invoice.collection_method==='charge_automatically'&&invoice.currency==='eur');
+    require(invoice.amount_paid===(declined?0:2000)&&invoice.amount_remaining===(declined?2000:0)
+      &&['amount_due','total','subtotal'].every(k=>invoice[k]===2000)&&['amount_paid_off_stripe','amount_overpaid','starting_balance','ending_balance','pre_payment_credit_notes_amount','post_payment_credit_notes_amount'].every(k=>invoice[k]===0)&&['discounts','total_discount_amounts','total_pretax_credit_amounts'].every(k=>empty(invoice[k])));
+    const invoices=await pages('/v1/invoices',[['subscription',t.subscriptionReference]]);require(invoices.length===1&&invoices[0].id===t.invoiceReference);
+    const lines=await pages('/v1/invoices/'+t.invoiceReference+'/lines');require(lines.length===1);const line=lines[0];exact(line,line.id,'line_item');require(/^il_/.test(line.id));
+    const detail=line.parent?.subscription_item_details;
+    require(line.invoice===t.invoiceReference&&line.quantity===1&&line.currency==='eur'&&line.amount===2000
+      &&line.parent?.type==='subscription_item_details'&&detail?.subscription===t.subscriptionReference
+      &&detail.subscription_item===item.id&&detail.proration===false
+      &&(line.subscription==null||line.subscription===t.subscriptionReference)
+      &&line.pricing?.type==='price_details'&&line.pricing.price_details?.price===t.priceReference&&line.pricing.price_details.product===t.productReference
+      &&line.period?.start===t.periodStart&&line.period.end===t.periodEnd&&empty(line.discount_amounts)&&empty(line.pretax_credit_amounts));
+    function allocationProof(v){
+      exact(v,t.allocationReference,'invoice_payment');
+      require(v.invoice===t.invoiceReference&&v.currency==='eur'&&v.is_default===true&&v.amount_requested===2000
+        &&v.payment?.type==='payment_intent'&&v.payment.payment_intent===t.intentReference);
+      const transitions=v.status_transitions;
+      if(declined){
+        require(v.status==='open'&&(v.amount_paid==null||v.amount_paid===0)
+          &&(transitions==null||object(transitions)&&transitions.paid_at==null&&transitions.canceled_at==null));
+      }else require(v.status==='paid'&&v.amount_paid===2000&&Number.isSafeInteger(transitions?.paid_at)&&transitions.paid_at>0);
+    }
+    const allocations=await pages('/v1/invoice_payments',[['invoice',t.invoiceReference]]);require(allocations.length===1);allocationProof(allocations[0]);
+    const intent=await read('/v1/payment_intents/'+t.intentReference);exact(intent,t.intentReference,'payment_intent');
+    require(intent.customer===t.customerReference&&intent.status===(declined?'requires_payment_method':'succeeded')&&intent.amount===2000&&intent.amount_received===(declined?0:2000)&&intent.currency==='eur'&&intent.capture_method==='automatic'&&Array.isArray(intent.payment_method_types)&&intent.payment_method_types.length===1&&intent.payment_method_types[0]==='card'&&typeof intent.latest_charge==='string'&&/^ch_[A-Za-z0-9_]{1,200}$/.test(intent.latest_charge));
+    const chargeReference=intent.latest_charge;
+    const charge=await read('/v1/charges/'+chargeReference);exact(charge,chargeReference,'charge');
+    function verifyFailedCharge(c){
+      exact(c,retryReceipt.chargeReference,'charge');
+      require(c.customer===t.customerReference&&c.payment_intent===t.intentReference&&c.amount===2000&&c.currency==='eur'
+        &&c.status==='failed'&&c.paid===false&&c.captured===false&&c.amount_captured===0&&c.amount_refunded===0&&c.refunded===false
+        &&c.payment_method_details?.type==='card'&&c.failure_code==='card_declined'
+        &&c.outcome?.type==='issuer_declined'&&c.outcome.reason===retryReceipt.declineCode);
+    }
+    if(declined){
+      require(chargeReference===retryReceipt.chargeReference&&intent.last_payment_error?.charge===chargeReference
+        &&intent.last_payment_error.type==='card_error'&&intent.last_payment_error.code==='card_declined'
+        &&intent.last_payment_error.decline_code===retryReceipt.declineCode);
+      verifyFailedCharge(charge);
+    }else require(charge.customer===t.customerReference&&charge.payment_intent===t.intentReference&&charge.status==='succeeded'&&charge.paid===true&&charge.captured===true&&charge.amount===2000&&charge.amount_captured===2000&&charge.currency==='eur'&&charge.payment_method_details?.type==='card'&&charge.amount_refunded===0&&charge.refunded===false);
+    const noRefunds=value=>value?.object==='list'&&empty(value.data)&&value.has_more===false;
+    if(Object.hasOwn(charge,'refunds'))require(noRefunds(charge.refunds));
+    require(noRefunds(await read('/v1/refunds',[['charge',chargeReference],['limit',100]])));
+    const reverse=await pages('/v1/invoice_payments',[['payment[type]','payment_intent'],['payment[payment_intent]',t.intentReference]]);require(reverse.length===1);allocationProof(reverse[0]);if(!declined)require(reverse[0].status_transitions.paid_at===allocations[0].status_transitions.paid_at);
+    const latest=await read('/v1/payment_intents/'+t.intentReference);exact(latest,t.intentReference,'payment_intent');
+    require(latest.latest_charge===chargeReference&&latest.customer===t.customerReference&&latest.status===intent.status&&latest.amount_received===intent.amount_received&&latest.currency==='eur');
+    if(retryCase){
+      const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
+      require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');
+      require(invoices[0].customer===t.customerReference);
+      const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
+      require(charges.length===(declined?1:2));
+      verifyFailedCharge(charges.find(c=>c.id===retryReceipt.chargeReference));
+      if(!declined){
+        require(chargeReference!==retryReceipt.chargeReference&&charges.some(c=>c.id===chargeReference
+          &&c.customer===t.customerReference&&c.payment_intent===t.intentReference));
+        verifyFailedCharge(await read('/v1/charges/'+retryReceipt.chargeReference));
+        require(noRefunds(await read('/v1/refunds',[['charge',retryReceipt.chargeReference],['limit',100]])));
+        require(retryWitness.lineId===line.id&&retryWitness.itemId===item.id
+          &&retryWitness.periodStart===t.periodStart&&retryWitness.periodEnd===t.periodEnd);
+      }else retryWitness=Object.freeze({...retryReceipt,lineId:line.id,itemId:item.id,periodStart:t.periodStart,periodEnd:t.periodEnd});
+      billingListener(context);retryNext=declined?'recovered':null;
+      return true;
+    }
+    if(cancellationCase||initial3ds||invoiceCase){
+      const invoices=await pages('/v1/invoices',[['customer',t.customerReference]]);
+      require(invoices.length===1);exact(invoices[0],t.invoiceReference,'invoice');require(invoices[0].customer===t.customerReference);
+      const charges=await pages('/v1/charges',[['customer',t.customerReference]]);
+      require(charges.length===1);exact(charges[0],chargeReference,'charge');
+      require(charges[0].customer===t.customerReference&&charges[0].payment_intent===t.intentReference);
+      if(invoiceCase){
+        const witness={...t,chargeReference,itemId:item.id,lineId:line.id,paidAt:allocations[0].status_transitions.paid_at};
+        if(invoiceReads===1)invoiceWitness=Object.freeze(witness);
+        else require(Object.entries(witness).every(([k,v])=>invoiceWitness[k]===v));
+        billingListener(context);return true;
+      }
+      if(initial3ds){
+        requireAuthenticatedChallenge(charge);
+        billingListener(context);
+        return true;
+      }
+      const finalSubscription=await read('/v1/subscriptions/'+t.subscriptionReference);
+      const finalTerms=cancellationTerms(finalSubscription,subscriptionItem(finalSubscription));
+      require(Object.entries(terms).every(([key,value])=>value===finalTerms[key]));
+      const witness={...terms,lineId:line.id,chargeReference,paidAt:allocations[0].status_transitions.paid_at};
+      if(phase==='initial')originalCancellationCash=witness;
+      else require(Object.entries(witness).every(([key,value])=>value===originalCancellationCash[key]));
+      cancellationNext=phase==='initial'?'scheduled':phase==='scheduled'?'withdrawn':null;
+    }
+    billingListener(context);return Object.freeze({providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
+  }
+
   const refundOperation=(code,limits,body)=>{
     if(refundFailed)return Promise.reject(fixed(code));
     return operation(code,limits,body).catch(()=>{refundFailed=true;throw fixed(code);});
@@ -578,9 +998,49 @@ async function createCliAdapter(options,dependencies,purpose) {
     inspectRefund:(value,limits)=>refundOperation('REFUND',limits,context=>inspectRefund(value,context)),}),
   });
   return Object.freeze({
-    validateBinding:limits=>operation('BINDING',limits,binding),
-    startListener:limits=>operation('LISTENER',limits,startListener),
-    stopListener:limits=>operation('STOP',limits,stopListener),
+    ...(optionalTrial?{checkSavedProfile:limits=>operation('CLI_PROFILE',limits,checkSavedProfile)}:{}),
+    validateBinding:limits=>operation('BINDING',limits,async context=>{
+      if(profileRunId&&!billingBound)await seedProfile(context);
+      const result=await binding(context);if(billingMode)billingBound=true;return result;
+    }),
+    startListener:limits=>operation('LISTENER',limits,async context=>{if(billingMode){if(!billingBound||billingStarted)fail();billingStarted=true;}return startListener(context);}),
+    stopListener:drainableListener?stopRequiredTrialListener:stopOwnedListener,
+    ...(billingMode?{
+      assertBillingListener,
+      ...(requiredTrialCase?{proveOwnedBillingRequiredTrial}:{}),
+      ...(!firstPayment&&!retryCase&&!initial3ds&&!invoiceCase&&!requiredTrialCase?{bindOwnedBillingGraph:(value,limits)=>operation('BILLING_BINDING',limits,context=>bindOwnedBillingGraph(value,context)),
+      observeOwnedBillingGraph:limits=>operation('BILLING_GRAPH',limits,observeOwnedBillingGraph)}:{}),
+      ...(invoiceCase?{observeOwnedBillingCapturedInvoice:(value,limits)=>operation('BILLING_INVOICE',limits,async context=>{
+        billingListener(context);if(++invoiceReads>2)fail();
+        const graph=checkedBillingGraph(value,invoiceReads===1);
+        if(invoiceReads===2&&Object.entries(graph).some(([k,v])=>invoiceWitness[k]!==v))fail();
+        billingGraph=graph;return observeOwnedBillingGraph(context);
+      })}:{}),
+      ...(initial3ds?{observeOwnedBillingInitial3ds:(value,limits)=>operation('BILLING_INITIAL_3DS',limits,async context=>{
+        bindOwnedBillingGraph(value,context);
+        return observeOwnedBillingGraph(context);
+      })}:{}),
+      ...(retryCase?{observeOwnedBillingInitialRetry:(phase,value,receipt,limits)=>operation('BILLING_INITIAL_RETRY',limits,async context=>{
+        billingListener(context);
+        if(retryNext!==phase||!['declined','recovered'].includes(phase))fail();
+        const graph=checkedBillingGraph(value,phase==='declined');
+        const cause=exactData(receipt,['chargeReference','declineCode']);
+        if(typeof cause.chargeReference!=='string'||!/^ch_[A-Za-z0-9_]{1,200}$/.test(cause.chargeReference)
+          ||!['generic_decline','do_not_honor','insufficient_funds'].includes(cause.declineCode))fail();
+        if(phase==='recovered'){
+          if(!retryWitness||cause.chargeReference!==retryWitness.chargeReference||cause.declineCode!==retryWitness.declineCode
+            ||Object.keys(graph).some(k=>k!=='periodStart'&&k!=='periodEnd'&&graph[k]!==billingGraph[k])
+            ||graph.periodStart!==retryWitness.periodStart||graph.periodEnd!==retryWitness.periodEnd)fail();
+        }
+        billingGraph=graph;
+        return observeOwnedBillingGraph(context,phase,cause);
+      })}:{}),
+      ...(cancellationCase?{observeOwnedBillingCancellation:(phase,limits)=>operation('BILLING_CANCELLATION',limits,async context=>{
+        if(phase!=='scheduled'&&phase!=='withdrawn')fail();
+        await observeOwnedBillingGraph(context,phase);
+        return true;
+      })}:{}),
+    }:{
     bindMissedIntent,
     inspectIntent:limits=>operation('INTENT',limits,inspectIntent),
     bindManualPayment:(value,limits)=>manualOperation('PAYMENT_BINDING',limits,context=>bindManualPayment(value,context)),
@@ -588,15 +1048,18 @@ async function createCliAdapter(options,dependencies,purpose) {
     assertManualPaymentListener,
     inspectManualPayment:(eventId,limits)=>manualOperation('PAYMENT',limits,context=>inspectManualPayment(eventId,context)),
     inspectUnusedManualPayment:limits=>manualOperation('UNUSED',limits,inspectUnusedManualPayment),
-    loginInvocation:limits=>operation('LOGIN',limits,async context=>{
-      await privateTree(context);
-      return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
-        stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
     }),
-    completeLoginInvocation:limits=>operation('LOGIN',limits,async context=>{
-      await privateTree(context);await privateFile(cliDirectory+'/config/stripe/oauth_pending.json');check(context);
-      return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login','--complete-device']),options:Object.freeze({cwd:ROOT,env,shell:false,
-        stdio:Object.freeze(['pipe','pipe','pipe']),timeout:600000,maxBuffer:65536})});
-    }),
+    ...(!profileRunId?{
+      loginInvocation:limits=>operation('LOGIN',limits,async context=>{
+        await privateTree(context);
+        return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login']),options:Object.freeze({cwd:ROOT,env,shell:false,
+          stdio:Object.freeze(['pipe','pipe','pipe']),timeout:180000,maxBuffer:65536})});
+      }),
+      completeLoginInvocation:limits=>operation('LOGIN',limits,async context=>{
+        await privateTree(context);await privateFile(cliDirectory+'/config/stripe/oauth_pending.json');check(context);
+        return Object.freeze({file:'/usr/bin/sandbox-exec',args:Object.freeze([...args,'login','--complete-device']),options:Object.freeze({cwd:ROOT,env,shell:false,
+          stdio:Object.freeze(['pipe','pipe','pipe']),timeout:600000,maxBuffer:65536})});
+      }),
+    }:{}),
   });
 }

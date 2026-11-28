@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, errorTitle } from "../../../lib/api/client";
 import { validUuid } from "../../customers/context";
 import { CampaignForm } from "./CampaignForm";
@@ -9,10 +9,18 @@ import type { CampaignPage } from "./types";
 export function CampaignList({ siteId }: { siteId: string }) {
   const [offset,setOffset]=useState(0);const [revision,setRevision]=useState(0);const [creating,setCreating]=useState(false);
   const createTrigger=useRef<HTMLButtonElement>(null);
+  const restoreCreateFocus=useRef(false);
+  useLayoutEffect(()=>{
+    if(!creating && restoreCreateFocus.current) {
+      restoreCreateFocus.current=false;
+      createTrigger.current?.focus();
+    }
+  },[creating]);
+  function closeCreation() { restoreCreateFocus.current=true;setCreating(false); }
   if(!validUuid(siteId)) return <p role="alert">Select a valid Site to manage campaigns.</p>;
   return <div className="space-y-6">
     <button ref={createTrigger} onClick={()=>setCreating(value=>!value)}>{creating?"Close creation form":"Create campaign"}</button>
-    {creating && <CampaignForm siteId={siteId} onSaved={()=>{setCreating(false);setOffset(0);setRevision(value=>value+1);createTrigger.current?.focus();}} onRefresh={()=>{setCreating(false);setRevision(value=>value+1);createTrigger.current?.focus();}} />}
+    {creating && <CampaignForm siteId={siteId} onSaved={()=>{closeCreation();setOffset(0);setRevision(value=>value+1);}} onRefresh={()=>{closeCreation();setRevision(value=>value+1);}} />}
     <CampaignRows key={`${siteId}:${offset}:${revision}`} siteId={siteId} offset={offset} onPage={setOffset} />
   </div>;
 }

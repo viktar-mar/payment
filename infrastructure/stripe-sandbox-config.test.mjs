@@ -78,7 +78,7 @@ test('symlinks are rejected including dangling links without following their tar
   });
 });
 
-test('new private env contains only the three empty Sandbox key assignments', async () => {
+test('new private env contains exactly three empty Sandbox keys and disabled Billing actions', async () => {
   const initializeSandboxEnv = await initializer();
   withDirectory(directory => {
     const path = join(directory, 'stripe-sandbox.env.local');
@@ -88,6 +88,7 @@ test('new private env contains only the three empty Sandbox key assignments', as
       'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=',
       'PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY=',
       'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=',
+      'PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED=false',
     ]);
     assert.match(contents, /заполнить локально; не передавать в чат/);
   });

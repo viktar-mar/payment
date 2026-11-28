@@ -159,10 +159,15 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-manual-payment-schema.mjs','stripe-manual-payment-auth.mjs',
       'stripe-form-diagnostic-provision.mjs','stripe-form-diagnostic-settlement.mjs',
       'stripe-manual-form-options.mjs','stripe-sandbox-acceptance.mjs','stripe-sandbox-remaining-options.mjs',
-      'stripe-sandbox-bootstrap.mjs','stripe-sandbox-owned.mjs',
+      'stripe-sandbox-bootstrap.mjs','stripe-sandbox-user-env.mjs','stripe-sandbox-owned.mjs',
       'stripe-sandbox-cli.mjs','stripe-sandbox-provision.mjs',
       'stripe-sandbox-ownership.mjs','stripe-manual-refund-options.mjs','stripe-manual-refund-remainder-options.mjs',
       'stripe-sandbox-extras.mjs','smoke-stage-5a.mjs',
+      'stripe-billing-acceptance-options.mjs','stripe-billing-limits.mjs',
+      'stripe-billing-first-payment-options.mjs','stripe-billing-first-renewal-options.mjs','stripe-billing-failed-renewal-options.mjs',
+      'stripe-billing-first-payment-browser-diagnostic.mjs',
+      'stripe-billing-optional-trial-options.mjs','stripe-billing-optional-trial-source.mjs',
+      'stripe-billing-required-trial-evidence.mjs','stripe-billing-provision.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;
     registerHooks({load(url,context,nextLoad){
@@ -170,18 +175,25 @@ test('inert imports neither read private credentials nor launch any subprocess o
       if(!sources.has(url))return trap();
       return {format:'module',source:readSource(new URL(url),'utf8'),shortCircuit:true};
     }});
-    cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;fsp.readFile=trap;
+    cp.execFile=cp.spawn=cp.spawnSync=trap;fs.readFileSync=trap;
+    fsp.readFile=fsp.lstat=fsp.realpath=fsp.open=trap;
     http.createServer=net.createServer=trap;globalThis.fetch=trap;syncBuiltinESMExports();
     await import('./infrastructure/stripe-manual-payment.mjs');
     await import('./infrastructure/stripe-manual-payment-auth.mjs');
+    await import('./infrastructure/stripe-billing-first-payment-options.mjs');
     // Negative probes never read the filesystem, including an otherwise allowed
     // source path. No private path is exempted by suffix or repository prefix.
-    for(const file of ['infrastructure/.env','infrastructure/fixtures/customer-issuer-private.jwks.json',
+    for(const file of [...sources,'infrastructure/.env','infrastructure/stripe-sandbox.env.local',
+      'infrastructure/fixtures/customer-issuer-private.jwks.json',
       'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
-      'infrastructure/stripe-manual-payment.mjs']){
+      'infrastructure/stripe-billing-required-trial-proof.sql','infrastructure/stripe-billing-required-trial-seed.sql']){
       assert.throws(()=>fs.readFileSync(new URL(file,root)),/private boundary touched/);
       await assert.rejects(async()=>fsp.readFile(new URL(file,root)),/private boundary touched/);
     }
+    await assert.rejects(import('./infrastructure/stripe-billing-acceptance-options.test.mjs'),/private boundary touched/);
+    await assert.rejects(import('./infrastructure/stripe-billing-first-payment.test.mjs'),/private boundary touched/);
+    await assert.rejects(import('./infrastructure/stripe-billing-failed-renewal-response.mjs'),/private boundary touched/);
+    await assert.rejects(import('./infrastructure/stripe-billing-invoice-ingress.mjs'),/private boundary touched/);
   `;
   const result=spawnSync(process.execPath,['--input-type=module','-e',script],{cwd:new URL('..',import.meta.url),env:{PATH:'/usr/bin:/bin',LANG:'C',LC_ALL:'C',NO_COLOR:'1'},encoding:'utf8'});assert.equal(result.status,0,result.stderr);assert.equal(result.stdout,'');
 });

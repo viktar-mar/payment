@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <link rel="icon" href="data:,">
+  <title>Owned initial subscription payment</title>
+  <script type="module" src="/src/billing-first-payment.ts"></script>
+</head>
+<body data-phase="NEW">
+  <main>
+    <h1>Initial subscription payment</h1>
+    <p>EUR20 per month. Stripe Sandbox, one initial test payment.</p>
+    <button id="request" disabled>Request code</button>
+    <label>Six-digit code <input id="code" inputmode="numeric" autocomplete="off" disabled></label>
+    <button id="verify" disabled>Verify code</button>
+    <label><input id="consent" type="checkbox" disabled>I consent to recurring payments</label>
+    <button id="start" disabled>Start payment</button>
+    <div id="provider"></div>
+    <button id="pay" disabled>Pay</button>
+    <p id="status" role="status">NEW</p>
+  </main>
+</body>
+</html>

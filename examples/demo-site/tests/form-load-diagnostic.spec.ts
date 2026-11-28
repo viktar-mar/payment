@@ -1,3 +1,4 @@
+import {billingFailedRenewalExcluded} from '../../../infrastructure/stripe-billing-failed-renewal-options.mjs';
 import {test,chromium} from '@playwright/test';
 import {runFormLoadDiagnostic} from '../../../infrastructure/stripe-form-diagnostic.mjs';
 import {formatFormDiagnosticFrame} from '../../../infrastructure/stripe-form-diagnostic-schema.mjs';
@@ -7,6 +8,7 @@ import {runFormLoadBrowser} from './support/form-load-diagnostic';
 // closure of its sole launch/context. Importing/collecting this test is inert.
 test('one prepare-only form load; never confirms a payment',async()=>{
   const env=process.env,deadline=Date.now()+900000,controller=new AbortController();
+  if(!billingFailedRenewalExcluded(env))throw new Error('form_diagnostic_OPT_IN_REQUIRED');
   const ports={backend:0,demo:0,receiver:0,postgres:0,mailpitHttp:0,mailpitSmtp:0};
   for(const name of Object.keys(ports) as (keyof typeof ports)[]){
     const value=env['PAYMENT_STRIPE_SANDBOX_PORT_'+name.toUpperCase()];

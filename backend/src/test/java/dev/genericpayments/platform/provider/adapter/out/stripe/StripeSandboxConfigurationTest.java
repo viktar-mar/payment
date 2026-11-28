@@ -24,6 +24,11 @@ class StripeSandboxConfigurationTest {
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
         .withUserConfiguration(StripeSandboxConfiguration.class);
 
+    @Test void billingActionsAreAbsentSafeButEnabledConfigurationMustBeValid(){
+        runner.withPropertyValues("PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED=true","PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1=secret-canary-invalid").run(c->{assertThat(c).hasNotFailed().hasSingleBean(dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens.class);assertThat(c.getBean(dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens.class).enabled()).isFalse();});
+        enabled("test").withPropertyValues("PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED=true").run(c->assertThat(c).hasFailed());
+        enabled("test").withPropertyValues("PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED=true","PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION=v1","PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS=v1","PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1=secret-canary-invalid").run(c->{assertThat(c).hasFailed();assertThat(org.assertj.core.util.Throwables.getStackTrace(c.getStartupFailure())).doesNotContain("secret-canary-invalid");});
+    }
     @Test void disabledWorksWithoutKeysAndOnlyFakeVerificationIsAllowed() {
         runner.run(context -> {
             assertThat(context).hasNotFailed();

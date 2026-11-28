@@ -11,6 +11,8 @@ import dev.genericpayments.platform.customers.application.port.out.CustomerStore
 import dev.genericpayments.platform.sites.application.port.out.LockSitePort;
 import java.time.Clock;
 import java.util.*;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.dao.DataIntegrityViolationException;
 
@@ -21,6 +23,7 @@ public class SubscriptionRecoveryTransaction {
     private final SubscriptionAuthorityPort authority;private final SubscriptionPolicyPort policies;
     private final LockPaymentAccountPort accounts;private final LockSitePort sites;private final CustomerStore customers;
     private final SubscriptionProviderRegistry providers;private final Clock clock;
+    @Autowired private ObjectProvider<SubscriptionBillingTimePort> billingTimes;
     public SubscriptionRecoveryTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         BillingRecordStore bills,SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,
         LockSitePort sites,CustomerStore customers,SubscriptionProviderRegistry providers,Clock clock){
@@ -33,24 +36,35 @@ public class SubscriptionRecoveryTransaction {
     public SubscriptionOperation reserveRecover(RecoverSubscriptionUseCase.Command command){return reserve(command).operation();}
     public SubscriptionOperation reserveResume(ResumeSubscriptionUseCase.Command command){return reserve(command).operation();}
     public Reserved reserve(RecoverSubscriptionUseCase.Command command){
-        Objects.requireNonNull(command);return reserve(command.context(),command.subscriptionId(),command.billingRecordId(),false,SubscriptionOperation.Kind.RECOVER);
+        Objects.requireNonNull(command);return reserve(command.context(),command.subscriptionId(),command.billingRecordId(),false,SubscriptionOperation.Kind.RECOVER,null,null);
     }
     public Reserved reserve(ResumeSubscriptionUseCase.Command command){
-        Objects.requireNonNull(command);return reserve(command.context(),command.subscriptionId(),null,command.recurringConsent(),SubscriptionOperation.Kind.RESUME);
+        Objects.requireNonNull(command);return reserve(command.context(),command.subscriptionId(),null,command.recurringConsent(),SubscriptionOperation.Kind.RESUME,null,null);
     }
-    private Reserved reserve(SubscriptionCommandContext context,UUID id,UUID billId,boolean consent,SubscriptionOperation.Kind kind){
+    /** Explicit isolated Stripe composition supplies its exact owner-scoped observation outside the reservation transaction. */
+    public Reserved reserveObservedResume(ResumeSubscriptionUseCase.Command command,SubscriptionBillingTimePort.Sample expectedTime,
+            java.util.function.Function<Lookup,Snapshot> read){
+        Objects.requireNonNull(command);Objects.requireNonNull(read);
+        if(command.context()==null||!(command.context().actor() instanceof SubscriptionActor.Customer))throw SubscriptionRuleErrors.conflict();
+        if(!command.recurringConsent()||expectedTime==null||!expectedTime.isolated())throw SubscriptionRuleErrors.conflict();
+        return reserve(command.context(),command.subscriptionId(),null,true,SubscriptionOperation.Kind.RESUME,read,expectedTime);
+    }
+    private Reserved reserve(SubscriptionCommandContext context,UUID id,UUID billId,boolean consent,SubscriptionOperation.Kind kind,
+            java.util.function.Function<Lookup,Snapshot> observedResume,SubscriptionBillingTimePort.Sample expectedTime){
         requireOutsideTransaction();String principal=principal(context);
         if(id==null||kind==SubscriptionOperation.Kind.RECOVER&&billId==null||context.idempotencyKey()==null||context.idempotencyKey().isBlank()
             ||context.idempotencyKey().length()>255||context.idempotencyKey().codePoints().anyMatch(Character::isISOControl))throw SubscriptionRuleErrors.conflict();
         var candidate=tx.required(()->{
             authority.revalidate(context,true);
             var s=owned(context,id);var account=accounts.findByIdForUpdate(s.paymentAccountId()).orElseThrow(SubscriptionRuleErrors::conflict);
+            if(expectedTime!=null)requireIsolatedOptionalTrial(s,account,expectedTime);
             // This read is a candidate only. Locking Subscription here after Site would
             // invert reservation's operation/FK -> Site order during concurrent calls.
             return new Candidate(s,account,policies.load(context.siteId()).version());
         });
         // Retrieval precedes reservation and runs without any platform transaction or row lock.
-        var snapshot=providers.forAccount(candidate.account()).retrieve(new Lookup(candidate.account(),id,candidate.subscription().providerReference(),null));
+        var lookup=new Lookup(candidate.account(),id,candidate.subscription().providerReference(),null);
+        var snapshot=observedResume==null?providers.forAccount(candidate.account()).retrieve(lookup):observedResume.apply(lookup);
         var now=clock.instant();var operationId=UUID.randomUUID();
         var proposed=new SubscriptionOperation(operationId,context.siteId(),context.customerId(),id,kind,SubscriptionOperation.Status.RESERVED,
             principal,CreateSubscriptionFingerprint.digest(context.idempotencyKey()),fingerprint(context,id,billId,consent,kind,principal,candidate.subscription().revision(),candidate.policy()),
@@ -60,9 +74,14 @@ public class SubscriptionRecoveryTransaction {
             authority.revalidate(context,true);
             var current=owned(context,id);var account=accounts.findByIdForUpdate(current.paymentAccountId()).orElseThrow(SubscriptionRuleErrors::conflict);
             var s=subscriptions.lock(context.siteId(),id);
+            if(expectedTime!=null)requireIsolatedOptionalTrial(s,account,expectedTime);
             if(!operation.subscriptionId().equals(id)||!operation.customerId().equals(context.customerId())
                 ||!operation.fingerprint().equals(fingerprint(context,id,billId,consent,kind,principal,operation.expectedRevision(),operation.policyVersion())))throw SubscriptionRuleErrors.conflict();
-            if(!claim.owner())return new Reserved(operation,s,account,null,false);
+            if(!claim.owner()){
+                String invoice=null;
+                if(kind==SubscriptionOperation.Kind.RECOVER){var bill=bills.lock(context.siteId(),billId);if(!bill.subscriptionId().equals(s.id())||!bill.accountId().equals(account.id()))throw SubscriptionRuleErrors.conflict();invoice=bill.providerInvoiceReference();}
+                return new Reserved(operation,s,account,invoice,false);
+            }
             var policy=policies.load(context.siteId());
             if(s.revision()!=candidate.subscription().revision()||!s.paymentAccountId().equals(candidate.account().id())||!Objects.equals(s.providerReference(),snapshot.subscriptionReference())
                 ||account.status()!=PaymentAccountStatus.ACTIVE||!policy.enabled()||policy.version()!=candidate.policy()
@@ -74,7 +93,9 @@ public class SubscriptionRecoveryTransaction {
                 if(observed.size()!=1||observed.getFirst().settlement()!=SettlementKind.OPEN||!observed.getFirst().period().equals(bill.period())
                     ||!observed.getFirst().price().equals(bill.billedPrice()))throw SubscriptionRuleErrors.conflict();
                 var disposition=snapshot.recoveryDisposition(invoice);
-                if(disposition==RecoveryDisposition.ASSOCIATE_EXISTING_ACTION)RecoveryRules.requireActionAssociation(s,bill);
+                // Stripe reservation is local only. Its adapter proves action/pay permission from
+                // the complete exact graph after reservation; BLOCKED is never retry authority.
+                if(account.provider()==PaymentProviderType.STRIPE||disposition==RecoveryDisposition.ASSOCIATE_EXISTING_ACTION)RecoveryRules.requireActionAssociation(s,bill);
                 else RecoveryRules.requireRecoverable(s,bill,disposition!=RecoveryDisposition.RETRY_ALLOWED);
             }else {
                 RecoveryRules.requireResumable(s,snapshot.paymentMethodReady());
@@ -84,7 +105,27 @@ public class SubscriptionRecoveryTransaction {
         });}catch(SubscriptionRuleViolation violation){throw SubscriptionRuleErrors.translate(violation);}
         catch(DataIntegrityViolationException conflict){throw SubscriptionRuleErrors.conflict();}
     }
+    private void requireIsolatedOptionalTrial(Subscription s,PaymentAccount account,SubscriptionBillingTimePort.Sample expectedTime){
+        if(billingTimes==null||account.provider()!=PaymentProviderType.STRIPE||account.mode()!=PaymentAccountMode.SANDBOX
+            ||account.status()!=PaymentAccountStatus.ACTIVE||s.billingStatus()!=Subscription.Status.PAUSED||s.trial()==null
+            ||s.billingPrice().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.OPTIONAL_DURING_TRIAL
+            ||!s.trial().end().equals(expectedTime.billingAt())||s.debt()!=null||s.paidThrough()!=null||s.pendingChange()!=null||s.cancellation()!=null
+            ||!expectedTime.equals(billingTimes.getIfAvailable(SubscriptionBillingTimePort::ordinary).sampleForRead(s,clock.instant())))
+            throw SubscriptionRuleErrors.conflict();
+    }
     public SubscriptionOperationResult readResult(UUID id){return tx.required(()->result(operations.lock(id),null));}
+    public void beforeOriginalReplay(SubscriptionCommandContext c,Reserved r){tx.requiresNew(()->{
+        var o=operations.lock(r.operation().id());authority.revalidate(c,true);
+        var current=owned(c,o.subscriptionId());var a=accounts.findByIdForUpdate(current.paymentAccountId()).orElseThrow(SubscriptionRuleErrors::conflict);
+        var s=subscriptions.lock(c.siteId(),o.subscriptionId());var policy=policies.load(c.siteId());
+        if(!o.equals(r.operation())||o.kind()!=SubscriptionOperation.Kind.RECOVER||!o.authorityScope().equals(principal(c))||!a.equals(r.account())
+            ||a.provider()!=PaymentProviderType.STRIPE||a.mode()!=PaymentAccountMode.SANDBOX||a.status()!=PaymentAccountStatus.ACTIVE
+            ||!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
+            ||!policy.enabled()||policy.version()!=o.policyVersion()||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null
+            ||!s.billingPrice().equals(r.subscription().billingPrice())||s.debt()==null||!recoveryBill(o).filter(s.debt().billingRecordId()::equals).isPresent()
+            ||operations.unresolved(c.siteId(),s.id()).stream().anyMatch(other->!other.id().equals(o.id())&&other.kind()!=SubscriptionOperation.Kind.PORTAL&&other.kind()!=SubscriptionOperation.Kind.RECONCILE))throw SubscriptionRuleErrors.conflict();
+        return null;
+    });}
     public SubscriptionOperationResult recordReply(UUID id,Reply reply){
         return tx.requiresNew(()->{
             var o=operations.lock(id);
@@ -108,7 +149,7 @@ public class SubscriptionRecoveryTransaction {
         var canonical=new StringBuilder();for(var field:fields){var value=String.valueOf(field);canonical.append(value.length()).append(':').append(value);}
         return "v1."+kind.name().toLowerCase(Locale.ROOT)+"."+(bill==null?"none":bill)+"."+CreateSubscriptionFingerprint.digest(canonical.toString());
     }
-    static Optional<UUID> recoveryBill(SubscriptionOperation o){
+    public static Optional<UUID> recoveryBill(SubscriptionOperation o){
         if(o.kind()!=SubscriptionOperation.Kind.RECOVER||!o.fingerprint().matches("v1\\.recover\\.[0-9a-f-]{36}\\.[0-9a-f]{64}"))return Optional.empty();
         try{return Optional.of(UUID.fromString(o.fingerprint().split("\\.")[2]));}catch(IllegalArgumentException invalid){return Optional.empty();}
     }

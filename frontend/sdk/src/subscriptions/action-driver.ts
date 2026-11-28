@@ -6,10 +6,25 @@ import { parseSubscriptionAction } from './wire.js';
 const identity = (s: CustomerSession) => JSON.stringify([s.apiBaseUrl, s.siteKey, s.siteId, s.origin, s.customer.id, s.customer.status, s.customer.maskedEmail, s.sessionToken, s.expiresAt, [...s.scopes].sort()]);
 interface ActionBinding { client: SubscriptionClient; authority: string; subscriptionId: string; operationId: string; secret: string; kind: SubscriptionAction['kind']; expiresAt: string; }
 const bindings = new WeakMap<SubscriptionAction, ActionBinding>();
+const spent = new WeakMap<SubscriptionClient, Set<string>>();
+// A tombstone retains only the original operation identity, never the consumed grant.
+const intent = (input: SubscriptionIdRequest & { operationId: string }) => JSON.stringify([input.subscriptionId, input.operationId]);
 /** Internal registration; no capability or receipt is persisted. */
 export function bindSubscriptionAction(client: SubscriptionClient, session: CustomerSession, operationId: string, subscriptionId: string, action: SubscriptionAction): SubscriptionAction {
   bindings.set(action, { client, authority: identity(session), subscriptionId, operationId, secret: action.secret, kind: action.kind, expiresAt: action.expiresAt }); return action;
 }
+/** Check the original action object, request owner and immutable Customer identity. */
+export function assertSubscriptionAction(client: SubscriptionClient, input: SubscriptionIdRequest & { operationId: string }, action: SubscriptionAction): void {
+  const binding = bindings.get(action);
+  if (!binding || spent.get(client)?.has(intent(input)) || binding.client !== client || binding.authority !== identity(input.session) || binding.subscriptionId !== input.subscriptionId || binding.operationId !== input.operationId || action.secret !== binding.secret || action.kind !== binding.kind || action.expiresAt !== binding.expiresAt || Date.parse(binding.expiresAt) <= Date.now()) throw new PaymentSdkError('INVALID_SESSION');
+  parseSubscriptionAction({ kind: action.kind, secret: action.secret, expires_at: action.expiresAt });
+}
+/** Consume synchronously before any preflight await; an uncertain receipt stays spent. */
+export function consumeSubscriptionAction(client: SubscriptionClient, input: SubscriptionIdRequest & { operationId: string }, action: SubscriptionAction): void {
+  assertSubscriptionAction(client, input, action);
+  const consumed = spent.get(client) ?? new Set<string>(); consumed.add(intent(input)); spent.set(client, consumed); bindings.delete(action);
+}
+export { mountStripeSubscription } from './stripe-subscription-driver.js';
 /** Explicit one-shot Fake confirmation. Caller creates the intent key; never auto-replayed. */
 export async function confirmSubscriptionAction(client: SubscriptionClient, input: SubscriptionMutation & { operationId: string }, action: SubscriptionAction): Promise<SubscriptionOperation> {
   checkAbort(input.signal);

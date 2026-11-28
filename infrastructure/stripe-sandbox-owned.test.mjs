@@ -16,9 +16,13 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
   assert.equal(reads,0);
 });
 import {EventEmitter} from 'node:events';
+import {chmod, link, lstat, mkdtemp, open, rm, symlink, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {preflightOwnedSandbox,preflightOwnedFormDiagnostic} from './stripe-sandbox-owned.mjs';
 import * as owned from './stripe-sandbox-owned.mjs';
+import {opts as failedRenewalOptions} from './fixtures/failed-renewal-descriptors.mjs';
 
 const root=fileURLToPath(new URL('../',import.meta.url)).replace(/\/$/,'');
 const source='a'.repeat(40),daemon='unix:///tmp/owned-docker.sock';
@@ -53,6 +57,169 @@ function fixture({head=source+'\n',status='',docker='"linux"\n',metadata={},cano
 }
 function pending(phase,code) {return {status:'PENDING',phase,code};}
 function safe(result,want) {assert.deepEqual(result,want);assert.equal(Object.isFrozen(result),true);assert.equal(JSON.stringify(result).includes('PRIVATE_CANARY'),false);}
+
+// Only the exact source input maps to a temporary file. All daemon probes use the inert fixture.
+const keyFile = root+'/infrastructure/stripe-sandbox.env.local';
+const keyBytes = 'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A0\r\n'
+  + 'PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B0"\r\n'
+  + 'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\r\n';
+async function failedRenewalFixture(t) {
+  const options = failedRenewalOptions();
+  const f = fixture({head:options.expectedSource, canonical:'/Users/test/docker.sock'});
+  const directory = await mkdtemp(join(tmpdir(), 'failed-renewal-env-'));
+  t.after(() => rm(directory, {recursive:true, force:true}));
+  const file = join(directory, 'stripe-sandbox.env.local');
+  const filesystem = f.dependencies;
+  const originalStat = filesystem.lstat, originalCanonical = filesystem.realpath;
+  filesystem.lstat = async path => path === keyFile ? lstat(file)
+    : path === root+'/infrastructure' ? lstat(directory) : originalStat(path);
+  filesystem.realpath = async path => [keyFile,root+'/infrastructure'].includes(path) ? path : originalCanonical(path);
+  filesystem.open = (path, flags) => {
+    assert.equal(path, keyFile);
+    return open(file, flags);
+  };
+  return {...f, options, file};
+}
+
+for (const mode of ['launcher','bounded worker']) {
+  for (const state of ['missing','public','link','symlink','live key','extra assignment','bad verifier','valid','prior verifier']) {
+    test('failed-renewal '+mode+' checks '+state+' source configuration before Docker', async t => {
+      const f = await failedRenewalFixture(t);
+      const contents = state === 'live key' ? keyBytes.replace('sk_test_', 'sk_live_')
+        : state === 'extra assignment' ? keyBytes+'OTHER=PRIVATE_CANARY\n'
+        : state === 'bad verifier' ? keyBytes.replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=PRIVATE_CANARY')
+        : state === 'prior verifier' ? keyBytes.replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=whsec_A0011223344556677')
+        : keyBytes;
+      if (state === 'symlink') {
+        await writeFile(f.file+'.target', contents, {mode:0o600});
+        await symlink(f.file+'.target', f.file);
+      } else if (state !== 'missing') await writeFile(f.file, contents, {mode:0o600});
+      if (state === 'public') await chmod(f.file, 0o644);
+      if (state === 'link') await link(f.file, f.file+'.other');
+      const allowed = state === 'valid' || state === 'prior verifier';
+      const limits = mode === 'bounded worker' ? {deadline:Date.now()+5000} : undefined;
+      const result = await owned.preflightOwnedBillingFailedRenewal(f.options, f.dependencies, limits);
+      safe(result, allowed ? {status:'READY'} : pending('INPUTS','SANDBOX_ENV_UNCONFIRMED'));
+      const afterSource = f.calls.filter(call => call.type !== 'execute' || call.file !== '/usr/bin/git');
+      if (!allowed) assert.deepEqual(afterSource, []);
+      else assert.equal(afterSource.filter(call => call.type === 'port').length, 7);
+    });
+  }
+}
+
+test('failed-renewal source mismatch stops before private file inspection', async () => {
+  const f = fixture({head:'other source'});
+  safe(await owned.preflightOwnedBillingFailedRenewal(failedRenewalOptions(), f.dependencies),
+    pending('SOURCE','SOURCE_MISMATCH'));
+  assert.deepEqual(f.calls.map(call => [call.type,call.file]), [['execute','/usr/bin/git']]);
+});
+
+test('optional trial preflight refuses ignored Docker inputs before private admission or daemon probes',async()=>{
+  const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL:'true',
+    PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc',
+    PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_SUBNET:'10.94.40.0/28'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',
+    apiVersion:'2026-09-30.endive'},selectedCase:'optional_trial_pause_resume',controlPort:56127});
+  const f=fixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    return args.includes('--others')?{...result,stdout:'backend/src/main/resources/META-INF/PRIVATE_CANARY.class\0'}:result;
+  };
+  safe(await owned.preflightOwnedBillingOptionalTrial(input,f.dependencies),pending('SOURCE','SOURCE_MISMATCH'));
+  assert.ok(f.calls.some(call=>call.args?.includes('--others')));
+  assert.ok(f.calls.every(call=>call.type==='execute'&&call.file==='/usr/bin/git'));
+});
+
+test('cancelled failed-renewal admission closes a late file handle before reading it', async t => {
+  const f = await failedRenewalFixture(t);
+  await writeFile(f.file, keyBytes, {mode:0o600});
+  let entered, resume, closed;
+  const opening = new Promise(resolve => { entered = resolve; });
+  const released = new Promise(resolve => { resume = resolve; });
+  const cleanup = new Promise(resolve => { closed = resolve; });
+  let reads = 0;
+  f.dependencies.open = async (path, flags) => {
+    assert.equal(path, keyFile);
+    const held = await open(f.file, flags);
+    entered();
+    await released;
+    return {
+      stat:() => held.stat(), read:(...args) => { reads++; return held.read(...args); },
+      close:async () => { await held.close(); closed(); },
+    };
+  };
+  const controller = new AbortController();
+  const run = owned.preflightOwnedBillingFailedRenewal(f.options, f.dependencies, {deadline:Date.now()+5000, signal:controller.signal});
+  await opening;
+  controller.abort();
+  resume();
+  await cleanup;
+  safe(await run, pending('INPUTS','SANDBOX_ENV_UNCONFIRMED'));
+  assert.equal(reads, 0);
+  assert.deepEqual(f.calls.map(call => call.file), ['/usr/bin/git','/usr/bin/git']);
+});
+
+// The native launcher stops on this result before opening ports or creating a run.
+for (const [name, code] of [
+  ['socket lookup', 'DAEMON_SOCKET_UNCONFIRMED'],
+  ['socket ownership', 'DAEMON_SOCKET_UNCONFIRMED'],
+  ['config directory', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config present', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config error accessor', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['config error proxy', 'DAEMON_CONFIG_UNCONFIRMED'],
+  ['command exit', 'DAEMON_INFO_NONZERO_EXIT'],
+  ['terminated command', 'DAEMON_INFO_TERMINATED'],
+  ['output limit', 'DAEMON_INFO_OUTPUT_LIMIT'],
+  ['missing executable', 'DAEMON_INFO_EXEC_FAILED'],
+  ['foreign rejection', 'DAEMON_INFO_UNCONFIRMED'],
+  ['error accessor', 'DAEMON_INFO_UNCONFIRMED'],
+  ['unexpected OS', 'DAEMON_OS_UNCONFIRMED'],
+  ['OS accessor', 'DAEMON_OS_UNCONFIRMED'],
+  ['OS proxy', 'DAEMON_OS_UNCONFIRMED'],
+  ['valid Linux reply', null],
+]) test('failed-renewal daemon admission: '+name, async t => {
+  const f = await failedRenewalFixture(t);
+  const input = f.options;
+  await writeFile(f.file, keyBytes, {mode:0o600});
+  const {execute, lstat} = f.dependencies;
+  let dockerCalls = 0, privateReads = 0;
+  const privateValue = () => { privateReads++; throw Error('PRIVATE_CANARY'); };
+  f.dependencies.lstat = async path => {
+    if (path === '/Users/test/docker.sock') {
+      if (name === 'socket lookup') throw Error('PRIVATE_CANARY');
+      if (name === 'socket ownership') return {...await lstat(path), uid:process.getuid()+1};
+    }
+    if (path === '/private/var/empty' && name === 'config directory') throw Error('PRIVATE_CANARY');
+    if (path === '/private/var/empty/config.json' && name === 'config present') return {};
+    if (path === '/private/var/empty/config.json' && name === 'config error accessor')
+      throw {get code(){privateReads++; return 'ENOENT';}};
+    if (path === '/private/var/empty/config.json' && name === 'config error proxy')
+      throw new Proxy({code:'ENOENT'}, {get:privateValue, getOwnPropertyDescriptor:privateValue});
+    return lstat(path);
+  };
+  f.dependencies.execute = async (file, args, settings) => {
+    if (file === '/usr/bin/git') return execute(file, args, settings);
+    dockerCalls++;
+    assert.deepEqual(args, ['--config','/private/var/empty','--host',input.daemon,'info','--format','{{json .OSType}}']);
+    const error = Error('PRIVATE_CANARY');
+    if (name === 'command exit') throw Object.assign(error, {code:1});
+    if (name === 'terminated command') throw Object.assign(error, {code:null, killed:true, signal:'SIGTERM'});
+    if (name === 'output limit') throw Object.assign(error, {code:'ERR_CHILD_PROCESS_STDIO_MAXBUFFER', killed:true, signal:'SIGTERM'});
+    if (name === 'missing executable') throw Object.assign(error, {code:'ENOENT'});
+    if (name === 'foreign rejection') throw new Proxy(error, {get:privateValue, getOwnPropertyDescriptor:privateValue});
+    if (name === 'error accessor') throw Object.defineProperty(error, 'code', {get:privateValue});
+    if (name === 'OS accessor') return {get stdout(){privateReads++; return '"linux"';}};
+    if (name === 'OS proxy') return new Proxy({stdout:'"linux"'}, {
+      get(_target, key){return key === 'then' ? undefined : privateValue();},
+      getOwnPropertyDescriptor:privateValue,
+    });
+    return {stdout:name === 'unexpected OS' ? 'PRIVATE_CANARY' : '"linux"\n', get stderr(){return privateValue();}};
+  };
+  safe(await owned.preflightOwnedBillingFailedRenewal(input, f.dependencies),
+    code ? pending('DAEMON', code) : {status:'READY'});
+  assert.equal(privateReads, 0);
+  assert.equal(dockerCalls, name.startsWith('socket') || name.startsWith('config') ? 0 : 1);
+  assert.equal(f.calls.filter(call => call.type === 'port').length, code ? 0 : 7);
+});
 
 test('diagnostic preflight uses dedicated flags while full preflight refuses mixed modes',async()=>{
   const env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'},f=fixture();
@@ -275,4 +442,29 @@ test('manual seventh port cannot admit before verified close and unconfirmed clo
   const expired=controlledProbe({manual:true,immediate:true,holdPort:56127}),pendingResult=owned.preflightOwnedManualFormDiagnostic(manualOptions(),expired.dependencies);
   for(let n=0;n<40&&expired.servers.length<7;n++)await new Promise(resolve=>setImmediate(resolve));
   expired.expire();safe(await pendingResult,pending('PORTS','PORT_UNAVAILABLE'));expired.servers[6].closed();assert.equal(expired.servers.length,7);
+});
+
+test('Billing preflight reuses exact source daemon and six-port proof without legacy financial flags',async()=>{
+  const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'}),f=fixture();
+  safe(await owned.preflightOwnedBilling(input,f.dependencies),{status:'READY'});assert.equal(f.calls.filter(c=>c.type==='port').length,6);
+  const wrong=fixture({head:'b'.repeat(40)});safe(await owned.preflightOwnedBilling(input,wrong.dependencies),pending('SOURCE','SOURCE_MISMATCH'));assert.equal(wrong.calls.filter(c=>c.type==='port').length,0);
+});
+test('Billing runtime preflight cancellation reaches command and prevents late source-to-daemon continuation',async()=>{
+ const controller=new AbortController(),f=fixture();let release,signal;
+ f.dependencies.execute=async(_file,_args,settings)=>{signal=settings.signal;return new Promise(r=>release=r);};
+ const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success'});
+ const pending=owned.preflightOwnedBilling(input,f.dependencies,{deadline:Date.now()+1000,signal:controller.signal});await new Promise(r=>setTimeout(r,5));controller.abort();
+ assert.equal((await pending).status,'PENDING');assert.equal(signal.aborted,true);release({stdout:source+'\n',stderr:''});await new Promise(r=>setTimeout(r,5));assert.deepEqual(f.calls,[]);
+});
+test('first-payment preflight owns all seven distinct ports and source before any runtime authority',async()=>{const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_success',controlPort:56127,frozenTime:1790000000}),f=fixture();safe(await owned.preflightOwnedBillingFirstPayment(input,f.dependencies),{status:'READY'});assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[...Object.values(ports),56127]);const busy=fixture();busy.dependencies.portAvailable=async p=>p!==56127;safe(await owned.preflightOwnedBillingFirstPayment(input,busy.dependencies),pending('PORTS','PORT_UNAVAILABLE'));const drift=fixture({head:'b'.repeat(40)});safe(await owned.preflightOwnedBillingFirstPayment(input,drift.dependencies),pending('SOURCE','SOURCE_MISMATCH'));assert.equal(drift.calls.some(c=>c.type==='port'),false);});
+
+test('first-renewal preflight owns seventh port and rejects wrong modes before dependencies',async()=>{
+ const input=options({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},selectedCase:'initial_and_first_renewal',controlPort:56127,frozenTime:1790000000}),f=fixture();
+ assert.equal(typeof owned.preflightOwnedBillingFirstRenewal,'function');
+ safe(await owned.preflightOwnedBillingFirstRenewal(input,f.dependencies),{status:'READY'});
+ assert.deepEqual(f.calls.filter(c=>c.type==='port').map(c=>c.port),[...Object.values(ports),56127]);
+ let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});
+ for(const change of [{selectedCase:'initial_success'},{env:{...input.env,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'}},{controlPort:ports.backend}])safe(await owned.preflightOwnedBillingFirstRenewal({...input,...change},trap),pending('OPT_IN','OPT_IN_REQUIRED'));
+ safe(await owned.preflightOwnedBillingFirstPayment(input,trap),pending('OPT_IN','OPT_IN_REQUIRED'));assert.equal(reads,0);
+ const busy=fixture();busy.dependencies.portAvailable=async p=>p!==56127;safe(await owned.preflightOwnedBillingFirstRenewal(input,busy.dependencies),pending('PORTS','PORT_UNAVAILABLE'));
 });

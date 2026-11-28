@@ -1,6 +1,15 @@
+import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {billingOptionalTrialOptIn,validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
+import {hasOnlyTrackedOptionalTrialInputs} from './stripe-billing-optional-trial-source.mjs';
+import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
+import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
+import {validateFailedRenewalUserEnv} from './stripe-sandbox-user-env.mjs';
+import {billingBounded,billingCheck} from './stripe-billing-limits.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
+import {isProxy} from 'node:util/types';
 import {lstat,realpath} from 'node:fs/promises';
 import {createServer} from 'node:net';
 import {dirname,resolve} from 'node:path';
@@ -14,6 +23,23 @@ const CONFIG='/private/var/empty';
 const PORTS=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
 const executeFile=promisify(execFile);
 const pending=(phase,code)=>Object.freeze({status:'PENDING',phase,code});
+
+// Read native result data without invoking getters or proxy traps.
+function ownDataField(object, name) {
+  if (object === null || typeof object !== 'object' || isProxy(object)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(object, name);
+  return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+}
+
+function daemonInfoFailure(error) {
+  const code = ownDataField(error, 'code');
+  if (code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') return 'DAEMON_INFO_OUTPUT_LIMIT';
+  if (Number.isSafeInteger(code) && code !== 0) return 'DAEMON_INFO_NONZERO_EXIT';
+  if (['ENOENT','EACCES','ENOEXEC','EAGAIN'].includes(code)) return 'DAEMON_INFO_EXEC_FAILED';
+  if (ownDataField(error, 'killed') === true && ownDataField(error, 'signal') === 'SIGTERM') return 'DAEMON_INFO_TERMINATED';
+  return 'DAEMON_INFO_UNCONFIRMED';
+}
+
 // Nothing is inherited. Git status cannot refresh the index or invoke a configured fsmonitor.
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C',
   GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'});
@@ -53,6 +79,28 @@ function portAvailable(port,host,dependencies) {
 export async function preflightOwnedSandbox(options,dependencies={}) {
   return preflight(options,dependencies,false);
 }
+export async function preflightOwnedBillingFirstPayment(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'first-payment');}
+export async function preflightOwnedBillingFirstRenewal(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'first-renewal');}
+export async function preflightOwnedBillingFailedRenewal(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'failed-renewal');}
+export async function preflightOwnedBillingOptionalTrial(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'optional-trial');}
+export async function preflightOwnedBilling(options,dependencies={},limits){return preflightBilling(options,dependencies,limits,'billing');}
+async function preflightBilling(options,dependencies,limits,mode) {
+  const selected=(mode==='optional-trial'?validateBillingOptionalTrialOptions:mode==='failed-renewal'?validateBillingFailedRenewalOptions:mode==='first-renewal'?validateBillingFirstRenewalOptions:mode==='first-payment'?validateBillingFirstPaymentOptions:validateBillingAcceptanceOptions)(options);
+  if(!selected)return pending('OPT_IN','OPT_IN_REQUIRED');
+  const raw=dependencies;
+  const checkUserEnv=()=>limits===undefined ? validateFailedRenewalUserEnv(raw)
+    : billingBounded(limits,l=>validateFailedRenewalUserEnv(raw,()=>billingCheck(l)));
+  if(limits!==undefined){
+    // Runtime-only authority is explicit; each boundary rechecks it before dispatch and after completion.
+    dependencies={
+      execute:(file,args,settings)=>billingBounded(limits,l=>(raw.execute??executeFile)(file,args,{...settings,signal:l.signal,timeout:Math.min(settings.timeout,l.deadline-Date.now())}),10000),
+      lstat:path=>billingBounded(limits,()=>(raw.lstat??lstat)(path)),
+      realpath:path=>billingBounded(limits,()=>(raw.realpath??realpath)(path)),
+      portAvailable:(port,host)=>billingBounded(limits,()=>raw.portAvailable?raw.portAvailable(port,host):portAvailable(port,host,raw),4000),
+    };
+  }
+  return preflight(selected,dependencies,mode,checkUserEnv);
+}
 
 // This gate runs before consulting dependencies or any private configuration.
 export function formDiagnosticOptIn(env) {
@@ -88,41 +136,57 @@ export async function preflightOwnedManualPayment(options,dependencies={}) {
   const selected=validateManualPaymentOptions(options);if(!selected)return pending('INPUTS','CONFIGURATION');
   return preflight(selected,dependencies,'payment');
 }
-async function preflight(options,dependencies,diagnostic) {
+async function preflight(options,dependencies,diagnostic,checkUserEnv) {
   let phase='OPT_IN',code='OPT_IN_REQUIRED';
   try {
     const env=Object.getOwnPropertyDescriptor(options??{},'env')?.value;
-    if(!remainderExcluded(env))return pending(phase,code);
-    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
+    const billingMode=['billing','first-payment','first-renewal','failed-renewal','optional-trial'].includes(diagnostic);
+    if(diagnostic==='optional-trial'?!billingOptionalTrialOptIn(env):diagnostic==='failed-renewal'?!billingFailedRenewalOptIn(env):diagnostic==='first-renewal'?!billingFirstRenewalOptIn(env):diagnostic==='first-payment'?!billingFirstPaymentOptIn(env):diagnostic==='billing'?!billingAcceptanceOptIn(env):!billingAcceptanceExcluded(env))return pending(phase,code);
+    if(!billingMode&&!remainderExcluded(env))return pending(phase,code);
+    if(env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'||(billingMode?false:diagnostic==='payment'?!manualPaymentOptIn(env):diagnostic==='manual'?!manualFormOptIn(env):diagnostic?!formDiagnosticOptIn(env):(env?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='true'||env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS!=='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT==='true'
       ||env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC==='true'||env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY==='true'||env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC==='true')))return pending(phase,code);
     phase='INPUTS';code='CONFIGURATION';
     if(![undefined,''].includes(env.DEBUG)||![undefined,''].includes(env.NODE_DEBUG)||![undefined,'','0'].includes(env.PWDEBUG))return pending(phase,code);
     const topology=validateFormDiagnosticTopology(options);if(!topology)return pending(phase,code);
     const {expectedSource,daemon,ports}=topology,url=new URL(daemon);
-    const selectedPorts=PORTS.map(name=>ports[name]);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
+    const selectedPorts=PORTS.map(name=>ports[name]);if(['first-payment','first-renewal','failed-renewal','optional-trial'].includes(diagnostic))selectedPorts.push(options.controlPort);if(diagnostic==='manual'||diagnostic==='payment')selectedPorts.push(options.manualPort);
 
     phase='SOURCE';code='SOURCE_MISMATCH';
     const execute=dependencies.execute??executeFile;
     const processOptions={cwd:ROOT,env:CHILD_ENV,shell:false,timeout:10000,maxBuffer:16384};
     const head=await execute('/usr/bin/git',['rev-parse','HEAD'],processOptions);
     if(head.stdout!==expectedSource+'\n'&&head.stdout!==expectedSource)return pending(phase,code);
-    const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1','--untracked-files=no'],processOptions);
+    const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1',diagnostic==='optional-trial'?'--untracked-files=all':'--untracked-files=no'],processOptions);
     if(status.stdout!=='')return pending(phase,code);
+    if(diagnostic==='optional-trial'&&!await hasOnlyTrackedOptionalTrialInputs(execute,processOptions))return pending(phase,code);
 
-    phase='DAEMON';code='DAEMON_UNCONFIRMED';
+    if(['failed-renewal','optional-trial'].includes(diagnostic)) {
+      phase='INPUTS';code='SANDBOX_ENV_UNCONFIRMED';
+      await checkUserEnv();
+    }
+
+    const reportDaemonStep = diagnostic === 'failed-renewal';
+    phase='DAEMON';code=reportDaemonStep?'DAEMON_SOCKET_UNCONFIRMED':'DAEMON_UNCONFIRMED';
     const inspect=dependencies.lstat??lstat,canonical=dependencies.realpath??realpath;
     const socket=await inspect(url.pathname);
     if(!socket.isSocket()||socket.isSymbolicLink()||socket.uid!==process.getuid()||await canonical(url.pathname)!==url.pathname)return pending(phase,code);
+    if(reportDaemonStep)code='DAEMON_CONFIG_UNCONFIRMED';
     const config=await inspect(CONFIG);
     if(!config.isDirectory()||config.isSymbolicLink()||config.uid!==0||!Number.isInteger(config.mode)||(config.mode&0o022)!==0||await canonical(CONFIG)!==CONFIG)return pending(phase,code);
     try {await inspect(CONFIG+'/config.json');return pending(phase,code);}
-    catch(error) {if(error?.code!=='ENOENT')return pending(phase,code);}
+    catch(error) {
+      const configError = reportDaemonStep ? ownDataField(error, 'code') : error?.code;
+      if(configError!=='ENOENT')return pending(phase,code);
+    }
+    if(reportDaemonStep)code='DAEMON_INFO_UNCONFIRMED';
     const docker=await execute(DOCKER,['--config',CONFIG,'--host',daemon,'info','--format','{{json .OSType}}'],processOptions);
-    if(docker.stdout!=='"linux"\n'&&docker.stdout!=='"linux"')return pending(phase,code);
+    if(reportDaemonStep)code='DAEMON_OS_UNCONFIRMED';
+    const os = reportDaemonStep ? ownDataField(docker, 'stdout') : docker.stdout;
+    if(os!=='"linux"\n'&&os!=='"linux"')return pending(phase,code);
 
     phase='PORTS';code='PORT_UNAVAILABLE';
     const available=dependencies.portAvailable??((port,host)=>portAvailable(port,host,dependencies));
     for(const port of selectedPorts)if(await available(port,'127.0.0.1')!==true)return pending(phase,code);
     return Object.freeze({status:'READY'});
-  }catch {return pending(phase,code);}
+  }catch(error) {return pending(phase,code==='DAEMON_INFO_UNCONFIRMED'?daemonInfoFailure(error):code);}
 }

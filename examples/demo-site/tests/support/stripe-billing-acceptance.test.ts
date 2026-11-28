@@ -1,0 +1,1628 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {readFile} from 'node:fs/promises';
+// @ts-expect-error Native Node type erasure requires explicit source extension.
+import {forwardBillingDispatch,runInitialBillingBrowser,runBillingCancellationBrowser,runBillingDeclineRetryBrowser,runBillingInitial3dsBrowser,runBillingInvoiceWebhooksBrowser,runBillingRequiredTrialBrowser} from './stripe-billing-acceptance.ts';
+// @ts-ignore Native Node executes the protocol fixture registration.
+import {registerChromiumProtocolFixture} from './stripe-billing-chromium-route.ts';
+import type {SubscriptionOperation} from '@generic-payments/sdk';
+import type {BillingBinding,BillingPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import {errors,type Route} from '@playwright/test';
+const binding={endpoints:{backend:'http://127.0.0.1:18080',demo:'http://127.0.0.1:18081',receiver:'http://127.0.0.1:18082'},priceId:'11111111-2222-4333-8444-555555555555'} as BillingBinding;
+function fixture(){const calls:string[]=[],headers={origin:binding.endpoints.demo,'content-type':'application/json',authorization:'Bearer '+'A'.repeat(43),'idempotency-key':'original-sdk-key'};let args:unknown[]=[];const request={url:()=>binding.endpoints.backend+'/api/v1/customer/subscriptions',method:()=> 'POST',redirectedFrom:()=>null,postData:()=>JSON.stringify({price_id:binding.priceId,recurring_consent:true}),allHeaders:async()=>headers};const route={request:()=>request,continue:async(...v:unknown[])=>{args=v;calls.push('continue');}} as unknown as Route;const port={beforeDispatch:async()=>{calls.push('persist');return true;}} as unknown as BillingPort;return {calls,headers,request,route,port,args:()=>args};}
+test('original browser CREATE waits for durable key before unmodified continuation',async()=>{const f=fixture();await forwardBillingDispatch(f.route,f.port,binding,'Bearer '+'A'.repeat(43),'create',undefined,{deadline:Date.now()+1000});assert.deepEqual(f.calls,['persist','continue']);assert.deepEqual(f.args(),[]);});
+test('browser confirmation does not persist a dispatch after Pay retires during manager validation',async()=>{
+ const f=fixture(),identity={subscriptionId:'subscription',operationId:'operation',attemptId:'attempt'};
+ f.request.url=()=>binding.endpoints.backend+'/api/v1/customer/subscriptions/subscription/operations/operation/confirmation-attempts/attempt/confirm';
+ f.request.postData=()=>JSON.stringify({capability:'bca2_'+'C'.repeat(43),confirmation_token:'ctoken_fixture'});
+ let current=true;
+ await assert.rejects(forwardBillingDispatch(f.route,f.port,binding,f.headers.authorization,'confirm',identity,
+  {deadline:Date.now()+1000},{token:'ctoken_fixture',check:()=>assert.ok(current)},async()=>{current=false;}),/billing_BROWSER/);
+ assert.deepEqual(f.calls,[]);
+});
+for(const kind of ['foreign-origin','cookie','authority','body','persist-failure'])test('browser dispatch refuses '+kind,async()=>{const f=fixture();if(kind==='foreign-origin')f.headers.origin='https://other.test';if(kind==='cookie')Object.assign(f.headers,{cookie:'session=bad'});if(kind==='authority')f.headers.authorization='Bearer '+'B'.repeat(43);if(kind==='body')f.request.postData=()=>'{"price_id":"foreign","recurring_consent":true}';if(kind==='persist-failure')f.port.beforeDispatch=async()=>{throw Error('secret-sentinel');};await assert.rejects(()=>forwardBillingDispatch(f.route,f.port,binding,'Bearer '+'A'.repeat(43),'create',undefined,{deadline:Date.now()+1000}),e=>e instanceof Error&&!e.message.includes('sentinel'));assert.ok(!f.calls.includes('continue'));});
+test('native Billing discovery is dedicated, bounded and explicitly excluded by default',async()=>{const config=await readFile(new URL('../../playwright.stripe-billing.config.ts',import.meta.url),'utf8'),normal=await readFile(new URL('../../playwright.config.ts',import.meta.url),'utf8');assert.match(config,/workers:1/);assert.match(config,/retries:0/);assert.match(config,/trace:'off'/);assert.doesNotMatch(config,/webServer/);assert.match(normal,/stripe-billing\.spec\.ts/);assert.match(normal,/stripe-billing-acceptance\.test\.ts/);assert.match(normal,/subscription-elements-browser\.test\.ts/);});
+test('native runner reserves cleanup and scheduling time beyond the unchanged owner budget',async()=>{
+ const [config,spec,owner]=await Promise.all([
+  readFile(new URL('../../playwright.stripe-billing.config.ts',import.meta.url),'utf8'),
+  readFile(new URL('../stripe-billing.spec.ts',import.meta.url),'utf8'),
+  readFile(new URL('../../../../infrastructure/stripe-billing-acceptance.mjs',import.meta.url),'utf8')
+ ]);
+ const number=(source:string,pattern:RegExp)=>{const match=source.match(pattern);assert.ok(match,'expected explicit timeout contract');return Number(match[1]);};
+ const ownerBudget=number(spec,/limits=\{deadline:Date\.now\(\)\+(\d+)/);
+ const cleanupBudget=number(spec,/owner\.close\(\{deadline:Date\.now\(\)\+(\d+)/);
+ const runnerBudget=number(config,/(?<!\w)timeout:(\d+)/);
+ const globalBudget=number(config,/globalTimeout:(\d+)/);
+ assert.equal(ownerBudget,45*60*1000);
+ assert.equal(number(owner,/limits\.deadline-Date\.now\(\)>(\d+)/),ownerBudget);
+ assert.equal(cleanupBudget,120*1000);
+ assert.equal(number(owner,/limits=\{deadline:Math\.min\(now,active\?\.deadline\?\?now\)\+(\d+)/),cleanupBudget);
+ assert.equal(runnerBudget,ownerBudget+cleanupBudget+60*1000);
+ assert.equal(runnerBudget,48*60*1000);
+ assert.equal(globalBudget,50*60*1000);
+ assert.ok(globalBudget>runnerBudget);
+});
+
+// A single in-memory page sends SDK-shaped requests only in response to visible manager
+// controls. It cannot make network calls. Responses retain their originating request.
+import type {Browser, Request, Response} from '@playwright/test';
+import type {BillingCancellationPort,BillingDeclineRetryPort,BillingInitial3dsPort,BillingInvoiceWebhooksPort,BillingRequiredTrialPort} from '../../../../infrastructure/stripe-billing-acceptance.mjs';
+import {browserCleanupConfirmed,browserDiagnostic,browserProviderOrigin} from '../../../../infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs';
+
+type SessionFailure = {
+ status:number; problem?:object; contentType?:string; contentEncoding?:string; contentLength?:string|null;
+ measuredSize?:number; unreadable?:boolean; holdSize?:()=>Promise<void>; holdBody?:()=>Promise<void>;
+};
+const approvedFixtureIssuer='https://approved-synthetic.stripe.com';
+function cancellationPage(fault = '', declineRetry = false, sca = false, invoiceCase = false, sessionFailure?:SessionFailure, pinnedCancellation=false,
+ advanceTrialClock:(milliseconds:number)=>void=()=>{}, trial=false) {
+ const responseGuard=sca||invoiceCase||pinnedCancellation||trial;
+ const id = (n:number) => '11111111-2222-4333-8444-' + String(n).padStart(12, '0');
+ const b = {...binding, runId:id(99), expectedSource:'e'.repeat(40), siteKey:'demo-key', email:'user@example.test', siteId:id(1), productId:id(2),accountId:id(12)};
+ const [sub, create, attempt, schedule, withdraw] = [id(3), id(4), id(5), id(6), id(7)];
+ const boundary = new Date(Date.now() + 86400000).toISOString();
+ const token = 'A'.repeat(43);
+ const base = b.endpoints.backend + '/api/v1/customer/subscriptions';
+ const otp = b.endpoints.backend + '/api/v1/public/customer-auth/email-otp/challenges';
+ const currentCustomer = b.endpoints.backend + '/api/v1/customer/me';
+ const trialOffer = b.endpoints.backend + '/api/v1/customer/subscription-products/' + b.productId + '/offers';
+ const cancel = base + '/' + sub + '/cancellation';
+ const operation = base + '/' + sub + '/operations/' + create;
+ const select = operation + '/confirmation-session';
+ const trialPermit=operation+'/action-confirmations', setupId='seti_fixture', setupSecret=setupId+'_secret_fixture';
+ const setupUrl='https://api.stripe.com/v1/setup_intents/'+setupId+'/confirm';
+ const grant='bga1_'+'G'.repeat(43);
+ const action={kind:'PROVIDER_CLIENT',secret:grant,expires_at:boundary};
+ const trialPeriod={start:new Date(Date.now()-1000).toISOString(),end:boundary};
+ let setupFinished=false, trialRefreshed=false,trialSettled=false,trialSamples=0;
+ const uncompletedTrial=fault==='trial-watch-expired'||fault==='trial-customer-expired';
+ const delayedTrial=trial && (uncompletedTrial||fault==='trial-delayed-settlement'||fault.startsWith('trial-terminal-'));
+ const trialSessionExpiry=fault==='trial-customer-expired'?new Date(Date.now()+120_000).toISOString():boundary;
+ const trialStatus=(status:SubscriptionOperation['status'],foreign=false):SubscriptionOperation=>({
+  subscriptionId:sub!,operationId:foreign?id(92):create!,status,actionAvailable:status==='REQUIRES_ACTION'
+ });
+ const confirm = base + '/' + sub + '/operations/' + create + '/confirmation-attempts/' + attempt + '/confirm';
+ const trace:string[] = [], sent:string[] = [], numbers:string[]=[], keysPressed:string[]=[];
+ const successor=id(21),retry=confirm.replace(/confirm$/,'retry'),nextConfirm=confirm.replace(attempt!,successor);
+ const sessionFor=(id:string)=>({protocol:'SERVER_CONFIRM_V2',provider:'stripe',flow:'PAYMENT',attempt_id:id,publishable_key:'pk_test_fixture',
+  capability:'bca2_'+(id===attempt?'C':'D').repeat(43),client_secret:'pi_original_secret_fixture',expires_at:boundary});
+ const receiptFor=(id:string,state:string,retry_allowed:boolean,successor_attempt_id:string|null)=>({protocol:'SERVER_CONFIRM_V2',attempt_id:id,state,retry_allowed,successor_attempt_id,expires_at:boundary});
+ let payCount=0,armedPay=0,retryClicked=false,nonce=30,staticProbed=false,sessionErrorBodyReads=0;
+ let latePay:Promise<void>|undefined,lateCreate:Promise<void>|undefined;
+ let pinnedFrameChanged=false, replaceFrameOnTokenCheck=false;
+ const failureListeners:((request:Request)=>void)[]=[];
+ const requestFailed=(request:Request)=>{for(const listener of failureListeners)listener(request);};
+ const presentation:string[]=[];
+ async function staticPresentation(){
+  const document=!fault.startsWith('static-image') && !fault.startsWith('early-static-image') && !fault.startsWith('successor-static-image');
+  const nested={parentFrame:()=>fault==='static-nav-direct-child'?frame:stripeFrame,page:()=>page,isDetached:()=>false,url:()=>''};
+  const request={url:()=>document?'https://private.example/presentation?frame=1':
+    'https://private.example/image.png'+(fault==='static-image-query'?'?value=private-canary':''),
+   method:()=>fault==='static-method'?'POST':'GET',
+   frame:()=>{
+    if(fault==='static-nav-unavailable')throw Error('private frame canary');
+    return fault==='static-main-navigation'?frame:document?nested:stripeFrame;
+   },
+   resourceType:()=>{
+    if(fault==='static-image-frame-before-fetch')queueMicrotask(()=>{pinnedFrameChanged=true;});
+    return document?'document':fault==='static-image-kind'?'xhr':'image';
+   },isNavigationRequest:()=>document,
+   postData:()=>null,redirectedFrom:()=>null,
+   allHeaders:async()=>fault==='static-credentials'?{cookie:'private-canary'}:fault==='static-image-cors'?{origin:'https://js.stripe.com'}:{},
+   failure:()=>({errorText:'net::ERR_BLOCKED_BY_CLIENT'})} as unknown as Request;
+  if(fault.startsWith('early-static-image')||fault.startsWith('successor-static-image'))trace.push('pinned asset intercepted');
+  await handler({request:()=>request,abort:async(reason:string)=>{
+   presentation.push('abort '+reason);if(reason==='blockedbyclient')requestFailed(fault==='static-foreign-event'?{...request} as Request:request);
+  },fulfill:async(reply:{status:number})=>{presentation.push('fulfilled '+reply.status);}} as unknown as Route);
+ }
+ const frame = {name:()=>'',page:()=>page,isDetached:()=>false,url:()=>documentUrl};
+ const stripeFrame = {name:()=>'stripe',page:()=>fault==='static-image-foreign-page'?{}:page,
+  getByRole:()=>({count:async()=>0}),
+  isDetached:()=>fault==='static-image-detached'||verified&&fault==='detached',
+  url:()=>{
+   if(fault==='static-image-uncommitted')return '';
+   if(fault==='static-image-blank')return 'about:blank';
+   if(verified&&fault==='wrong-parent')return 'https://unowned.invalid/';
+   return pinnedFrameChanged?'https://js.stripe.com/v3/replaced.html':'https://js.stripe.com/v3/frame.html';
+  },parentFrame:()=>frame};
+ const providerSent:string[]=[];
+ let releaseFirstToken:undefined|(()=>void),delayedToken:Promise<void>|undefined;
+ const delayedHeaders=Promise.withResolvers<void>();
+ let payClicked=false, interceptsProvider=false;
+ let documentUrl = '', closed = false, verified = false, displayed:'initial'|'schedule'|'withdraw' = 'initial';
+ let ack:'schedule'|'withdraw'|undefined, refreshed = false;
+ let releaseBody:undefined|(()=>void), duplicateConfirm:undefined|(()=>Promise<void>);
+ let releaseDispatch:undefined|(()=>void);
+ const cancellationPersisting=Promise.withResolvers<void>(),releaseCancellation=Promise.withResolvers<void>();
+ let handler:(route:Route)=>Promise<void>;
+ let socketHandler:undefined|((socket:{close:()=>void})=>void);
+ const navigationListeners:((frame:unknown)=>void)[]=[];
+ const navigate=(frame:unknown)=>{for(const listener of navigationListeners)listener(frame);};
+ const waiters = new Set<{predicate:(r:Response)=>boolean;resolve:(r:Response)=>void;reject:(e:Error)=>void}>();
+ function publish(request:Request, status:number, json:object|null) {
+  const earlyInitial=fault.startsWith('early-static')&&request.url()===select;
+  const earlySuccessor=fault.startsWith('successor-static-image')&&request.url().endsWith('/client-session');
+  const earlyStatic=((declineRetry||sca||trial)&&earlyInitial)||(declineRetry&&earlySuccessor);
+  const bodyAvailable=earlyStatic?Promise.withResolvers<void>():undefined;
+  const response = {request:()=>request,url:()=>request.url(),status:()=>status,
+   fromServiceWorker:()=>fault==='trial-setup-worker'&&request.url()===setupUrl,body:async()=>{
+   if(request.url()===select && status!==200){
+    sessionErrorBodyReads++;
+    if(sessionFailure?.unreadable)throw Error('private diagnostic canary');
+    await sessionFailure?.holdBody?.();
+   }
+   await bodyAvailable?.promise;
+   if(earlyStatic)trace.push(earlyInitial?'initial session body read':'successor session body read');
+   if(request.url()===select){
+    if(fault==='initial-session-wire-read')throw Error('private response read canary');
+    if(fault==='initial-session-wire-size')return Buffer.alloc(65537);
+    if(fault==='initial-session-wire-json')return Buffer.from('private syntax canary');
+    if(fault==='initial-session-wire-object')return Buffer.from('null');
+   }
+   return Buffer.from(JSON.stringify(json));
+  },headerValue:async(name:string)=>{
+   if(name==='content-type')return sessionFailure?.contentType??null;
+   if(name==='content-length')return sessionFailure?.contentLength===undefined?String(Buffer.byteLength(JSON.stringify(json))):sessionFailure.contentLength;
+   return sessionFailure?.contentEncoding??null;
+  }} as unknown as Response;
+  for(const w of waiters) if(w.predicate(response)){waiters.delete(w);w.resolve(response);}
+  if(bodyAvailable){
+   // The page got its session response. The observer's independent body read
+   // can still be pending when the browser requests the first Stripe asset.
+   queueMicrotask(()=>void staticPresentation().catch(()=>{}));
+   setImmediate(()=>{
+    if(fault==='early-static-navigation')navigate(frame);
+    if(fault==='early-static-image-frame-changed')pinnedFrameChanged=true;
+    if(fault==='early-static-image-same-url-navigation'||fault==='early-static-nav-parent-same-url')navigate(stripeFrame);
+    bodyAvailable.resolve();
+   });
+  }
+  return response;
+ }
+ async function provider(url:string,owner:unknown=stripeFrame,delay=false,method='POST'){
+  if(!interceptsProvider){providerSent.push(url);return;}
+  const tokenCall=url.endsWith('/confirmation_tokens');
+  const badSupport=!tokenCall;
+  let tokenResponse:Response|null=null;
+  const reply=observeNetwork(owner,url,method);
+  const request={url:()=>url,method:()=>method,frame:()=>owner,isNavigationRequest:()=>false,redirectedFrom:()=>badSupport&&fault==='telemetry-redirect'?{}:null,
+   existingResponse:()=>tokenResponse,
+   allHeaders:async()=>{
+    if(tokenCall && fault==='3ds-token-frame-changes-during-owner-check')replaceFrameOnTokenCheck=true;
+    if(delay){delayedHeaders.resolve();await new Promise<void>(r=>{releaseFirstToken=r;});}
+    if(fault==='provider-route-cookie'&&url==='https://r.stripe.com/')return {cookie:'provider=demo'};
+    return badSupport&&fault==='telemetry-auth'?{authorization:'Bearer '+token}:badSupport&&fault==='telemetry-cookie'?{cookie:'provider=demo'}:{origin:'https://js.stripe.com'};}} as unknown as Request;
+  await handler({request:()=>request,fallback:async()=>{
+   providerSent.push(url);await reply(tokenCall?'token':new URL(url).hostname,200);
+   if(tokenCall&&!['missing-token-response','confirm-token-no-response'].includes(fault))tokenResponse={
+    request:()=>fault==='wrong-token-request'?{...request}:request,url:()=>url,
+    status:()=>['token-failure','confirm-token-http'].includes(fault)?402:200,fromServiceWorker:()=>fault==='token-worker',
+    body:async()=>{
+     if(fault==='pending-token-body')await new Promise<void>(resolve=>{setTimeout(resolve,5);});
+     if(fault==='concurrent-confirm')await new Promise<void>(resolve=>{releaseBody=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
+     return Buffer.from(JSON.stringify({object:fault==='token-type'?'payment_method':'confirmation_token',id:declineRetry&&payCount===2&&fault!=='reused-token'?'ctoken_second':'ctoken_demo',livemode:fault==='live-token'}));
+    }
+   } as Response;
+  },continue:async()=>{providerSent.push(url);},abort:async()=>{}} as unknown as Route);
+  if(closed)throw new Error('closed');
+ }
+ const issuerHost=fault==='contract-approved-issuer'?approvedFixtureIssuer:'https://hooks.stripe.com';
+ let issuerDocument='about:blank',issuerReplaced=false,challengeClicked=false;
+ const issuerButton={
+  ownerFrame:async()=>issuer,isVisible:async()=>issuerDocument!=='about:blank'&&!challengeClicked,
+  isEnabled:async()=>fault!=='contract-disabled',
+  evaluate:async()=>!issuerReplaced,
+  click:async()=>{
+   trace.push('issuer Complete');challengeClicked=true;
+   if(fault==='contract-settlement-error'){manager.state.phase='error';return;}
+   if(fault!=='contract-no-settlement'){
+    manager.state.phase='ready';
+    subscription.billingStatus='ACTIVE';
+    subscription.access={allowed:true,reason:'PAID'};
+    if(fault==='contract-wrong-subscription')subscription.subscriptionId=id(75);
+   }
+  },
+  dispose:async()=>{},
+ };
+ const issuer={
+  page:()=>page,isDetached:()=>false,url:()=>issuerDocument,name:()=>'arbitrary-synthetic-name',parentFrame:()=>stripeFrame,
+  getByRole:(role:string,opts:{name:string;exact:boolean})=>{
+   assert.equal(role,'button');assert.deepEqual(opts,{name:'Complete',exact:true});
+   return {
+    count:async()=>issuerDocument==='about:blank'||challengeClicked?0:1,
+    isVisible:issuerButton.isVisible,isEnabled:issuerButton.isEnabled,
+    elementHandle:async()=>issuerButton,
+    evaluate:async(_fn:unknown,element:unknown)=>element===issuerButton&&!issuerReplaced,
+   };
+  },
+ };
+ const cdpFrames=[
+  {node:frame,id:'checkout-frame',parent:undefined},
+  {node:stripeFrame,id:'stripe-frame',parent:frame},
+  {node:issuer,id:'issuer-frame',parent:stripeFrame},
+ ];
+ function cdpFrameTree(entry:typeof cdpFrames[number]):unknown{
+  return {frame:{id:entry.id,url:entry.node.url()||'about:blank',name:entry.node.name()},
+   childFrames:cdpFrames.filter(child=>child.parent===entry.node).map(cdpFrameTree)};
+ }
+ const devtools=new Map<string,(value:unknown)=>void>();
+ let networkSequence=0;
+ let armedPatterns:string[]=[];
+ const abortedPauses=new Set<string>();
+ function observeNetwork(target:unknown,url:string,method:string){
+  const networkId='net'+(++networkSequence),request={url,method};
+  const frameId=cdpFrames.find(entry=>entry.node===target)?.id??'foreign-frame';
+  devtools.get('Network.requestWillBeSent')?.({requestId:networkId,frameId,request});
+  const reply=async(label:string,status:number)=>{
+   if(!responseGuard)return;
+   const redirect=fault==='redirect-'+label;
+   const covered=armedPatterns.some(pattern=>{
+    const escaped=pattern.split('*').map(part=>part.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+    return new RegExp('^'+escaped.join('.*')+'$').test(url);
+   });
+   const topology=sca&&label==='challenge-provider'?{}:{networkId,frameId};
+   if(covered)await devtools.get('Fetch.requestPaused')?.({requestId:networkId,...topology,request,responseStatusCode:redirect?307:status,
+    responseHeaders:redirect?[{name:'Location',value:'https://unlisted.invalid/unsafe'}]:[]});
+   if(abortedPauses.has(networkId))throw Error('stopped response');
+   if(redirect)trace.push('followed redirect '+label);
+  };
+  return reply;
+ }
+ async function wire(url:string,target:unknown,data:string|null,json:object){
+  const method=data===null?'GET':'POST',reply=observeNetwork(target,url,method);
+  const api=new URL(url).hostname==='api.stripe.com',authenticator=api&&url.includes('/v1/3ds2/');
+  const formKeyOnly=authenticator&&['contract-foreign-form-key','contract-owned-form-key'].includes(fault);
+  let existing:Response|undefined;
+  const request={url:()=>url,method:()=>method,
+   frame:()=>{
+    if(sca)throw Error('provider transport is independent of frame identity');
+    return target;
+   },
+   isNavigationRequest:()=>false,resourceType:()=>trial?'xhr':'fetch',
+   serviceWorker:()=>null,redirectedFrom:()=>null,postData:()=>{
+    if(sca&&target===issuer)throw Error('issuer transport content is opaque');
+    return data;
+   },
+   allHeaders:async()=>({
+    ...(api&&!formKeyOnly?{authorization:'Bearer '+(fault==='contract-foreign-key'?'pk_test_other':'pk_test_fixture')}:{}),
+    ...(sca&&api&&method==='POST'?{'content-type':'application/x-www-form-urlencoded'}:{}),
+    origin:'https://js.stripe.com',
+    ...(trial?{'content-type':'application/x-www-form-urlencoded',...(fault==='trial-setup-cookie'?{cookie:'fixture'}:{})}:{}),
+    ...(url.includes('/sdk-resource')&&fault==='contract-cookie'?{cookie:'fixture'}:{}),
+    ...(fault==='contract-account-header'?{'stripe-account':'acct_fixture'}:{}),
+   }),existingResponse:()=>existing,
+  } as unknown as Request;
+  const sendWire=async(...args:unknown[])=>{
+   assert.deepEqual(args,[]);providerSent.push(url);
+   if(url===setupUrl)trace.push('forward trial setup');
+   await reply(url===setupUrl?'trial-setup':'challenge-provider',200);
+   existing=publish(request,200,json);
+   if(url===setupUrl)setupFinished=true;
+  };
+  await handler({request:()=>request,continue:sendWire,fallback:sendWire,abort:async()=>{}} as unknown as Route);
+  if(closed)throw Error('closed');
+ }
+ async function challengeTraffic(){
+  const secret=sessionFor(attempt!).client_secret;
+  const intent=fault==='contract-foreign-intent'?'pi_other':'pi_original';
+  const proof=fault==='contract-foreign-secret'?'pi_original_secret_other':secret;
+  const target='https://api.stripe.com/v1/payment_intents/'+intent+'?client_secret='+proof;
+  if(fault!=='contract-no-private-api'){
+   await wire(target,stripeFrame,null,{object:'payment_intent',livemode:false,id:'pi_original',client_secret:secret,status:'requires_action'});
+   const action=fault==='contract-api-write'?'https://api.stripe.com/v1/payment_intents/pi_original/confirm':'https://api.stripe.com/v1/3ds2/authenticate';
+   const formKey=fault==='contract-foreign-form-key'?'&key=pk_test_other':fault==='contract-owned-form-key'?'&key=pk_test_fixture':'';
+   await wire(action,stripeFrame,'source=opaque_fixture'+formKey,{});
+  }
+  const resourceHost=fault==='contract-unapproved-origin'?'https://unlisted-fixture.stripe.com':issuerHost;
+  const opaqueBody=fault==='contract-opaque-issuer-post'?'widget=opaque_fixture':null;
+  await wire(resourceHost+'/sdk-resource?version=2',issuer,opaqueBody,{});
+  issuerDocument=issuerHost+'/test-challenge-without-form';
+ }
+ async function send(url:string, value:object, result:object|null, status=202, method='POST') {
+  const schedulePost = url===cancel, withdrawPost=url===cancel+'/withdraw';
+  const key = declineRetry||responseGuard?id(nonce++):schedulePost?id(9):withdrawPost?(fault==='same-key'?id(9):id(10)):'initial-key';
+  const headers = {'idempotency-key':key,authorization:'Bearer '+token,origin:b.endpoints.demo,'content-type':'application/json'};
+  if(trial&&url.startsWith(otp)){delete (headers as Record<string,unknown>).authorization;delete (headers as Record<string,unknown>)['idempotency-key'];}
+  if(trial&&method==='GET'){delete (headers as Record<string,unknown>)['idempotency-key'];delete (headers as Record<string,unknown>)['content-type'];}
+  if(url===currentCustomer && fault==='trial-baseline-cookie')Object.assign(headers,{cookie:'session=fixture'});
+  if(fault==='initial-foreign-authority' && url===operation+'/action' && status===409)headers.authorization='Bearer '+'B'.repeat(43);
+  if(schedulePost && fault==='origin')headers.origin='https://elsewhere.invalid';
+  if(schedulePost && fault==='cookie')Object.assign(headers,{cookie:'session=demo'});
+  if(schedulePost && fault==='token')headers.authorization='Bearer '+'B'.repeat(43);
+  let existing:Response|undefined;
+  const request = {
+   existingResponse:()=>existing,url:()=>schedulePost && fault==='foreign-endpoint'?url.replace(sub!,id(19)):
+    schedulePost && fault==='foreign-host'?url.replace(b.endpoints.backend,'https://unowned.invalid'):url,
+   method:()=>method,
+   frame:()=>schedulePost && fault==='wrong-frame'||url===select && fault==='initial-session-frame'?{}:frame,isNavigationRequest:()=>false,
+   redirectedFrom:()=>schedulePost&&fault==='redirect'?{}:null,allHeaders:async()=>{
+    if(url===select && fault==='initial-session-headers-pending' || url===operation+'/action' && fault==='initial-read-headers-pending'){
+     await new Promise<void>(resolve=>{releaseDispatch=resolve;});
+    }
+    return headers;
+   },
+   sizes:async()=>{
+    await sessionFailure?.holdSize?.();
+    return {responseBodySize:sessionFailure?.measuredSize??Buffer.byteLength(JSON.stringify(result))};
+   },
+   postData:()=>trial&&method==='GET'?null:withdrawPost && fault==='malformed-withdraw'?'{"mode":"PERIOD_END"}':
+    url===trialPermit&&fault==='trial-permit-duplicate-fields'?'{"action_token":"'+grant+'","action_token":"'+grant+'"}':
+    JSON.stringify(schedulePost&&fault==='immediate'?{mode:'IMMEDIATE'}:value)
+  } as unknown as Request;
+  const reply=observeNetwork(frame,request.url(),method);
+  const label=url===trialPermit?'trial-permit':url===otp?'otp':url.endsWith('/verify')?'verify':url===base?'create':url===select?'selection':url===confirm?'confirm':schedulePost?'schedule':withdrawPost?'withdraw':'read';
+  const route = {request:()=>request,continue:async(...args:unknown[])=>{
+   assert.deepEqual(args,[]);sent.push(request.url());
+   if(url===trialPermit)trace.push('forward trial permit');
+   await reply(label,status);
+   if(url===select && fault==='initial-session-no-response')return;
+   if(url===confirm && fault==='confirm-backend-no-response')return;
+   existing=publish((schedulePost&&fault==='foreign-request'||url===retry&&fault==='wrong-retry-response'||
+    url===currentCustomer&&fault==='trial-baseline-unpaired'||
+    url===select&&['initial-session-unpaired','early-static-image-unpaired'].includes(fault))?{...request} as Request:request,status,result);
+  },abort:async()=>{}} as unknown as Route;
+  await handler(route);
+  if(closed)throw new Error('closed');
+ }
+ const subscription = {
+  subscriptionId:sub!, siteId:b.siteId, customerId:id(11), productId:b.productId, billingPrice:{priceId:b.priceId},
+  billingStatus:sca?'INCOMPLETE':'ACTIVE', state:'ACTIVE', revision:4, paidThrough:boundary,period:{start:'2026-01-01T00:00:00Z',end:boundary},
+  access:{allowed:!sca,reason:sca?'INITIAL_PAYMENT_REQUIRED':'PAID'},cancellation:null as {effectiveAt:string}|null, pendingOperation:null
+ };
+ const trialProjection=()=>{
+  const allowed=trialSettled||fault==='trial-premature-access';
+  return {...subscription,subscriptionId:trialRefreshed&&fault==='trial-wrong-refresh'?id(63):sub,
+   paymentAccountId:b.accountId,billingPrice:{priceId:b.priceId,trialDays:1,trialPaymentMethodPolicy:'REQUIRED_BEFORE_TRIAL'},
+   state:allowed?'TRIALING':'INCOMPLETE',billingStatus:allowed?'TRIALING':'INCOMPLETE',
+   trial:allowed?trialPeriod:null,period:allowed?trialPeriod:null,paidThrough:null,entitledPrice:allowed?{priceId:b.priceId}:null,
+   cancellation:null,debt:null,pendingChange:null,revision:allowed?2:1,
+   pendingOperation:allowed?null:{kind:'CREATE',operationId:create,status:'PROCESSING'},
+   access:{allowed,reason:allowed?'TRIAL':'INITIAL_PAYMENT_REQUIRED',validUntil:allowed?new Date(Date.now()+60000).toISOString():null}};
+ };
+ const manager = {
+  client:{subscriptions:{
+   get:async()=>{await send(base+'/'+sub,{}, {},200,'GET');return trialProjection();},
+   operation:async()=>{
+    const op=trialStatus('SUCCEEDED',fault==='trial-terminal-read-foreign');
+    await send(operation,{}, {subscription_id:op.subscriptionId,operation_id:op.operationId,status:op.status,action_available:op.actionAvailable},200,'GET');
+    return op;
+   },
+  }},customerSession:{},
+  state:{phase:'ready',authorityRevision:1,subscription,operation:null as SubscriptionOperation|null},
+  evaluateHandle:async()=>({evaluate:async(fn:(check:()=>boolean)=>boolean)=>{
+   if(replaceFrameOnTokenCheck){pinnedFrameChanged=true;replaceFrameOnTokenCheck=false;}
+   return fn(()=>manager.state.authorityRevision===1);
+  }}),
+  evaluate:async(fn:(m:unknown,arg:unknown)=>unknown,arg?:unknown)=>{
+   if(delayedTrial&&setupFinished&&!trialRefreshed&&arg===undefined){
+    ++trialSamples;
+    if(uncompletedTrial||fault==='trial-delayed-settlement'&&trialSamples<=42)advanceTrialClock(10_000);
+    const until=uncompletedTrial?Infinity:fault==='trial-delayed-settlement'?43:3;
+    if(trialSamples===until){
+     const terminal=fault==='trial-terminal-failed'?'FAILED':fault==='trial-terminal-unknown'?'UNKNOWN':
+      fault==='trial-terminal-action'?'REQUIRES_ACTION':'SUCCEEDED';
+     manager.state.operation=trialStatus(terminal);
+     manager.state.phase=terminal==='FAILED'?'error':terminal==='UNKNOWN'?'unknown':terminal==='REQUIRES_ACTION'?'requires_action':'ready';
+     if(terminal==='SUCCEEDED'){trialSettled=true;Object.assign(subscription,trialProjection());}
+     trace.push('trial status '+terminal);
+    }
+    if(fault==='trial-terminal-foreign'&&trialSamples===1)manager.state.operation=trialStatus('PROCESSING',true);
+   }
+   return fn(manager,arg);
+  },
+  locator:()=>({filter:()=>({isVisible:async()=>fault==='confirm-form-validation'})}),
+  frameLocator:()=>({locator:(selector:string)=>({fill:async(v:string)=>{if(selector.includes('number'))numbers.push(v);},isVisible:async()=>false})}),
+  getByRole:(_role:string,opts:{name:string})=>{
+   let fromKeyboard=false;
+   const control={
+   check:async()=>{trace.push(opts.name);},waitFor:async()=>{},
+   evaluate:async()=>true,evaluateHandle:async()=>{
+    const n=payCount;
+    if(opts.name==='Pay')armedPay=n+1;
+    return {evaluate:async(fn:(get:()=>boolean)=>boolean)=>{
+     if(opts.name==='Retry payment'&&fault==='retry-owner-lost-during-gesture')manager.state.authorityRevision++;
+     return fn(()=>opts.name==='Refresh status'?trialRefreshed:opts.name==='Retry payment'?retryClicked:opts.name==='Create subscription'?trace.includes('Create subscription'):declineRetry?payCount>n:payClicked);
+    }};
+   },
+   click:async()=>{
+    const name=opts.name;
+    trace.push(name);
+    if(fault==='cancellation-otp-request'&&name==='Request code' || fault==='cancellation-otp-verify'&&name==='Verify code')throw Error('private OTP canary');
+    if(name==='Request code'&&fault==='websocket'){if(!socketHandler)throw new Error('socket escaped');socketHandler({close:()=>{providerSent.push('closed websocket');}});}
+    if(name==='Request code'&&['early-provider-confirm','early-token','unknown-host'].includes(fault))await provider(fault==='unknown-host'?'https://unknown.invalid/anything':'https://api.stripe.com/v1/'+(fault==='early-token'?'confirmation_tokens':'payment_intents/pi_test/confirm'));
+    if(name==='Request code') await send(otp, {site_key:b.siteKey,email:b.email,intent:'AUTHENTICATE'}, {challenge_id:id(8)});
+    if(name==='Verify code'){
+     await send(otp+'/'+id(8)+'/verify',trial?{site_key:b.siteKey,code:'123456'}:{}, {expires_at:trial?trialSessionExpiry:boundary,customer:{id:id(11),status:'ACTIVE'},site_id:b.siteId,scopes:['CUSTOMER_READ','SUBSCRIPTION_READ','SUBSCRIPTION_MANAGE'],session_token:token},200);
+     const firstList=()=>send(base+'?limit=100',{}, {items:fault==='create-nonempty-baseline'?[{id:id(99)}]:[],next_cursor:null},200,'GET');
+     if(trial)void (async()=>{
+      const current={id:fault==='trial-baseline-foreign-customer'?id(12):id(11),status:'ACTIVE',masked_email:null,authentication_modes:['EMAIL_OTP'],session_expires_at:trialSessionExpiry};
+      await send(currentCustomer+(fault==='trial-baseline-query'?'?extra=1':''),{},current,200,'GET');
+      if(fault==='trial-baseline-repeat')await send(currentCustomer,{},current,200,'GET');
+      await send(trialOffer,{}, {items:[]},200,'GET');
+      await firstList();
+     })().catch(()=>{});
+     else await firstList();
+    }
+    if(name==='Create subscription'){
+     if(fault==='create-pointer-lost'&&!fromKeyboard)return;
+     if(fault==='create-late-gesture')await (lateCreate=new Promise<void>(resolve=>setTimeout(resolve,50)));
+     const directAction=fault==='initial-direct-action'||fault==='trial-direct-action';
+     const createSubscription=()=>send(base,{price_id:b.priceId,recurring_consent:true},{subscription_id:sub,operation_id:create,status:directAction?'REQUIRES_ACTION':'PROCESSING',
+      action_available:directAction,next_action:directAction?{kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary}:null,browser_confirm_allowed:false});
+     if(fault==='create-persist-pending'){void createSubscription().catch(()=>{});return;}
+     await createSubscription();
+     if(fault==='provider-route-stripe-network')await provider('https://private-provider.stripe.network/?data=private-canary');
+     if(fault==='provider-route-frame')await provider('https://r.stripe.com/',frame);
+     if(fault==='provider-route-cookie')await provider('https://r.stripe.com/');
+     if(trial){
+      void (async()=>{
+       await send(operation,{}, {operation_id:create,subscription_id:sub,status:'PROCESSING',action_available:false},200,'GET');
+       await send(operation+'/action',{},action,200,'GET');
+       await send(operation+'/confirmation-attempts/current',{},null,200,'GET');
+       await send(select,{action_token:fault==='trial-foreign-grant'?'bga1_'+'B'.repeat(43):grant},{
+        protocol:'BROWSER_CONFIRM_V1',provider:'stripe',flow:fault==='trial-payment-session'?'PAYMENT':'SETUP',
+        publishable_key:'pk_test_fixture',client_secret:setupSecret,action_token:grant,expires_at:trialSessionExpiry},200);
+      })().catch(()=>{});
+      return;
+     }
+     const session=sessionFor(attempt!);
+     if(fault.startsWith('early-static')&&fault.endsWith('-invalid-session'))session.capability='invalid';
+     if(fault==='initial-session-wire-protocol')session.protocol='BROWSER_CONFIRM_V1';
+     if(fault==='initial-session-wire-attempt')session.attempt_id='private attempt canary';
+     if(fault==='initial-session-wire-fields')Object.assign(session,{extra:'private field canary'});
+     if(fault==='initial-session-wire-expiry')session.expires_at='2000-01-01T00:00:00Z';
+     if(fault==='initial-session-wire-key')session.publishable_key='pk_live_fixture';
+     if(fault==='initial-session-wire-intent')session.client_secret='private intent canary';
+    const prepare = async()=>{
+     if(declineRetry){
+      if(fault==='initial-operation-missing' || fault==='initial-page-closed' || directAction)return;
+      const operationStatus=fault==='initial-operation-http'?503:200;
+      await send(operation,{}, {status:'PROCESSING',operation_id:create,subscription_id:sub,action_available:false},operationStatus,'GET');
+      if(operationStatus!==200)return;
+      if(fault==='initial-action-missing')return;
+      const actionStatus=fault==='initial-action-conflict'?409:fault==='initial-action-http'?503:200;
+      if(fault==='initial-foreign-action')await send(operation.replace(sub!,id(72))+'/action',{}, {},409,'GET');
+      if(fault==='initial-foreign-authority')await send(operation+'/action',{}, {},409,'GET');
+      if(fault==='initial-ambiguous-action')await send(operation+'/action',{}, {},409,'GET');
+      if(fault==='initial-too-many-reads')for(let n=80;n<93;n++)await send(operation.replace(sub!,id(n))+'/action',{}, {},409,'GET');
+      await send(operation+'/action',{}, {kind:'PROVIDER_CLIENT',secret:'bga1_'+'G'.repeat(43),expires_at:boundary},actionStatus,'GET');
+      if(fault==='initial-current-missing')return;
+      const currentStatus=fault==='initial-current-http'?503:200;
+      await send(operation+'/confirmation-attempts/current',{}, null,currentStatus,'GET');
+      if(currentStatus!==200 || actionStatus!==200 || ['initial-session-not-sent','initial-foreign-action','initial-foreign-authority','initial-ambiguous-action','initial-too-many-reads','initial-read-headers-pending'].includes(fault))return;
+     }
+     const actionToken='bga1_'+'G'.repeat(fault==='initial-session-guard'?42:43);
+     if(fault==='early-static-image-before-session')await staticPresentation();
+     const status=fault.startsWith('session-http')||fault==='early-static-image-http-conflict'?409:200;
+     await send(select,{action_token:actionToken},sessionFailure?.problem??session,sessionFailure?.status??status);
+    };
+    void prepare().catch(()=>{});
+    }
+    if(name==='Pay'){
+     if(fault==='confirm-pointer-lost'&&!fromKeyboard)return;
+     if(fault==='confirm-click-refused')throw new errors.TimeoutError('private click canary');
+     if(fault==='confirm-click-unobserved')return;
+     if(fault==='confirm-late-gesture')await (latePay=new Promise<void>(resolve=>setTimeout(resolve,50)));
+     if(fault==='before-actual-click')await provider('https://api.stripe.com/v1/confirmation_tokens');
+     if(trial){
+      payClicked=fault!=='trial-untrusted';
+      const permit=()=>send(trialPermit,{action_token:grant},{subscription_id:sub,operation_id:fault==='trial-foreign-permit-receipt'?id(90):create,
+       status:'PROCESSING',action_available:false,next_action:null,browser_confirm_allowed:fault!=='trial-denied-permit'});
+      const confirmSetup=()=>wire(fault==='trial-payment-intent'?'https://api.stripe.com/v1/payment_intents/pi_fixture/confirm':
+       fault==='trial-confirmation-token'?'https://api.stripe.com/v1/confirmation_tokens':
+       fault==='trial-wrong-setup-id'?setupUrl.replace(setupId,'seti_other'):setupUrl,
+       fault==='trial-foreign-frame'?frame:stripeFrame,
+       new URLSearchParams({key:fault==='trial-wrong-provider-key'?'pk_test_other':'pk_test_fixture',
+        client_secret:fault==='trial-wrong-secret'?setupSecret+'other':setupSecret,
+        ...(fault==='trial-provider-token'?{confirmation_token:'ctoken_other'}:{})}).toString(),
+       {id:setupId,object:'setup_intent',status:fault==='trial-setup-pending'?'processing':'succeeded',client_secret:setupSecret,livemode:false});
+      if(fault==='trial-generic-mutation')await send(base+'/'+sub+'/method-setups',{recurring_consent:true},{});
+      if(fault==='trial-before-permit')await confirmSetup();
+      await permit();
+      if(fault==='trial-repeat-permit')await permit();
+      await confirmSetup();
+      if(fault==='trial-repeat-setup')await confirmSetup();
+      trialSettled=!delayedTrial;
+      manager.state.operation=trialStatus(trialSettled?'SUCCEEDED':'PROCESSING');
+      manager.state.phase=trialSettled?'ready':'processing';
+      Object.assign(subscription,trialProjection());
+      return;
+     }
+     payClicked=true;payCount++;
+     if(['confirm-before-token','confirm-form-validation'].includes(fault))return;
+     if(fault==='late-first-token'){
+      if(payCount===1){delayedToken=provider('https://api.stripe.com/v1/confirmation_tokens',stripeFrame,true);void delayedToken.catch(()=>{});await delayedHeaders.promise;}
+      else{releaseFirstToken!();await delayedToken;}
+     }
+     if(fault!=='absent-token'&&fault!=='initial-only')await provider('https://api.stripe.com/v1/confirmation_tokens');
+     if(['confirm-token-no-response','confirm-token-http','confirm-backend-not-sent'].includes(fault))return;
+     if(fault==='token-replay')await provider('https://api.stripe.com/v1/confirmation_tokens');
+     const submit=()=>send(confirm,{capability:'bca2_'+'C'.repeat(43),confirmation_token:fault==='substituted-token'?'ctoken_other':'ctoken_demo'},{protocol:'SERVER_CONFIRM_V2',attempt_id:attempt,state:'OBSERVE',next_action_allowed:false,retry_allowed:false,successor_attempt_id:null},200);
+     if(sca){
+      await send(confirm,{capability:sessionFor(attempt!).capability,confirmation_token:'ctoken_demo'},
+       {...receiptFor(attempt!,'REQUIRES_ACTION',false,null),next_action_allowed:fault!=='replayed-next-ack'},200);
+      void challengeTraffic().catch(()=>{});return;
+     }
+     if(declineRetry){
+      const first=payCount===1;
+      if(fault==='confirm-persist-pending'){
+       void send(confirm,{capability:sessionFor(attempt!).capability,confirmation_token:'ctoken_demo'},
+        {...receiptFor(attempt!,'DECLINED',true,null),next_action_allowed:false},200).catch(()=>{});
+       return;
+      }
+      await send(first?confirm:nextConfirm,{capability:sessionFor(first?attempt!:successor).capability,confirmation_token:first||fault==='reused-token'?'ctoken_demo':'ctoken_second'},
+       {...receiptFor(first?attempt!:successor,first?(fault==='unknown-first'?'UNKNOWN':'DECLINED'):'OBSERVE',first,null),next_action_allowed:false},200);
+      if(first&&fault==='early-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
+      return;
+     }
+     duplicateConfirm=submit;
+     await submit();
+     if(fault==='early')await send(cancel,{mode:'PERIOD_END'},{});
+    }
+    if(name==='Retry payment'){
+     if(fault==='retry-click-unobserved'||fault==='retry-pointer-lost'&&!fromKeyboard)return;
+     retryClicked=true;
+     await send(retry,{},receiptFor(attempt!,'DECLINED',false,fault==='same-successor'?attempt!:successor),200);
+     if(fault==='repeat-retry')await send(retry,{},receiptFor(attempt!,'DECLINED',false,successor),200);
+     void send(nextConfirm.replace(/confirm$/,'client-session'),{}, {...sessionFor(successor),...(['different-pi','successor-static-image-invalid-session'].includes(fault)?{client_secret:'pi_foreign_secret_fixture'}:{})},200).catch(()=>{});
+    }
+    if(trial&&name==='Refresh status'){
+     trialRefreshed=true;Object.assign(subscription,trialProjection());
+     await send(base+'?limit=100',{}, {items:[{subscription_id:sub,
+      site_id:fault==='trial-wrong-refresh-wire'?id(87):b.siteId,customer_id:id(11),product_id:b.productId,payment_account_id:b.accountId,
+      state:'TRIALING',billing_status:'TRIALING',paid_through:null,pending_operation:null,billing_price:{price_id:b.priceId},
+      revision:2,access:{subscription_id:sub,allowed:true,reason:'TRIAL'}}],next_cursor:null},200,'GET');
+    }
+    if(name==='Refresh status' && ack){
+     if(fault==='lost-authority')manager.state.authorityRevision++;
+     if(fault==='unknown-state')manager.state.phase='unknown';
+     displayed=ack; refreshed=true;subscription.revision++;
+     subscription.state=ack==='schedule'?'CANCEL_AT_PERIOD_END':'ACTIVE';
+     subscription.cancellation=ack==='schedule'?{effectiveAt:fault==='wrong-boundary'?'2025-01-01T00:00:00Z':boundary}:null;
+     ack=undefined;
+    }
+    if(name==='Confirm cancellation'||name==='Withdraw cancellation'){
+     const kind=name==='Confirm cancellation'?'schedule':'withdraw';
+     assert.ok(verified);if(kind==='withdraw')assert.equal(displayed,'schedule');
+     if(kind==='schedule'&&fault==='navigate')navigate(frame);
+     if(kind==='schedule'&&['support','telemetry-main','wrong-parent','detached','telemetry-auth','telemetry-redirect','telemetry-cookie','late-provider-confirm','late-token','merchant-api'].includes(fault)){
+      const providerUrl=fault==='late-provider-confirm'?'https://api.stripe.com/v1/payment_intents/pi_test/confirm':
+       fault==='late-token'?'https://api.stripe.com/v1/confirmation_tokens':fault==='merchant-api'?'https://merchant-ui-api.stripe.com/v1/subscriptions':'https://r.stripe.com/';
+      await provider(providerUrl,fault==='telemetry-main'?frame:stripeFrame);
+     }
+     const path=kind==='schedule'?cancel:cancel+'/withdraw';
+     const payload=kind==='schedule'?{mode:'PERIOD_END'}:{};
+     const receipt={subscription_id:fault==='foreign-subscription'?id(20):sub,operation_id:kind==='withdraw'&&fault==='reused-operation'?schedule:kind==='schedule'?schedule:withdraw,status:fault==='unknown-ack'||kind==='withdraw'&&fault==='withdraw-unknown-ack'?'UNKNOWN':'PROCESSING',next_action:null,action_available:false,browser_confirm_allowed:false};
+     if(fault==='retired-cancellation'){
+      void send(path,payload,receipt).catch(()=>{});
+      await cancellationPersisting.promise;
+      queueMicrotask(()=>releaseCancellation.resolve());
+      throw Error('private click canary');
+     }
+     await send(path,payload,receipt);ack=kind;refreshed=false;
+     if(fault==='duplicate'||fault==='duplicate-withdraw'&&kind==='withdraw')await send(path,payload,receipt);
+    }
+   }
+   };
+   return {...control,elementHandle:async()=>({
+    waitForElementState:async(state:string)=>{
+     if(delayedTrial&&state==='enabled'&&opts.name==='Refresh status'&&!trialSettled)
+      throw new errors.TimeoutError('synthetic Refresh is disabled while CREATE is processing');
+    },
+    focus:async()=>{},
+    evaluate:async()=>opts.name==='Create subscription'?fault!=='create-focus-lost':
+     opts.name==='Retry payment'?fault!=='retry-focus-lost':fault!=='confirm-focus-lost',
+    evaluateHandle:control.evaluateHandle,
+    press:async(key:string)=>{keysPressed.push(key);fromKeyboard=true;await control.click();},
+   })};
+  }
+ };
+ const page={
+  evaluate:async()=>fault!=='contract-shared-worker-enabled',
+  frames:()=>[frame,stripeFrame,issuer],context:()=>({newCDPSession:async(surface:unknown)=>{
+   if(surface!==page)throw Error("This frame does not have a separate CDP session, it is a part of the parent frame's session");
+   return {on:(event:string,fn:(v:unknown)=>void)=>devtools.set(event,fn),send:async(command:string,args:{requestId?:string;patterns?:{urlPattern:string}[]})=>{
+    if(command==='Fetch.enable')armedPatterns=args.patterns!.map(p=>p.urlPattern);
+    if(command==='Fetch.failRequest')abortedPauses.add(args.requestId!);
+    if(command==='Page.getFrameTree')return {frameTree:cdpFrameTree(cdpFrames[0]!)};
+   }};
+  }}),
+  mainFrame:()=>frame,url:()=>documentUrl,waitForFunction:async()=>{
+   if(responseGuard){
+    await provider('https://api.stripe.com/v1/elements/sessions',stripeFrame,false,'GET');
+    await provider('https://r.stripe.com/b',stripeFrame);
+    await provider('https://merchant-ui-api.stripe.com/telemetry',stripeFrame);
+   }
+   if((declineRetry||pinnedCancellation)&&!staticProbed&&fault.startsWith('static-')){
+    staticProbed=true;void staticPresentation().catch(()=>{});
+    if(fault==='static-duplicate')void staticPresentation().catch(()=>{});
+   }
+  },
+  on:(event:string,fn:typeof navigate)=>{if(event==='framenavigated')navigationListeners.push(fn);if(event==='requestfailed')failureListeners.push(fn);},
+  goto:async(url:string)=>{
+   if(fault==='cancellation-navigation')throw Error('private navigation canary');
+   if(responseGuard){
+    documentUrl='about:blank';
+    const method='GET',reply=observeNetwork(frame,url,method);
+    const request={url:()=>url,method:()=>method,frame:()=>frame,redirectedFrom:()=>null};
+    await handler({request:()=>request,fallback:async()=>{await reply('demo',200);},abort:async()=>{}} as unknown as Route);
+    if(closed)throw Error('closed');
+   }
+   documentUrl=url;
+   if(fault.startsWith('static-checkout-')){
+    // The demo configures both product slots with history.replaceState on mount.
+    const configured=new URL(url);
+    configured.searchParams.set('subscription_product_2_id',fault==='static-checkout-foreign-product'?id(99):'');
+    if(fault==='static-checkout-foreign-path')configured.pathname='/other';
+    documentUrl=configured.href;
+   }
+   if(responseGuard)await provider('https://js.stripe.com/v3/',frame,false,'GET');
+   if(fault==='early-refused-origin')await provider('https://unlisted-fixture.stripe.com/private-path?query=private-canary');
+  },locator:()=>({first:()=>manager}),
+  waitForResponse:(predicate:(r:Response)=>boolean,{timeout=3000}={})=>new Promise<Response>((resolve,reject)=>{
+   if(closed){reject(new Error('closed'));return;}
+   const ownConfirm=fault.startsWith('confirm-') && predicate({
+    url:()=>payCount===0?confirm:nextConfirm,request:()=>({method:()=> 'POST'}),
+   } as Response);
+   const lateCreateObservation=['create-late-gesture','create-persist-pending'].includes(fault)&&predicate({url:()=>base,request:()=>({method:()=> 'POST'})} as Response);
+   if(ownConfirm&&fault==='confirm-early-observer'&&armedPay!==payCount+1){reject(new errors.TimeoutError('confirm observer was armed too early'));return;}
+   const waiter={predicate,resolve:(response:Response)=>{clearTimeout(timer);resolve(response);},reject:(error:Error)=>{clearTimeout(timer);reject(error);}};
+   const timer=setTimeout(()=>{
+    waiters.delete(waiter);
+    reject(fault==='initial-page-closed'?new Error('private page closed reason'):new errors.TimeoutError('private fixture URL during response wait'));
+   },lateCreateObservation||ownConfirm&&fault!=='confirm-early-observer'?25:timeout);
+   waiters.add(waiter);
+  })
+ };
+ if(responseGuard)registerChromiumProtocolFixture(page);
+ const context={
+  newPage:async()=>{if(fault==='cancellation-setup')throw Error('private setup canary');return page;},on:()=>{},routeWebSocket:async(_pattern:unknown,fn:typeof socketHandler)=>{socketHandler=fn;},route:async(pattern:unknown,fn:typeof handler)=>{interceptsProvider=pattern==='**/*';handler=fn;},
+  close:async()=>{closed=true;releaseBody?.();releaseDispatch?.();for(const w of waiters)w.reject(new Error('closed'));waiters.clear();
+   if(fault==='session-http-close-fails')throw Error('private close reason');
+  }
+ };
+ const port={
+  resources:()=>b,beforeDispatch:async(kind:string)=>{
+   if(kind==='create'&&fault==='create-persist-pending'){
+    trace.push('persist CREATE');
+    await new Promise<void>(resolve=>{releaseDispatch=resolve;});
+   }
+   if(kind==='confirm'&&fault==='duplicate-during-persist')await new Promise<void>(resolve=>{releaseDispatch=resolve;void duplicateConfirm?.().catch(()=>{}).finally(resolve);});
+   if(kind==='confirm'&&fault==='confirm-persist-pending')await new Promise<void>(resolve=>{releaseDispatch=resolve;});
+   return true;
+  },releaseOriginalConfirm:()=>{trace.push('release original confirm');if(fault==='invalid ingress')throw Error('tainted');return true;},
+  acknowledge:async(kind:string)=>{if(trial&&kind==='create')trace.push('ack trial create');if(invoiceCase&&kind==='confirm'){trace.push('completed invoice proof');if(fault==='invalid evidence')throw Error();}if(declineRetry&&kind==='confirm'){trace.push('decline proof');return fault!=='no-decline-proof';}return true;},acknowledgeCustomer:async()=>true,
+  beforeTrialSetup:async(kind:string,identity:unknown,key?:string)=>{
+   assert.deepEqual(identity,{subscriptionId:sub,operationId:create});assert.equal(typeof key,kind==='permit'?'string':'undefined');
+   trace.push('persist trial '+kind);
+   if(fault==='trial-retire-'+kind)manager.state.authorityRevision++;
+   return true;
+  },
+  acknowledgeTrialSetup:async(identity:unknown)=>{
+   assert.deepEqual(identity,{subscriptionId:sub,operationId:create});trace.push('verify setup');return true;
+  },
+  beforeChallenge:async(scope:unknown)=>{
+   assert.deepEqual(scope,{subscriptionId:sub,operationId:create,attemptId:attempt});
+   trace.push('persist challenge');
+   return fault!=='contract-dispatch-refused';
+  },acknowledgeChallenge:async(scope:unknown)=>{
+   assert.deepEqual(scope,{subscriptionId:sub,operationId:create,attemptId:attempt});
+   assert.ok(challengeClicked);
+   assert.equal(subscription.billingStatus,'ACTIVE');
+   assert.deepEqual(subscription.access,{allowed:true,reason:'PAID'});
+   trace.push('issuer witnessed');
+   return true;
+  },
+  beforeRetry:async()=>{trace.push('persist retry');if(fault==='retired-retry')manager.state.authorityRevision++;return true;},acknowledgeRetry:async()=>{trace.push('ack retry');return true;},
+  beforeSuccessorConfirm:async()=>{trace.push('persist successor');if(fault==='retired-successor')manager.state.authorityRevision++;return true;},acknowledgeSuccessor:async()=>{trace.push('recovered proof');return true;},
+  withOtpCode:async(callback:(code:string)=>Promise<true>)=>callback('123456'),
+  verifyInitial:async()=>{trace.push('verify initial');verified=true;return fault!=='initial-proof';},
+  beforeCancellation:async(kind:string,key:string)=>{
+   trace.push('persist '+kind+' '+key);
+   if(fault==='retired-cancellation'){cancellationPersisting.resolve();await releaseCancellation.promise;}
+   return fault!=='persist';
+  },
+  verifyCancellation:async(kind:string,operation:string)=>{trace.push('verify '+kind+' '+operation);return fault!=='proof';}
+ } as BillingCancellationPort&BillingDeclineRetryPort&BillingInitial3dsPort&BillingInvoiceWebhooksPort&BillingRequiredTrialPort;
+ const browser={newContext:async(options:object)=>{
+  if(sca)assert.deepEqual(options,{serviceWorkers:'block',acceptDownloads:false});
+  return context;
+ }} as unknown as Browser;
+ return {browser,port,trace,sent,providerSent,cancel,id,numbers,trialPermit,setupUrl,keysPressed,presentation,sessionErrorBodyReads:()=>sessionErrorBodyReads,retire:()=>{manager.state.authorityRevision++;},reloadIssuer:()=>{issuerReplaced=true;navigate(issuer);},reloadStripe:()=>navigate(stripeFrame),displayed:()=>displayed,refreshed:()=>refreshed,closed:()=>closed,latePay:()=>latePay,lateCreate:()=>lateCreate};
+}
+test('same-page manager schedules and withdraws once after the initial paid proof',async()=>{
+ const f=cancellationPage();
+ await runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+3000});
+ assert.deepEqual(f.trace.filter(e=>e.startsWith('verify ')||e.startsWith('persist ')||['Cancel at period end','I confirm cancellation','Confirm cancellation','Withdraw cancellation'].includes(e)),[
+  'verify initial','Cancel at period end','I confirm cancellation','Confirm cancellation','persist schedule '+f.id(9),'verify schedule '+f.id(6),'Withdraw cancellation','persist withdraw '+f.id(10),'verify withdraw '+f.id(7)
+ ]);
+ assert.deepEqual(f.sent.filter(url=>url.includes('/cancellation')),[f.cancel,f.cancel+'/withdraw']);
+ assert.equal(f.displayed(),'withdraw');assert.ok(f.refreshed());assert.ok(f.closed());
+});
+for(const [fault,code,forwarded] of [
+ ['withdraw-owner-retired','BROWSER_CANCELLATION_WITHDRAW_OWNER',false],
+ ['withdraw-unknown-ack','BROWSER_CANCELLATION_WITHDRAW_UNKNOWN',true],
+] as const)test('withdraw diagnostics distinguish persisted intent from a paired UNKNOWN: '+fault,async()=>{
+ const f=cancellationPage(fault,false,false,false,undefined,true);
+ const persist=f.port.beforeCancellation;
+ f.port.beforeCancellation=async(kind,key)=>{
+  const saved=await persist(kind,key);
+  if(kind==='withdraw'&&fault==='withdraw-owner-retired')f.retire();
+  return saved;
+ };
+ await assert.rejects(runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2500},()=>false),error=>{
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(browserProviderOrigin(error),null);
+  return true;
+ });
+ assert.deepEqual(f.sent.filter(url=>url.includes('/cancellation')),forwarded?[f.cancel,f.cancel+'/withdraw']:[f.cancel]);
+ assert.deepEqual(f.trace.filter(step=>/^(persist|verify) (schedule|withdraw) /.test(step)).map(step=>step.split(' ').slice(0,2).join(' ')),
+  ['persist schedule','verify schedule','persist withdraw']);
+ assert.ok(f.closed());
+});
+for(const fault of ['static-image','static-document','unreviewed-origin','redirect-schedule','redirect-withdraw']){
+ test('dedicated cancellation checkout binds its reviewed static pin and financial responses: '+fault,async t=>{
+  const f=cancellationPage(fault==='unreviewed-origin'?'static-image':fault,false,false,false,undefined,true);
+  const asset=t.mock.method(globalThis,'fetch',async(url:URL,opts:RequestInit)=>{
+   assert.equal(fault,'static-image');
+   assert.equal(url.href,'https://private.example/image.png');
+   assert.equal(opts.redirect,'error');
+   assert.equal(opts.credentials,'omit');
+   return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+  });
+  const run=runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2500},
+   origin=>fault!=='unreviewed-origin'&&origin==='https://private.example');
+  if(fault==='static-image'||fault==='static-document'){
+   assert.equal(await run,true);
+   assert.deepEqual(f.presentation,[fault==='static-image'?'fulfilled 200':'abort blockedbyclient']);
+   assert.deepEqual(f.sent.filter(url=>url.includes('/cancellation')),[f.cancel,f.cancel+'/withdraw']);
+   assert.deepEqual(f.trace.filter(step=>/^(verify initial|persist schedule|verify schedule|persist withdraw|verify withdraw)/.test(step))
+    .map(step=>step.split(' ').slice(0,2).join(' ')),['verify initial','persist schedule','verify schedule','persist withdraw','verify withdraw']);
+  }else{
+   await assert.rejects(run,error=>{
+    assert.equal(browserDiagnostic(error,'ACCEPTANCE'),fault==='unreviewed-origin'?'BROWSER_PROVIDER_ORIGIN_OTHER':'BROWSER_GUARD_RESPONSE_REDIRECT');
+    return true;
+   });
+   assert.equal(f.sent.filter(url=>url.includes('/cancellation')).length,fault==='redirect-schedule'?1:fault==='redirect-withdraw'?2:0);
+   assert.ok(!f.trace.some(step=>step.startsWith('followed redirect ')||step.startsWith('verify withdraw')));
+   if(fault==='unreviewed-origin')assert.ok(!f.sent.some(url=>url.endsWith('/confirm')));
+  }
+  assert.equal(asset.mock.callCount(),fault==='static-image'?1:0);
+  assert.ok(f.closed());
+ });
+}
+for(const [fault,expected] of Object.entries({
+ 'initial-proof':0,early:0,origin:0,token:0,cookie:0,redirect:0,'foreign-host':0,'wrong-frame':0,'foreign-endpoint':0,immediate:0,navigate:0,persist:0,
+ 'retired-cancellation':0,
+ duplicate:1,'duplicate-withdraw':2,'malformed-withdraw':1,'foreign-request':1,'foreign-subscription':1,'unknown-ack':1,'same-key':1,'unknown-state':1,'wrong-boundary':1,'lost-authority':1,proof:1,'reused-operation':2
+}))test('cancellation stops at '+fault,async()=>{
+ const f=cancellationPage(fault);
+ await assert.rejects(()=>runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+1500}),/^Error: billing_BROWSER$/);
+ assert.equal(f.sent.filter(url=>url.includes('/cancellation')).length,expected);
+ if(['foreign-request','foreign-subscription','unknown-ack'].includes(fault))assert.ok(!f.trace.some(v=>v.startsWith('verify schedule')));
+ if(fault==='reused-operation')assert.ok(!f.trace.some(v=>v.startsWith('verify withdraw')));
+ assert.ok(f.closed());
+});
+test('initial-only browser never enables cancellation even with an extended port',async()=>{
+ const f=cancellationPage('initial-only');
+ await runInitialBillingBrowser(f.browser,f.port,{deadline:Date.now()+1000});
+ assert.deepEqual(f.trace.filter(e=>e.startsWith('verify ')||e.startsWith('persist ')),[]);
+ const early=cancellationPage('early');
+ await assert.rejects(()=>runInitialBillingBrowser(early.browser,early.port,{deadline:Date.now()+1000}),/^Error: billing_BROWSER$/);
+ assert.equal(early.sent.includes(early.cancel),false);
+});
+for(const [fault,code] of [
+ ['cancellation-setup','BROWSER_SETUP'],['cancellation-navigation','BROWSER_NAVIGATION'],
+ ['cancellation-otp-request','BROWSER_OTP_REQUEST'],['cancellation-otp-verify','BROWSER_OTP_VERIFY'],
+ ['unknown-host','BROWSER_PROVIDER_ORIGIN_OTHER'],
+] as const)test('early cancellation retains the exact safe browser checkpoint: '+fault,async()=>{
+ const f=cancellationPage(fault);
+ f.port.acknowledgeCustomer=async()=>assert.fail('early failure must precede customer acknowledgement');
+ await assert.rejects(runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(browserProviderOrigin(error),null);
+  return true;
+ });
+ assert.ok(f.closed());
+ assert.deepEqual(f.providerSent,[]);
+ assert.ok(!f.trace.some(step=>step==='Create subscription'||step==='Pay'||step.startsWith('persist ')));
+});
+
+test('cancellation reports a nonempty subscription baseline after OTP',async()=>{
+ const f=cancellationPage('create-nonempty-baseline');
+ await assert.rejects(runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_BASELINE');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(!f.trace.includes('Create subscription'));
+});
+
+test('original token and trailing uncredentialed provider-frame support can complete the journey',async()=>{
+ const f=cancellationPage('support');
+ await runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+5000});
+ assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens','https://r.stripe.com/']);
+ assert.equal(f.displayed(),'withdraw');
+});
+for(const fault of ['early-provider-confirm','early-token','late-provider-confirm','late-token','unknown-host','telemetry-main','wrong-parent','detached','telemetry-auth','telemetry-redirect','telemetry-cookie','merchant-api','token-replay','before-actual-click','websocket'])test('refuses provider traffic at '+fault,async()=>{
+ const f=cancellationPage(fault);
+ await assert.rejects(()=>runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+5000}),/^Error: billing_BROWSER$/);
+ const beforePay=['early-provider-confirm','early-token','unknown-host','before-actual-click','websocket'].includes(fault);
+ assert.deepEqual(f.providerSent,beforePay?(fault==='websocket'?['closed websocket']:[]):['https://api.stripe.com/v1/confirmation_tokens']);
+ assert.equal(f.sent.includes(f.cancel),false);
+});
+
+for(const fault of ['absent-token','missing-token-response','substituted-token','wrong-token-request','token-failure','token-worker','token-type','live-token','concurrent-confirm','duplicate-during-persist'])test('refuses backend confirm at '+fault,async()=>{
+ const f=cancellationPage(fault);
+ await assert.rejects(()=>runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+2000}),/^Error: billing_BROWSER$/);
+ assert.equal(f.sent.some(url=>url.endsWith('/confirm')),false);
+ assert.equal(f.trace.includes('verify initial'),false);
+});
+test('matching token verification can finish reading the response after backend interception',async()=>{
+ const f=cancellationPage('pending-token-body');
+ await runBillingCancellationBrowser(f.browser,f.port,{deadline:Date.now()+3000});
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+test('decline retry arms confirmation observation after preparing the Pay gesture',async()=>{
+ const f=cancellationPage('confirm-early-observer',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('decline retry stops a late Pay gesture when the confirmation observer expires first',async()=>{
+ const f=cancellationPage('confirm-late-gesture',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_WAIT_CLICK_PENDING');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ await f.latePay();
+ assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+ assert.equal(f.providerSent.length,0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry activates the pinned Pay button with one Enter per authorized attempt',async()=>{
+ const f=cancellationPage('confirm-pointer-lost',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter','Enter']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('decline retry sends no key or payment when the exact Pay button cannot take focus',async()=>{
+ const f=cancellationPage('confirm-focus-lost',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_FOCUS');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.deepEqual(f.keysPressed,['Enter']);
+ assert.equal(f.providerSent.length,0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry sends CREATE with the exact trusted keyboard gesture when the pointer would be lost',async()=>{
+ const f=cancellationPage('create-pointer-lost',true);
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),true);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter','Enter']);
+ assert.equal(f.trace.filter(step=>step==='Create subscription').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+});
+test('decline retry refuses a late CREATE gesture after the response observer expires',async()=>{
+ const f=cancellationPage('create-late-gesture',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_WAIT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ await f.lateCreate();
+ assert.deepEqual(f.keysPressed,['Enter']);
+ assert.ok(!f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry refuses transport when CREATE persistence finishes after the response observer expires',async()=>{
+ const f=cancellationPage('create-persist-pending',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_WAIT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.trace.filter(step=>step==='persist CREATE').length,1);
+ assert.ok(!f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,code] of [['create-nonempty-baseline','BROWSER_CREATE_BASELINE'],['create-focus-lost','BROWSER_CREATE_FOCUS']] as const)
+ test('decline retry records '+code+' before any CREATE gesture',async()=>{
+  const f=cancellationPage(fault,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.deepEqual(f.keysPressed,[]);
+  assert.ok(!f.trace.includes('Create subscription'));
+  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+ });
+
+for(const [fault,expected] of [
+ ['confirm-click-refused','BROWSER_CONFIRM_CLICK'],
+ ['confirm-click-unobserved','BROWSER_CONFIRM_CLICK_UNOBSERVED'],
+ ['confirm-form-validation','BROWSER_CONFIRM_FORM_VALIDATION'],
+ ['confirm-before-token','BROWSER_CONFIRM_TOKEN_NOT_SENT'],
+ ['confirm-token-no-response','BROWSER_CONFIRM_TOKEN_NO_RESPONSE'],
+ ['confirm-token-http','BROWSER_CONFIRM_TOKEN_HTTP'],
+ ['confirm-backend-not-sent','BROWSER_CONFIRM_REQUEST_NOT_SENT'],
+ ['confirm-backend-no-response','BROWSER_CONFIRM_REQUEST_NO_RESPONSE'],
+ ['confirm-persist-pending','BROWSER_CONFIRM_REQUEST_NO_RESPONSE'],
+] as const)test('decline retry reports the Pay boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,fault==='confirm-backend-no-response'?1:0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/retry')));
+});
+
+test('the same manager explicitly retries a proven decline before paying with fresh details',async()=>{
+ const f=cancellationPage('retry-pointer-lost',true);
+ await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000});
+ assert.deepEqual(f.trace.filter(x=>['Pay','decline proof','Retry payment','persist retry','ack retry','persist successor','recovered proof'].includes(x)),
+  ['Pay','decline proof','Retry payment','persist retry','ack retry','Pay','persist successor','recovered proof']);
+ assert.deepEqual(f.numbers,['4000000000000002','4242424242424242']);
+ assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens','https://api.stripe.com/v1/confirmation_tokens']);
+ assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,1);
+ assert.ok(f.closed());
+});
+for(const [fault,code] of [
+ ['retry-focus-lost','BROWSER_RETRY_FOCUS'],
+ ['retry-click-unobserved','BROWSER_RETRY_CLICK_UNOBSERVED'],
+ ['retry-owner-lost-during-gesture','BROWSER_RETRY_REQUEST_REJECTED'],
+] as const)test('decline retry stops at '+code+' before retry dispatch',async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(f.trace.includes('decline proof'));
+ assert.ok(!f.trace.includes('persist retry'));
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.ok(!f.sent.some(url=>url.endsWith('/retry')||url.endsWith('/client-session')));
+});
+test('decline retry checks a staged Stripe document after validating the original session',async()=>{
+ const f=cancellationPage('early-static',true);
+ await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example');
+ assert.deepEqual(f.presentation,['abort blockedbyclient']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+ assert.equal(f.sent.filter(url=>url.endsWith('/retry')).length,1);
+});
+test('an invalid original session cannot release a staged Stripe document',async()=>{
+ const f=cancellationPage('early-static-invalid-session',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [phase,mode,previousPay] of [['initial','early-static-image',[]],['successor','successor-static-image',['Pay']]] as const)
+test('an early pinned image waits for the '+phase+' session before any asset transport or its Pay',async t=>{
+ const f=cancellationPage(mode,true);
+ const fetch=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+  const bodyRead=phase+' session body read';
+  assert.deepEqual(f.trace.filter(step=>['pinned asset intercepted',bodyRead,'Pay'].includes(step)),
+   [...previousPay,'pinned asset intercepted',bodyRead]);
+  assert.equal(options.method,'GET');
+  assert.equal(options.redirect,'error');
+  assert.equal(options.credentials,'omit');
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(f.trace.filter(step=>step==='Pay').length,previousPay.length);
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ assert.equal(await runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),true);
+ assert.equal(fetch.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,2);
+});
+test('an early pinned subresource performs no transport when the owned session is invalid',async t=>{
+ const f=cancellationPage('early-static-image-invalid-session',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('early pinned asset must not be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE_CAPABILITY');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(fetch.mock.callCount(),0);
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected] of [
+ ['early-static-image-before-session','BROWSER_PINNED_PHASE'],
+ ['early-static-image-unpaired','BROWSER_SESSION_UNPAIRED'],
+ ['early-static-image-http-conflict','BROWSER_SESSION_HTTP_CONFLICT'],
+ ['early-static-image-frame-changed','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
+ ['early-static-image-same-url-navigation','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
+] as const)test('an early pinned asset stays closed at '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('unverified image must not be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(fetch.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a same-url parent navigation retires the pinned document before the local block',async t=>{
+ const f=cancellationPage('early-static-nav-parent-same-url',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('document must never be fetched'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_PINNED_FRAME_NAV_BLOCK_CHANGED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(fetch.mock.callCount(),0);
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a staged pinned asset cannot leave after successor validation rejects a different intent',async t=>{
+ const f=cancellationPage('successor-static-image-invalid-session',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>assert.fail('unverified successor asset'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.equal(fetch.mock.callCount(),0);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+test('Pay is refused when manager authority changes during the pinned asset wait',async t=>{
+ const f=cancellationPage('early-static-image',true);
+ const fetch=t.mock.method(globalThis,'fetch',async()=>{
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  f.retire();
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'));
+ assert.equal(fetch.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected,closed] of [
+ ['session-http','BROWSER_SESSION_HTTP_CONFLICT',true],
+ ['early-static-invalid-session','BROWSER_INITIAL_SESSION_WIRE_CAPABILITY',true],
+ ['session-http-close-fails','BROWSER_SESSION_HTTP_CONFLICT',false],
+ ['early-static-navigation','BROWSER_GUARD_MAIN_NAVIGATION',true],
+] as const)test('decline retry reports only the original safe session boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error),expected);
+  assert.equal(browserCleanupConfirmed(error),closed);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const part of ['read','size','json','object','protocol','attempt','fields','expiry','key','intent']){
+ test('decline retry reports the original session wire checkpoint for '+part,async()=>{
+  const f=cancellationPage('initial-session-wire-'+part,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+2500}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_INITIAL_SESSION_WIRE_'+part.toUpperCase());
+   assert.equal(String(error),'Error: billing_BROWSER');
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.ok(!f.trace.includes('Pay'));
+  assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+ });
+}
+const conflictProblem=(code:string)=>({type:'urn:payment:problem:'+code,code,status:409,title:'private diagnostic canary'});
+const conflictReply=(code:string):SessionFailure=>({status:409,contentType:'application/problem+json; charset=utf-8',problem:conflictProblem(code)});
+const providerConflict=conflictReply('PROVIDER_EVIDENCE_MISMATCH');
+for(const [fixture,expected,reads] of [
+ [providerConflict,'BROWSER_SESSION_PROVIDER_EVIDENCE',1],
+ [conflictReply('SUBSCRIPTION_STATE_CONFLICT'),'BROWSER_SESSION_STATE_CONFLICT',1],
+ [conflictReply('SUBSCRIPTION_CONFLICT'),'BROWSER_SESSION_APPLICATION_CONFLICT',1],
+ [conflictReply('resource_conflict'),'BROWSER_SESSION_RESOURCE_CONFLICT',1],
+ [conflictReply('private diagnostic canary'),'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,problem:{...providerConflict.problem,type:'urn:payment:problem:other'}},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,contentType:'application/json'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentType:'application/problem+json; charset=utf-8, application/json'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentEncoding:'gzip'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:null},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:'4097'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,contentLength:'1, 1'},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,measuredSize:4097},'BROWSER_SESSION_HTTP_CONFLICT',0],
+ [{...providerConflict,measuredSize:4096,contentLength:'4096',problem:{...providerConflict.problem,title:'x'.repeat(4096)}},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,unreadable:true},'BROWSER_SESSION_HTTP_CONFLICT',1],
+ [{...providerConflict,status:400},'BROWSER_SESSION_HTTP_BAD_REQUEST',0],
+ [{...providerConflict,status:401},'BROWSER_SESSION_HTTP_UNAUTHORIZED',0],
+ [{...providerConflict,status:403},'BROWSER_SESSION_HTTP_FORBIDDEN',0],
+ [{...providerConflict,status:404},'BROWSER_SESSION_HTTP_NOT_FOUND',0],
+ [{...providerConflict,status:429},'BROWSER_SESSION_HTTP_RATE_LIMITED',0],
+ [{...providerConflict,status:503},'BROWSER_SESSION_HTTP_SERVER',0],
+ [{...providerConflict,status:418},'BROWSER_INITIAL_SESSION_HTTP',0],
+] as const)test('decline retry emits a fixed paired session failure code '+expected+' (reads '+reads+')',async()=>{
+ const f=cancellationPage('',true,false,false,fixture);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.sessionErrorBodyReads(),reads);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('decline retry ignores even a valid problem from an unpaired session response',async()=>{
+ const f=cancellationPage('initial-session-unpaired',true,false,false,providerConflict);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_SESSION_UNPAIRED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(f.sessionErrorBodyReads(),0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [hold,reads] of [['holdSize',0],['holdBody',1]] as const)test('decline retry leaves the HTTP conflict unchanged after cancellation at '+hold,async()=>{
+ const started=Promise.withResolvers<void>(),release=Promise.withResolvers<void>();
+ const f=cancellationPage('',true,false,false,{...providerConflict,[hold]:()=>{started.resolve();return release.promise;}});
+ const controller=new AbortController();
+ const result=assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000,signal:controller.signal}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_SESSION_HTTP_CONFLICT');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ try{
+  await Promise.race([started.promise,result]);
+  controller.abort();
+  await result;
+ }finally{release.resolve();}
+ await new Promise<void>(resolve=>setImmediate(resolve));
+ assert.equal(f.sessionErrorBodyReads(),reads);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,expected] of [
+ ['initial-operation-missing','BROWSER_OPERATION_NOT_SEEN'],
+ ['initial-page-closed','BROWSER_INITIAL_SESSION'],
+ ['initial-direct-action','BROWSER_SESSION_NOT_SENT'],
+ ['initial-operation-http','BROWSER_OPERATION_HTTP'],
+ ['initial-action-missing','BROWSER_ACTION_NOT_SEEN'],
+ ['initial-action-conflict','BROWSER_ACTION_CONFLICT'],
+ ['initial-action-http','BROWSER_ACTION_HTTP'],
+ ['initial-current-missing','BROWSER_CURRENT_NOT_SEEN'],
+ ['initial-current-http','BROWSER_CURRENT_HTTP'],
+ ['initial-session-not-sent','BROWSER_SESSION_NOT_SENT'],
+ ['initial-foreign-action','BROWSER_SESSION_NOT_SENT'],
+ ['initial-foreign-authority','BROWSER_SESSION_NOT_SENT'],
+ ['initial-ambiguous-action','BROWSER_INITIAL_SESSION'],
+ ['initial-read-headers-pending','BROWSER_INITIAL_SESSION'],
+ ['initial-too-many-reads','BROWSER_INITIAL_SESSION'],
+ ['initial-session-guard','BROWSER_SESSION_REQUEST_REJECTED'],
+ ['initial-session-frame','BROWSER_SESSION_REQUEST_REJECTED'],
+ ['initial-session-headers-pending','BROWSER_SESSION_REQUEST_PENDING'],
+ ['initial-session-no-response','BROWSER_SESSION_NO_RESPONSE'],
+ ['initial-session-unpaired','BROWSER_SESSION_UNPAIRED'],
+] as const)test('decline retry reports the exact original response boundary for '+fault,async()=>{
+ const f=cancellationPage(fault,true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+350}),(error:unknown)=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),expected);
+  assert.equal(browserCleanupConfirmed(error),true);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  return true;
+ });
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirmation-session')).length,['initial-session-no-response','initial-session-unpaired'].includes(fault)?1:0);
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const fault of ['unknown-first','early-retry','no-decline-proof','repeat-retry','wrong-retry-response','same-successor','different-pi','reused-token','retired-retry','retired-successor']){
+ test('decline retry refuses '+fault+' before a second confirm',async()=>{
+  const f=cancellationPage(fault,true);
+  await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+1500}),/^Error: billing_BROWSER$/);
+  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,1);
+  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,['unknown-first','early-retry','no-decline-proof','retired-retry'].includes(fault)?0:1);
+  assert.ok(!f.trace.includes('recovered proof'));assert.ok(f.closed());
+ });
+}
+
+for(const mode of ['static-block','static-image','static-checkout-normalized','static-duplicate','static-foreign-event']){
+ test('decline retry applies the reviewed presentation policy: '+mode,async t=>{
+  const f=cancellationPage(mode,true);
+  const asset=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+   assert.equal(mode,'static-image');assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
+   return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+  });
+  const accepted=['static-block','static-image','static-checkout-normalized'].includes(mode);
+  const result=runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+(accepted?1500:300)},o=>o==='https://private.example');
+  if(accepted)assert.equal(await result,true);else await assert.rejects(result,error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),mode==='static-duplicate'?'BROWSER_PINNED_DOCUMENT_POLICY':'BROWSER_PINNED_DOCUMENT_BLOCK');
+   return true;
+  });
+  assert.equal(f.sent.filter(u=>u.endsWith('/confirm')).length,accepted?2:0);
+  assert.equal(f.sent.filter(u=>u.endsWith('/retry')).length,accepted?1:0);
+  assert.equal(asset.mock.callCount(),mode==='static-image'?1:0);
+  assert.ok(f.presentation.includes(mode==='static-image'?'fulfilled 200':'abort blockedbyclient'));
+ });
+}
+
+for(const [fault,code] of [
+ ['static-main-navigation','BROWSER_PINNED_FRAME_NAV_CAPTURE_MAIN'],
+ ['static-nav-unavailable','BROWSER_PINNED_FRAME_NAV_CAPTURE_LOOKUP'],
+ ['static-nav-direct-child','BROWSER_PINNED_FRAME_NAV_CAPTURE_PARENT'],
+ ['static-checkout-foreign-product','BROWSER_PINNED_FRAME_NAV_CAPTURE_CHECKOUT'],
+ ['static-checkout-foreign-path','BROWSER_PINNED_FRAME_NAV_CAPTURE_CHECKOUT'],
+ ['static-image-uncommitted','BROWSER_PINNED_FRAME_ASSET_CAPTURE_UNCOMMITTED'],
+ ['static-image-blank','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DOCUMENT'],
+ ['static-image-detached','BROWSER_PINNED_FRAME_ASSET_CAPTURE_DETACHED'],
+ ['static-image-foreign-page','BROWSER_PINNED_FRAME_ASSET_CAPTURE_FOREIGN_PAGE'],
+ ['static-credentials','BROWSER_PINNED_CREDENTIALS'],
+ ['static-method','BROWSER_PINNED_METHOD'],
+ ['static-image-query','BROWSER_PINNED_ASSET_URL'],
+ ['static-image-kind','BROWSER_PINNED_ASSET_KIND'],
+ ['static-image-frame-before-fetch','BROWSER_PINNED_FRAME_ASSET_FETCH_CHANGED'],
+] as const)test('decline retry reports the pinned request failure for '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>assert.fail('unowned asset transport'));
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),0);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+test('a same-url navigation during transport prevents the pinned response from reaching a new document',async t=>{
+ const f=cancellationPage('static-image',true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>{
+  f.reloadStripe();
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},o=>o==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_PINNED_FRAME_ASSET_FULFILL_CHANGED');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['abort failed']);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+for(const [fault,code] of [
+ ['static-image-transport','BROWSER_PINNED_ASSET_TRANSPORT'],
+ ['static-image-response','BROWSER_PINNED_ASSET_STATUS'],
+ ['static-image-media','BROWSER_PINNED_ASSET_MEDIA'],
+ ['static-image-cors','BROWSER_PINNED_ASSET_CORS'],
+ ['static-image-empty','BROWSER_PINNED_ASSET_BODY'],
+] as const)test('decline retry reports the pinned response failure for '+fault,async t=>{
+ const f=cancellationPage(fault,true);
+ const asset=t.mock.method(globalThis,'fetch',async()=>{
+  if(fault==='static-image-transport')throw Error('private canary');
+  const bytes=fault==='static-image-empty'?new Uint8Array():new Uint8Array([1]);
+  return new globalThis.Response(bytes,{status:fault==='static-image-response'?403:200,
+   headers:{'content-type':fault==='static-image-media'?'text/html':'image/png'}});
+ });
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+3000},origin=>origin==='https://private.example'),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(String(error),'Error: billing_BROWSER');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.equal(asset.mock.callCount(),1);
+ assert.ok(!f.trace.includes('Pay'));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')||url.endsWith('/retry')));
+});
+
+test('a token intercepted on the first Pay cannot use the successor gesture after its headers arrive',async()=>{
+ const f=cancellationPage('late-first-token',true);
+ await assert.rejects(runBillingDeclineRetryBrowser(f.browser,f.port,{deadline:Date.now()+1500}),/^Error: billing_BROWSER$/);
+ assert.equal(f.trace.filter(x=>x==='Pay').length,2);
+ assert.deepEqual(f.providerSent,['https://api.stripe.com/v1/confirmation_tokens']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+});
+
+for(const [fault,code] of Object.entries({
+ 'provider-route-stripe-network':'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK',
+ 'provider-route-frame':'BROWSER_PROVIDER_ROUTE_FRAME',
+ 'provider-route-cookie':'BROWSER_PROVIDER_AUTH',
+}))test('initial 3DS reports a safe provider refusal after CREATE: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{}),error=>{
+  assert.match(String(error),/^Error: billing_BROWSER$/);
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),code);
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.ok(f.sent.includes(binding.endpoints.backend+'/api/v1/customer/subscriptions'));
+ assert.deepEqual(f.providerSent,['https://js.stripe.com/v3/']);
+ assert.ok(!f.trace.includes('Pay')&&!f.sent.some(url=>url.endsWith('/confirm')));
+});
+
+for(const fault of ['contract-opaque','contract-opaque-issuer-post','contract-no-private-api','contract-approved-issuer','contract-owned-form-key'])test('3DS accepts SDK settlement independent of issuer request shape: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ let handoffs=0;
+ const approved=fault==='contract-approved-issuer'?approvedFixtureIssuer:undefined;
+ assert.equal(await runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{
+  assert.ok(f.trace.includes('persist challenge'));
+  assert.ok(f.providerSent.some(url=>url.endsWith('/sdk-resource?version=2')));
+  f.trace.push('operator');handoffs++;
+ },undefined,approved),true);
+ assert.equal(handoffs,1);
+ assert.equal(f.trace.filter(step=>step==='Create subscription').length,1);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.ok(!f.trace.includes('Retry payment'));
+ assert.deepEqual(f.numbers,['4000000000003220']);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.deepEqual(f.trace.filter(step=>['persist challenge','operator','issuer Complete','issuer witnessed'].includes(step)),
+  ['persist challenge','operator','issuer Complete','issuer witnessed']);
+ assert.ok(!f.providerSent.some(url=>url.includes('/decision')||url.endsWith('/challenge_complete')));
+ if(fault==='contract-no-private-api')assert.ok(!f.providerSent.some(url=>url.includes('/v1/3ds2/')||url.includes('/v1/payment_intents/')));
+ assert.ok(f.closed());
+});
+
+test('3DS blocks a confirmation token after its payment frame changes during the checkout check',async()=>{
+ const f=cancellationPage('3ds-token-frame-changes-during-owner-check',false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},
+  async()=>assert.fail('operator must remain locked')),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_PROVIDER_ROUTE_FRAME');
+   return true;
+  });
+ assert.ok(!f.providerSent.some(url=>url.endsWith('/confirmation_tokens')));
+ assert.ok(!f.sent.some(url=>url.endsWith('/confirm')));
+ assert.ok(f.closed());
+});
+
+test('3DS fails closed before any checkout request if shared workers are available',async()=>{
+ const f=cancellationPage('contract-shared-worker-enabled',false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},
+  async()=>assert.fail('operator must remain locked')),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_GUARD_IFRAME_SETUP');
+   return true;
+  });
+ assert.deepEqual(f.sent,[]);
+ assert.deepEqual(f.providerSent,[]);
+ assert.ok(f.closed());
+});
+
+for(const [fault,blocked] of [
+ ['contract-foreign-intent','/payment_intents/pi_other?'],
+ ['contract-foreign-secret','client_secret=pi_original_secret_other'],
+ ['contract-foreign-key','/payment_intents/pi_original?'],
+ ['contract-foreign-form-key','/v1/3ds2/authenticate'],
+ ['contract-account-header','/payment_intents/pi_original?'],
+ ['contract-api-write','/payment_intents/pi_original/confirm'],
+ ['contract-unapproved-origin','https://unlisted-fixture.stripe.com'],
+ ['contract-cookie','/sdk-resource?version=2'],
+] as const)test('3DS contains a post-confirm provider request outside the isolated payment: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},
+  async()=>{assert.fail('operator must remain locked');}),error=>{
+   assert.equal(String(error),'Error: billing_BROWSER');
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+ });
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.ok(!f.providerSent.some(url=>url.includes(blocked)));
+ assert.ok(!f.trace.includes('issuer witnessed'));
+ assert.ok(f.closed());
+});
+
+test('3DS holds eager SDK traffic until dispatch is durable',async()=>{
+ const f=cancellationPage('contract-opaque',false,true);
+ const saving=Promise.withResolvers<void>(),durable=Promise.withResolvers<void>();
+ const beforeChallenge=f.port.beforeChallenge;
+ f.port.beforeChallenge=async scope=>{
+  saving.resolve();
+  await durable.promise;
+  return beforeChallenge(scope);
+ };
+ let handoffs=0;
+ const run=runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{handoffs++;});
+ void run.catch(()=>{});
+ try{
+  await Promise.race([saving.promise,run]);
+  await new Promise<void>(resolve=>setImmediate(resolve));
+  assert.equal(handoffs,0);
+  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+  assert.ok(!f.providerSent.some(url=>url.includes('/v1/3ds2/')||url.includes('/v1/payment_intents/')));
+ }finally{durable.resolve();}
+ assert.equal(await run,true);
+ assert.equal(handoffs,1);
+});
+
+for(const fault of ['replayed-next-ack','contract-dispatch-refused'])test('3DS never opens an operator gesture without a winning persisted confirmation: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ let handoffs=0;
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{handoffs++;}),/billing_BROWSER/);
+ assert.equal(handoffs,0);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.ok(!f.providerSent.some(url=>url.includes('/v1/3ds2/')||url.includes('/sdk-resource')));
+ assert.ok(!f.trace.includes('issuer witnessed'));
+ assert.ok(f.closed());
+});
+
+for(const fault of ['profile-retires','same-url-issuer-replaced','contract-settlement-error','contract-no-settlement','contract-wrong-subscription'])test('3DS requires the owned document and paid application projection: '+fault,async()=>{
+ const f=cancellationPage(fault,false,true);
+ let handoffs=0;
+ await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+1200},async()=>{
+  handoffs++;
+  if(fault==='profile-retires')f.retire();
+  if(fault==='same-url-issuer-replaced')f.reloadIssuer();
+ }),/billing_BROWSER/);
+ assert.equal(handoffs,1);
+ assert.equal(f.trace.filter(step=>step==='issuer Complete').length,fault.startsWith('contract-')?1:0);
+ assert.ok(!f.trace.includes('issuer witnessed'));
+ assert.ok(f.closed());
+});
+
+for(const fault of ['create-pointer-lost','confirm-pointer-lost','early-static-image'])
+ test('initial 3DS survives the verified checkout race: '+fault,async t=>{
+  const f=cancellationPage(fault,false,true);
+  const fetch=t.mock.method(globalThis,'fetch',async(_url:unknown,options:RequestInit)=>{
+   assert.equal(fault,'early-static-image');
+   assert.deepEqual(f.trace.filter(step=>['pinned asset intercepted','initial session body read','Pay'].includes(step)),
+    ['pinned asset intercepted','initial session body read']);
+   assert.equal(options.redirect,'error');
+   assert.equal(options.credentials,'omit');
+   return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+  });
+  assert.equal(await runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+3000},async()=>{},
+   origin=>origin==='https://private.example'),true);
+  assert.deepEqual(f.keysPressed,['Enter','Enter']);
+  assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+  assert.equal(f.providerSent.filter(url=>url.endsWith('/sdk-resource?version=2')).length,1);
+  assert.equal(fetch.mock.callCount(),fault==='early-static-image'?1:0);
+  if(fault==='early-static-image')assert.ok(f.presentation.includes('fulfilled 200'));
+ });
+
+for(const label of ['demo','js.stripe.com','otp','verify','read','create','selection','api.stripe.com','r.stripe.com','merchant-ui-api.stripe.com','token','confirm','challenge-provider']){
+ test('a response redirect never forwards the original '+label+' request to a second destination',async()=>{
+  const f=cancellationPage('redirect-'+label,false,true);
+  await assert.rejects(runBillingInitial3dsBrowser(f.browser,f.port,{deadline:Date.now()+2000},async()=>{}),/billing_BROWSER/);
+  assert.equal(f.trace.some(value=>value.startsWith('followed redirect ')),false);
+  assert.ok(f.closed());assert.equal(f.trace.includes('issuer witnessed'),false);
+ });
+}
+
+test('held invoice Pay completes with one trusted keyboard activation when pointer input is lost',async()=>{
+ const f=cancellationPage('confirm-pointer-lost',false,false,true);
+ assert.equal(await runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+1000},()=>false),true);
+ assert.deepEqual(f.keysPressed,['Enter']);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url.endsWith('/confirm')).length,1);
+ assert.deepEqual(f.trace.filter(step=>step==='release original confirm'||step==='completed invoice proof'),
+  ['release original confirm','completed invoice proof']);
+ assert.ok(f.closed());
+});
+
+test('held invoice Pay cannot dispatch after the exact control loses focus',async()=>{
+ const f=cancellationPage('confirm-focus-lost',false,false,true);
+ await assert.rejects(runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+1000},()=>false),error=>{
+  assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CONFIRM_FOCUS');
+  assert.equal(browserCleanupConfirmed(error),true);
+  return true;
+ });
+ assert.deepEqual(f.keysPressed,[]);
+ assert.equal(f.trace.some(step=>step==='Pay'||step==='release original confirm'),false);
+ assert.equal(f.providerSent.some(url=>url.endsWith('/confirmation_tokens')),false);
+ assert.equal(f.sent.some(url=>url.endsWith('/confirm')),false);
+ assert.ok(f.closed());
+});
+
+for(const fault of ['none','invalid ingress','invalid evidence','redirect-token','redirect-confirm']){
+ test('single original Pay through held invoice browser: '+fault,async()=>{
+  const f=cancellationPage(fault,false,false,true);
+  const run=runBillingInvoiceWebhooksBrowser(f.browser,f.port,{deadline:Date.now()+3000},()=>false);
+  if(fault==='none')assert.equal(await run,true);else await assert.rejects(run,/billing_BROWSER/);
+  assert.deepEqual(f.numbers,['4242424242424242']);assert.ok(f.closed());
+  assert.equal(f.trace.filter(x=>x==='Create subscription').length,1);assert.equal(f.trace.filter(x=>x==='Pay').length,1);
+  assert.equal(f.sent.filter(x=>x.endsWith('/confirm')).length,['invalid ingress','redirect-token'].includes(fault)?0:1);
+  assert.equal(f.trace.includes('completed invoice proof'),['none','invalid evidence'].includes(fault));
+  assert.equal(f.trace.some(x=>x.startsWith('followed redirect ')||x==='Retry payment'||x==='issuer Complete'),false);
+ });
+}
+
+test('required trial creates once, spends the original setup permit, then refreshes the same trial',async()=>{
+ const f=cancellationPage('',false,false,false,undefined,false,undefined,true);
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+3000}),true);
+ assert.deepEqual(f.trace.filter(step=>['ack trial create','Pay','persist trial permit','forward trial permit','persist trial setup','forward trial setup','verify setup','Refresh status'].includes(step)),
+  ['ack trial create','Pay','persist trial permit','forward trial permit','persist trial setup','forward trial setup','verify setup','Refresh status']);
+ assert.deepEqual(f.keysPressed,['Enter','Enter','Enter']);
+ assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.deepEqual(f.sent.slice(2,6).map(url=>new URL(url).pathname),[
+  '/api/v1/customer/me','/api/v1/customer/subscription-products/'+f.id(2)+'/offers',
+  '/api/v1/customer/subscriptions','/api/v1/customer/subscriptions']);
+ assert.ok(f.closed());
+});
+
+for(const fault of ['trial-baseline-query','trial-baseline-cookie','trial-baseline-repeat','trial-baseline-unpaired','trial-baseline-foreign-customer'])
+ test('required trial rejects an invalid restored customer before CREATE for '+fault,async()=>{
+  const f=cancellationPage(fault,false,false,false,undefined,false,undefined,true);
+  await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),error=>{
+   assert.equal(browserDiagnostic(error,'ACCEPTANCE'),'BROWSER_CREATE_BASELINE');
+   assert.equal(browserCleanupConfirmed(error),true);
+   return true;
+  });
+  assert.equal(f.sent.filter(url=>new URL(url).pathname==='/api/v1/customer/me').length,
+   ['trial-baseline-repeat','trial-baseline-unpaired','trial-baseline-foreign-customer'].includes(fault)?1:0);
+  assert.ok(!f.trace.includes('Create subscription'));
+ });
+
+for(const [fault,permits,setups] of [
+ ['trial-direct-action',0,0],['trial-foreign-grant',0,0],['trial-payment-session',0,0],['trial-premature-access',0,0],
+ ['trial-untrusted',0,0],['trial-generic-mutation',0,0],['trial-before-permit',0,0],
+ ['trial-permit-duplicate-fields',0,0],['trial-foreign-permit-receipt',1,0],['trial-denied-permit',1,0],
+ ['trial-payment-intent',1,0],['trial-confirmation-token',1,0],['trial-wrong-setup-id',1,0],
+ ['trial-wrong-secret',1,0],['trial-wrong-provider-key',1,0],['trial-provider-token',1,0],['trial-foreign-frame',1,0],['trial-setup-cookie',1,0],
+ ['trial-retire-permit',0,0],['trial-retire-setup',1,0],
+ ['trial-setup-worker',1,1],['trial-setup-pending',1,1],['redirect-trial-setup',1,1],
+ ['trial-repeat-permit',1,0],['trial-repeat-setup',1,1],['trial-wrong-refresh',1,1],['trial-wrong-refresh-wire',1,1],
+] as const)test('required trial closes its browser authority for '+fault,async()=>{
+ const f=cancellationPage(fault,false,false,false,undefined,false,undefined,true);
+ await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),/billing_BROWSER/);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,permits);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,setups);
+ assert.equal(f.providerSent.some(url=>/payment_intents|confirmation_tokens/.test(url)),false);
+ assert.equal(f.trace.some(step=>step.startsWith('followed redirect ')),false);
+ assert.ok(f.closed());
+});
+
+test('required trial holds a pinned passive asset until its original SETUP session is valid',async t=>{
+ const f=cancellationPage('early-static-image',false,false,false,undefined,false,undefined,true);
+ const asset=t.mock.method(globalThis,'fetch',async(url:URL,options:RequestInit)=>{
+  assert.equal(url.href,'https://private.example/image.png');
+  assert.equal(options.redirect,'error');assert.equal(options.credentials,'omit');
+  assert.deepEqual(f.trace.filter(step=>step==='pinned asset intercepted'||step==='initial session body read'),
+   ['pinned asset intercepted','initial session body read']);
+  return new globalThis.Response(new Uint8Array([1]),{status:200,headers:{'content-type':'image/png'}});
+ });
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000},origin=>origin==='https://private.example'),true);
+ assert.equal(asset.mock.callCount(),1);
+ assert.deepEqual(f.presentation,['fulfilled 200']);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,1);
+ assert.ok(f.closed());
+});
+
+test('required trial follows the original CREATE across both sweep delays before refreshing',async t=>{
+ const now=Date.now(),setTimer=globalThis.setTimeout;
+ let elapsed=0;
+ t.mock.method(Date,'now',()=>now+elapsed);
+ t.mock.method(globalThis,'setTimeout',(fn:()=>void,ms:number)=>setTimer(fn,ms===250?1:ms));
+ const f=cancellationPage('trial-delayed-settlement',false,false,false,undefined,false,ms=>{elapsed+=ms;},true);
+ assert.equal(await runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:now+600_000}),true);
+ assert.equal(elapsed,420_000);
+ assert.deepEqual(f.trace.filter(step=>step.startsWith('trial status ')||step==='Refresh status'),
+  ['trial status SUCCEEDED','Refresh status']);
+ assert.equal(f.trace.filter(step=>step==='Pay').length,1);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+ assert.ok(f.closed());
+});
+
+for(const fault of ['failed','unknown','action','foreign','read-foreign'])test('required trial refuses unsafe CREATE observation '+fault,async()=>{
+ const f=cancellationPage('trial-terminal-'+fault,false,false,false,undefined,false,undefined,true);
+ await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:Date.now()+2000}),/billing_BROWSER/);
+ assert.equal(f.trace.includes('Refresh status'),false);
+ assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+ assert.equal(f.providerSent.filter(url=>url===f.setupUrl).length,1);
+ assert.ok(f.closed());
+});
+
+for(const [fault,lifetime] of [['trial-watch-expired',600_000],['trial-customer-expired',120_000]] as const)
+ test('required trial stops processing at '+fault,async t=>{
+  const now=Date.now(),setTimer=globalThis.setTimeout;
+  let elapsed=0;
+  t.mock.method(Date,'now',()=>now+elapsed);
+  t.mock.method(globalThis,'setTimeout',(fn:()=>void,ms:number)=>setTimer(fn,ms===250?1:ms));
+  const f=cancellationPage(fault,false,false,false,undefined,false,ms=>{elapsed+=ms;},true);
+  await assert.rejects(runBillingRequiredTrialBrowser(f.browser,f.port,{deadline:now+700_000}),/billing_BROWSER/);
+  assert.equal(elapsed,lifetime);
+  assert.equal(f.trace.includes('Refresh status'),false);
+  assert.equal(f.sent.filter(url=>url===f.trialPermit).length,1);
+  assert.deepEqual(f.providerSent.filter(url=>url.endsWith('/confirm')),[f.setupUrl]);
+  assert.ok(f.closed());
+ });

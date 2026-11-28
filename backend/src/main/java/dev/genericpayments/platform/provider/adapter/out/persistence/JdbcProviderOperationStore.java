@@ -3,6 +3,15 @@ package dev.genericpayments.platform.provider.adapter.out.persistence;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount;
 import dev.genericpayments.platform.paymentaccounts.domain.PaymentAccountId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.model.ReadyClock;
+import dev.genericpayments.platform.provider.application.model.OwnedClockSubscription;
+import dev.genericpayments.platform.provider.application.model.OwnedClockSubscriptionReceipt;
+import dev.genericpayments.platform.provider.application.model.OwnedFirstRenewal.*;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Origin;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.Reservation;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.SuccessorOwner;
+import dev.genericpayments.platform.customers.domain.CustomerId;
+import dev.genericpayments.platform.sites.domain.SiteId;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind;
 import dev.genericpayments.platform.provider.application.model.ProviderOperation.Status;
 import dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore;
@@ -33,10 +42,167 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     @Override
     public ProviderOperation reserve(PaymentAccount account, Kind kind, UUID resourceId, String key, String fingerprint) {
         if (account == null || kind == null || resourceId == null) throw conflict();
+        if(kind==Kind.TEST_CLOCK_ADVANCE||dedicated(kind))throw conflict();
         text(key, 255);
         text(fingerprint, 255);
         requireAccount(account);
-        requireResource(account.id(), kind, resourceId);
+        requireResource(account.id(), kind, resourceId,key,fingerprint,false);
+        return reserveRow(account,kind,resourceId,key,fingerprint);
+    }
+    @Override
+    public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,
+            Reservation reservation,Kind kind) {
+        return reserveMethodStep(account,reservation,kind,null);
+    }
+    @Override public ProviderOperation reserveOwnedFailedRenewalMethodStep(PaymentAccount account,Reservation reservation,Kind kind,SuccessorOwner owner){
+        if(owner==null)throw conflict();
+        return reserveMethodStep(account,reservation,kind,owner);
+    }
+    private ProviderOperation reserveMethodStep(PaymentAccount account,Reservation reservation,Kind kind,SuccessorOwner invocation) {
+        if(account==null||reservation==null||(kind!=Kind.SETUP_INTENT_CREATE&&kind!=Kind.SUBSCRIPTION_UPDATE))throw conflict();
+        if((reservation.successor()!=null)!=(invocation!=null))throw conflict();
+        // Browser phases already hold this row before authority/account/root locks.
+        lockOwnedMethodOperation(reservation.setupOperationId());
+        var store=new JdbcOwnedFailedRenewalMethodStore(jdbc);store.requireReservationInTransaction(reservation);
+        var owner=reservation.admission().firstRenewalAdmission().receipt().intent().clock().owner();
+        if(!account.id().equals(owner.account())||!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef())
+                ||!account.provider().name().equals("STRIPE")||!account.mode().name().equals("SANDBOX"))throw conflict();
+        requireAccount(account);
+        String key=jdbc.queryForObject("select provider_operation_key from subscription_operations where id=?",String.class,reservation.setupOperationId())
+            +(kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD");
+        String fingerprint=jdbc.queryForObject("select owned_method_step_fingerprint(?,?)",String.class,reservation.id(),kind==Kind.SUBSCRIPTION_UPDATE);
+        JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,account.id(),kind,reservation.setupOperationId(),key,fingerprint);
+        var step=reserveRow(account,kind,reservation.setupOperationId(),key,fingerprint);
+        if(invocation!=null&&(step.status()!=Status.RESERVED||step.version()!=0))throw conflict();
+        return step;
+    }
+    @Override
+    public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,
+            Reservation reservation,ProviderOperation claim,Instant now) {
+        return inspectMethodDispatch(account,reservation,claim,now,null);
+    }
+    @Override public ProviderOperation requireOwnedFailedRenewalMethodDispatch(PaymentAccount account,Reservation reservation,
+            ProviderOperation claim,Instant now,SuccessorOwner owner){
+        if(owner==null)throw conflict();
+        return inspectMethodDispatch(account,reservation,claim,now,owner);
+    }
+    private ProviderOperation inspectMethodDispatch(PaymentAccount account,Reservation reservation,ProviderOperation claim,Instant now,SuccessorOwner owner){
+        if(account==null||reservation==null||claim==null||now==null||!claim.resourceId().equals(reservation.setupOperationId()))throw conflict();
+        if((reservation.successor()!=null)!=(owner!=null))throw conflict();
+        return requireOwnedMethodDispatchAfterAuthentication(account,claim,now,()->{
+            var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+            if(!current.equals(claim))throw conflict();
+            new JdbcOwnedFailedRenewalMethodStore(jdbc).requireReservationInTransaction(reservation);
+            if(owner!=null)requireWriteOwner(current,current.leaseOwner(),owner,true);
+            requirePinnedAccount(current);
+            JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
+            return current;
+        },()->jdbc.queryForObject("select clock_timestamp()",Timestamp.class).toInstant());
+    }
+    /** Authentication may wait for row/account locks; time authority must be sampled after it returns. */
+    static ProviderOperation requireOwnedMethodDispatchAfterAuthentication(PaymentAccount account,ProviderOperation claim,Instant now,
+            java.util.function.Supplier<ProviderOperation> authenticate,java.util.function.Supplier<Instant> databaseUtc) {
+        var current=authenticate.get();
+        if(!current.equals(claim))throw conflict();
+        if(current.version()!=1||current.firstDispatchedAt()==null)throw conflict();
+        var guard=new dev.genericpayments.platform.provider.application.service.ProviderOperationGuard();
+        guard.requireDispatch(current,account,current.fingerprint(),now);
+        // No caller timestamp may extend the lease/retry window after authentication waited for a lock.
+        guard.requireDispatch(current,account,current.fingerprint(),databaseUtc.get());
+        return current;
+    }
+    @Override
+    public ProviderOperation reserveOwnedFirstRenewalAdvance(PaymentAccount account,Advance advance){
+        if(account==null||advance==null)throw conflict();
+        var admission=JdbcOwnedFirstRenewalStore.requireAdvanceScope(jdbc,account.id(),advance);
+        var owner=admission.receipt().intent().clock().owner();
+        if(!account.externalAccountId().equals(owner.externalAccount())||!account.credentialsRef().equals(owner.credentialsRef()))throw conflict();
+        requireAccount(account);
+        return reserveRow(account,Kind.TEST_CLOCK_ADVANCE,advance.id(),advance.operationKey(),advance.fingerprint());
+    }
+    @Override
+    public Ack acknowledgeOwnedFirstRenewalAdvance(Advance advance,ProviderOperation claim,TestClockAck observation,Instant utcAt){
+        if(advance==null||claim==null||observation==null||utcAt==null||claim.kind()!=Kind.TEST_CLOCK_ADVANCE
+                ||claim.status()!=Status.DISPATCHING||claim.leaseOwner()==null)throw conflict();
+        var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(claim)||!current.resourceId().equals(advance.id()))throw conflict();
+        var admission=JdbcOwnedFirstRenewalStore.requireAdvanceScope(jdbc,current.accountId(),advance);
+        JdbcOwnedFirstRenewalStore.requireOperationAdvance(jdbc,current);
+        requirePinnedAccount(current);requireSubscriptionReference(current,observation.reference());
+        var original=admission.receipt().intent().clock();
+        long predecessor=advance.step()==Step.BOUNDARY?original.frozenTime():admission.receipt().periodEnd();
+        if(!observation.name().equals(original.owner().name())||observation.created()!=original.providerCreated()
+                ||observation.deletesAfter()!=original.providerDeletesAfter()||observation.frozenTime()<predecessor||observation.frozenTime()>advance.target()
+                ||observation.advancingTarget()!=null&&observation.advancingTarget()!=advance.target()
+                ||utcAt.isBefore(current.firstDispatchedAt())||!utcAt.isBefore(current.leaseExpiresAt()))throw conflict();
+        var at=utcAt.truncatedTo(ChronoUnit.MICROS);
+        try {
+            var acknowledged=one(jdbc.query("""
+                update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=version+1
+                where id=? and status='DISPATCHING' and lease_owner=? and version=? and lease_expires_at>clock_timestamp() returning *
+                """,this::operation,observation.reference(),current.id(),current.leaseOwner(),current.version()));
+            var ack=new Ack(advance,acknowledged,current.leaseOwner(),current.leaseExpiresAt(),observation,at);
+            jdbc.update("""
+                insert into stripe_billing_first_renewal_acks(step_id,admission_id,payment_account_id,provider_operation,claimant,deadline,
+                 reference,object_type,livemode,name,frozen_time,status,provider_created,provider_deletes_after,advancing_target,acknowledged_at)
+                 values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,advance.id(),admission.id(),current.accountId().value(),current.id(),current.leaseOwner(),Timestamp.from(current.leaseExpiresAt()),observation.reference(),observation.object(),
+                observation.livemode(),observation.name(),observation.frozenTime(),observation.status(),observation.created(),observation.deletesAfter(),observation.advancingTarget(),Timestamp.from(at));
+            return ack;
+        }catch(DataIntegrityViolationException invalid){throw conflict();}
+    }
+
+    @Override
+    public ProviderOperation reserveOwnedBillingCustomer(PaymentAccount account, ReadyClock ready) {
+        if(account==null || ready==null || !account.id().equals(ready.owner().account())
+            || !account.externalAccountId().equals(ready.owner().externalAccount())
+            || !account.credentialsRef().equals(ready.owner().credentialsRef())) throw conflict();
+        requireAccount(account);
+        requireResource(account.id(),Kind.CUSTOMER_CREATE,ready.owner().customer().value(),ready.owner().customerKey(),ready.customerFingerprint(),true);
+        if(!JdbcStripeBillingClockStore.readyRow(jdbc,ready.owner().intent()).filter(ready::equals).isPresent()) throw conflict();
+        return reserveRow(account,Kind.CUSTOMER_CREATE,ready.owner().customer().value(),ready.owner().customerKey(),ready.customerFingerprint());
+    }
+
+    @Override
+    public ProviderOperation reserveOwnedBillingSubscription(PaymentAccount account,OwnedClockSubscription intent) {
+        if(account==null || intent==null || !account.id().equals(intent.clock().owner().account())
+            || !account.externalAccountId().equals(intent.clock().owner().externalAccount())
+            || !account.credentialsRef().equals(intent.clock().owner().credentialsRef()))throw conflict();
+        JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        requireAccount(account);
+        return reserveRow(account,Kind.SUBSCRIPTION_CREATE,intent.createOperation(),intent.operationKey(),intent.fingerprint());
+    }
+    @Override
+    public OwnedClockSubscriptionReceipt acknowledgeOwnedBillingSubscription(OwnedClockSubscription intent,ProviderOperation claim,
+            String reference,long created,String item,long start,long end,Instant acknowledgedAt) {
+        if(intent==null || claim==null || acknowledgedAt==null || claim.status()!=Status.DISPATCHING || claim.leaseOwner()==null)throw conflict();
+        var current=lock(claim.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(claim) || current.kind()!=Kind.SUBSCRIPTION_CREATE || !current.accountId().equals(intent.clock().owner().account())
+            || !current.resourceId().equals(intent.createOperation()) || !current.operationKey().equals(intent.operationKey())
+            || !current.fingerprint().equals(intent.fingerprint()) || current.firstDispatchedAt()==null
+            || acknowledgedAt.isBefore(current.firstDispatchedAt()))throw conflict();
+        JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,intent);
+        requirePinnedAccount(current);
+        requireFirstSubscriptionDispatch(current);
+        JdbcStripeBillingClockSubscriptionStore.requirePristine(jdbc,intent);
+        requireSubscriptionReference(current,reference);
+        var receipt=new OwnedClockSubscriptionReceipt(intent,current.id(),reference,created,item,start,end,acknowledgedAt.truncatedTo(ChronoUnit.MICROS));
+        try {
+            // Provider row was acquired before the real DB clock predicate; no second transaction or proxy call.
+            one(jdbc.query("""
+                update provider_operations set status='ACKNOWLEDGED',provider_reference=?,lease_owner=null,lease_expires_at=null,version=version+1
+                where id=? and status='DISPATCHING' and lease_owner=? and version=? and lease_expires_at>clock_timestamp() returning *
+                """,this::operation,reference,current.id(),current.leaseOwner(),current.version()));
+            jdbc.update("""
+                insert into stripe_billing_owned_subscription_receipts(intent_id,payment_account_id,create_operation,provider_operation,
+                 reference,provider_created,item_reference,period_start,period_end,acknowledged_at)
+                values (?,?,?,?,?,?,?,?,?,?)
+                """,intent.id(),current.accountId().value(),intent.createOperation(),current.id(),reference,created,item,start,end,Timestamp.from(receipt.acknowledgedAt()));
+            return JdbcStripeBillingClockSubscriptionStore.receiptRow(jdbc,intent).filter(receipt::equals).orElseThrow(JdbcProviderOperationStore::conflict);
+        } catch(DataIntegrityViolationException invalid) { throw conflict(); }
+    }
+
+    private ProviderOperation reserveRow(PaymentAccount account,Kind kind,UUID resourceId,String key,String fingerprint) {
         jdbc.update("""
             insert into provider_operations(id,payment_account_id,external_account_id,credentials_ref,
                 kind,resource_id,operation_key,fingerprint)
@@ -53,6 +219,7 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || !operation.operationKey().equals(key) || !operation.fingerprint().equals(fingerprint)
             || !operation.externalAccountId().equals(account.externalAccountId())
             || !operation.credentialsRef().equals(account.credentialsRef())) throw conflict();
+        if(kind==Kind.SUBSCRIPTION_CREATE&&operation.firstDispatchedAt()==null)requireFirstSubscriptionDispatch(operation);
         return operation;
     }
 
@@ -67,6 +234,12 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
 
     @Override
     public Optional<ProviderOperation> claim(UUID id, String owner, Instant now, Duration lease) {
+        return claimStep(id,owner,now,lease,null);
+    }
+    @Override public Optional<ProviderOperation> claim(UUID id,String claimant,Instant now,Duration lease,SuccessorOwner owner){
+        if(owner==null)throw conflict();return claimStep(id,claimant,now,lease,owner);
+    }
+    private Optional<ProviderOperation> claimStep(UUID id,String owner,Instant now,Duration lease,SuccessorOwner invocation){
         text(owner, 128);
         if (id == null || now == null || !Duration.ofSeconds(60).equals(lease)) throw conflict();
         now = now.truncatedTo(ChronoUnit.MICROS);
@@ -77,8 +250,21 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             || (current.leaseExpiresAt() != null && now.isBefore(current.leaseExpiresAt()))
             || (current.firstDispatchedAt() != null && (now.isBefore(current.firstDispatchedAt())
                 || !now.isBefore(current.retryBefore())))) return Optional.empty();
+        // Owned initial publication uses Site -> Customer -> Account. Detect from persisted
+        // intent before the generic Account fence, never after Account has already been held.
+        if(current.kind()==Kind.SUBSCRIPTION_CREATE)
+            JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
+                .ifPresent(i->JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i));
+        if(current.kind()==Kind.TEST_CLOCK_ADVANCE)JdbcOwnedFirstRenewalStore.requireOperationAdvance(jdbc,current);
+        requireWriteOwner(current,owner,invocation,false);
         requirePinnedAccount(current);
-        requireResource(current.accountId(), current.kind(), current.resourceId());
+        requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
+        if(firstDispatchOnly(current) && current.firstDispatchedAt()!=null) return Optional.empty();
+        if(current.kind()==Kind.SUBSCRIPTION_CREATE&&current.firstDispatchedAt()==null) {
+            requireFirstSubscriptionDispatch(current);
+            JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,current.accountId(),current.resourceId())
+                .ifPresent(i->JdbcStripeBillingClockSubscriptionStore.requirePristine(jdbc,i));
+        }
         return jdbc.query("""
             update provider_operations set status='DISPATCHING', lease_owner=?, lease_expires_at=?,
                 first_dispatched_at=coalesce(first_dispatched_at,?), retry_before=coalesce(retry_before,?),
@@ -93,20 +279,51 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     @Override
     public ProviderOperation acknowledge(UUID id, String owner, long expectedVersion, String reference) {
         text(reference, 255);
-        return finishClaim(id, owner, expectedVersion, "ACKNOWLEDGED", reference);
+        return finishClaim(id, owner, expectedVersion, "ACKNOWLEDGED", reference,null);
     }
+    @Override public ProviderOperation acknowledge(UUID id,String claimant,long version,String reference,SuccessorOwner owner){
+        if(owner==null)throw conflict();text(reference,255);return finishClaim(id,claimant,version,"ACKNOWLEDGED",reference,owner);
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockResumeReceipt(ProviderOperation expected){
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected)||current.kind()!=Kind.SUBSCRIPTION_UPDATE||!current.operationKey().equals("subscription:"+current.accountId().value()+":"+current.resourceId()+":RESUME"))throw conflict();
+        return current;
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockPlanReceipt(ProviderOperation expected){
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected)||!java.util.Set.of(Kind.SUBSCRIPTION_UPDATE,Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(current.kind()))throw conflict();
+        return current;
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation lockSubscriptionMutationReceipt(ProviderOperation expected){
+        var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
+        if(!current.equals(expected)||!java.util.Set.of(Kind.SUBSCRIPTION_UPDATE,Kind.SUBSCRIPTION_CANCEL,Kind.INVOICE_PAY).contains(current.kind()))throw conflict();
+        requireResource(current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint());
+        return current;
+    }
+    @Transactional(propagation=Propagation.MANDATORY)
+    public ProviderOperation acknowledgeInTransaction(UUID id,String owner,long version,String reference){text(reference,255);return finishClaim(id,owner,version,"ACKNOWLEDGED",reference,null);}
 
     @Override
     public ProviderOperation unknown(UUID id, String owner, long expectedVersion) {
-        return finishClaim(id, owner, expectedVersion, "UNKNOWN", null);
+        return finishClaim(id, owner, expectedVersion, "UNKNOWN", null,null);
     }
 
-    private ProviderOperation finishClaim(UUID id, String owner, long version, String status, String reference) {
+    private ProviderOperation finishClaim(UUID id, String owner, long version, String status, String reference,SuccessorOwner invocation) {
         text(owner, 128);
         if (id == null || version < 0) throw conflict();
         // Acquire the row first: a blocked UPDATE could otherwise evaluate its clock predicate
         // before waiting for a lock and finish after the lease has expired.
-        lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
+        var current = lock(id).orElseThrow(JdbcProviderOperationStore::conflict);
+        requireWriteOwner(current,owner,invocation,true);
+        if ("ACKNOWLEDGED".equals(status) && (!supportedResource(current.kind()) || ownedSubscription(current)||current.kind()==Kind.TEST_CLOCK_ADVANCE)) throw conflict();
+        if ((current.kind() == Kind.TEST_CLOCK_CREATE||current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY||current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE) && "ACKNOWLEDGED".equals(status)) {
+            requirePinnedAccount(current);
+            requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
+            requireSubscriptionReference(current,reference);
+        }
         try {
             return one(jdbc.query("""
                 update provider_operations set status=?, provider_reference=?, lease_owner=null,
@@ -119,6 +336,24 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         }
     }
 
+    /** The public lease string is an identifier. Only the original invocation can reproduce it for this step. */
+    private void requireWriteOwner(ProviderOperation step,String claimant,SuccessorOwner owner,boolean sealed){
+        if(step.kind()!=Kind.SETUP_INTENT_CREATE&&step.kind()!=Kind.SUBSCRIPTION_UPDATE){
+            if(owner!=null)throw conflict();return;
+        }
+        var roots=jdbc.queryForList("""
+            select id from stripe_billing_failed_method_reservations where setup_operation=? and after_ready_id is not null
+            """,UUID.class,step.resourceId());
+        if(roots.isEmpty()){if(owner!=null)throw conflict();return;}
+        if(roots.size()!=1||owner==null)throw conflict();
+        var digest=owner.commitment(step.kind()==Kind.SETUP_INTENT_CREATE?Origin.SETUP_WRITE:Origin.METHOD_WRITE,step.id());
+        if(!digest.equals(claimant))throw conflict();
+        if(sealed&&(!digest.equals(step.leaseOwner())||!Boolean.TRUE.equals(jdbc.queryForObject("""
+            select owned_grace_write_claim_matches(?,p) and q.successor_owner_digest=? and q.successor_producer_xid<>pg_current_xact_id()
+            from provider_operations p join stripe_billing_failed_grace_method_claims q on q.operation_id=p.id where p.id=?
+            """,Boolean.class,roots.getFirst(),digest,step.id()))))throw conflict();
+    }
+
     @Override
     @Transactional(propagation=Propagation.REQUIRES_NEW,readOnly=true)
     public Optional<ProviderOperation> findById(UUID id) {
@@ -129,7 +364,12 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     public ProviderOperation lockRecovery(ProviderOperation expected) {
         var current=lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
         if(!current.equals(expected))throw conflict();
-        requirePinnedAccount(current);requireResource(current.accountId(),current.kind(),current.resourceId());
+        if(current.kind()==Kind.TEST_CLOCK_ADVANCE)throw conflict();
+        requirePinnedAccount(current);
+        // Known ACK local binding repair is distinct from provider/event recovery.
+        if(firstDispatchOnly(current) && (current.kind()!=Kind.CUSTOMER_CREATE || current.status()!=Status.ACKNOWLEDGED)) throw conflict();
+        requireResource(current.accountId(),current.kind(),current.resourceId(),current.operationKey(),current.fingerprint(),true,
+            current.kind()==Kind.CUSTOMER_CREATE && current.status()==Status.ACKNOWLEDGED);
         return current;
     }
     @Override
@@ -150,8 +390,16 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
         if (expected == null || expected.id() == null) throw conflict();
         var current = lock(expected.id()).orElseThrow(JdbcProviderOperationStore::conflict);
         // Includes immutable request facts, dispatch bounds, owner and fencing version.
+        // Portal has no accepted post-window original-request recovery evidence contract.
+        if(current.kind()==Kind.PORTAL_CONFIGURATION_CREATE||current.kind()==Kind.PORTAL_SESSION_CREATE||firstDispatchOnly(current))throw conflict();
         if (!current.equals(expected) || !current.fingerprint().equals(fingerprint)
             || current.firstDispatchedAt() == null) throw conflict();
+        if (!supportedResource(current.kind())) throw conflict();
+        if (current.kind() == Kind.CUSTOMER_CREATE||current.kind()==Kind.SUBSCRIPTION_CREATE||current.kind()==Kind.SETUP_INTENT_CREATE||current.kind()==Kind.SUBSCRIPTION_UPDATE||current.kind()==Kind.SUBSCRIPTION_CANCEL||current.kind()==Kind.INVOICE_PAY) {
+            requirePinnedAccount(current);
+            requireResource(current.accountId(), current.kind(), current.resourceId(),current.operationKey(),current.fingerprint());
+            requireSubscriptionReference(current,reference);
+        }
         if (current.status() == Status.ACKNOWLEDGED) {
             if (!Objects.equals(current.providerReference(), reference)) throw conflict();
             return current;
@@ -169,8 +417,25 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
     }
 
     private Optional<ProviderOperation> lock(UUID id) {
-        return jdbc.query("select * from provider_operations where id=? for update", this::operation, id)
-            .stream().findFirst();
+        // Locate immutable ownership without locking the provider receipt. Replays must use the
+        // same operation -> provider order as browser root/proof FKs, even for terminal ACKs.
+        var persisted=row(jdbc,id);
+        if(persisted.isEmpty())return Optional.empty();
+        if(persisted.filter(o->dedicated(o.kind())).isPresent())throw conflict();
+        persisted.filter(o->o.kind()==Kind.SETUP_INTENT_CREATE||o.kind()==Kind.SUBSCRIPTION_UPDATE)
+            .filter(o->JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,o.accountId(),o.resourceId()))
+            .ifPresent(o->lockOwnedMethodOperation(o.resourceId()));
+        var locked=jdbc.query("select * from provider_operations where id=? and kind<>'OWNED_RECOVERY_INTENT_CONFIRM' and kind<>'OWNED_GRACE_CLOCK_ADVANCE' and kind<>'OWNED_GRACE_AT_CLOCK_ADVANCE' and kind<>'OWNED_GRACE_AFTER_CLOCK_ADVANCE' for update",this::operation,id).stream().findFirst();
+        if(locked.filter(o->dedicated(o.kind())).isPresent())throw conflict();
+        return locked;
+    }
+    private static boolean dedicated(Kind kind){return kind!=null&&kind.dedicatedDispatch();}
+    private void lockOwnedMethodOperation(UUID resource){
+        if(jdbc.queryForList("select id from subscription_operations where id=? for update",UUID.class,resource).size()!=1)throw conflict();
+    }
+    static Optional<ProviderOperation> row(JdbcTemplate jdbc,UUID id){
+        var store=new JdbcProviderOperationStore(jdbc);
+        return jdbc.query("select * from provider_operations where id=?",store::operation,id).stream().findFirst();
     }
 
     private void requireAccount(PaymentAccount account) {
@@ -188,14 +453,229 @@ public class JdbcProviderOperationStore implements ProviderOperationStore {
             """, UUID.class, operation.accountId().value(), operation.externalAccountId(), operation.credentialsRef()).size() != 1) throw conflict();
     }
 
-    private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId) {
+    private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key,String fingerprint) {
+        requireResource(account,kind,resourceId,key,fingerprint,true);
+    }
+    private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key,String fingerprint,boolean ownedCustomer) {
+        requireResource(account,kind,resourceId,key,fingerprint,ownedCustomer,false);
+    }
+    private void requireResource(PaymentAccountId account, Kind kind, UUID resourceId,String key,String fingerprint,boolean ownedCustomer,boolean bindingRepair) {
+        if((kind==Kind.SETUP_INTENT_CREATE||kind==Kind.SUBSCRIPTION_UPDATE)
+                &&JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,account,resourceId)) {
+            if(!ownedCustomer||bindingRepair)throw conflict();
+            JdbcOwnedFailedRenewalMethodStore.requireStepResource(jdbc,account,kind,resourceId,key,fingerprint);return;
+        }
+        if(kind==Kind.TEST_CLOCK_ADVANCE){
+            if(!ownedCustomer||bindingRepair)throw conflict();
+            JdbcOwnedFirstRenewalStore.requireAdvanceResource(jdbc,account,resourceId,key,fingerprint);return;
+        }
+        if(kind==Kind.TEST_CLOCK_CREATE) {
+            var intent=JdbcStripeBillingClockStore.intentRow(jdbc,resourceId).orElseThrow(JdbcProviderOperationStore::conflict);
+            if(!account.equals(intent.account()) || !key.equals(intent.createKey()) || !fingerprint.equals(intent.createFingerprint())) throw conflict();
+            JdbcStripeBillingClockStore.lockOwner(jdbc,intent);
+            JdbcStripeBillingClockStore.requireActiveRow(jdbc,intent);
+            return;
+        }
+        if(kind==Kind.SUBSCRIPTION_CREATE && ownedCustomer) {
+            var owned=JdbcStripeBillingClockSubscriptionStore.operationIntent(jdbc,account,resourceId);
+            if(owned.isPresent()) {
+                var i=owned.get();
+                if(!i.operationKey().equals(key)||!i.fingerprint().equals(fingerprint))throw conflict();
+                JdbcStripeBillingClockSubscriptionStore.requireCurrentRow(jdbc,i);return;
+            }
+        }
+        if(kind==Kind.SUBSCRIPTION_CREATE || kind==Kind.SETUP_INTENT_CREATE || kind==Kind.SUBSCRIPTION_UPDATE || kind==Kind.INVOICE_PAY) {
+            if(!jdbc.queryForList("""
+                select i.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id
+                join stripe_billing_clock_intents i on i.payment_account_id=s.payment_account_id and i.site_id=s.site_id and i.customer_id=s.customer_id
+                where o.id=? and s.payment_account_id=?
+                """,UUID.class,resourceId,account.value()).isEmpty()) throw conflict();
+        }
+
+        if(kind==Kind.PORTAL_CONFIGURATION_CREATE){
+            if(jdbc.queryForList("""
+                select i.id from stripe_portal_configuration_intents i
+                join subscription_operations o on o.id=i.owner_operation and o.site_id=i.site_id and o.subscription_id=i.owner_subscription and o.kind='PORTAL'
+                join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id and s.payment_account_id=i.payment_account_id
+                where i.id=? and i.payment_account_id=? and i.operation_key=?
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.PORTAL_SESSION_CREATE){
+            if(jdbc.queryForList("""
+                select i.operation_id from stripe_portal_session_intents i
+                join subscription_operations o on o.id=i.operation_id and o.site_id=i.site_id and o.customer_id=i.customer_id and o.subscription_id=i.subscription_id and o.kind='PORTAL'
+                join subscriptions s on s.id=i.subscription_id and s.payment_account_id=i.payment_account_id and s.site_id=i.site_id and s.customer_id=i.customer_id
+                join stripe_portal_configurations c on c.intent_id=i.configuration_id and c.payment_account_id=i.payment_account_id and c.configuration_reference=i.configuration_reference
+                where i.operation_id=? and i.payment_account_id=? and ?=o.provider_operation_key||':SESSION'
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.INVOICE_PAY){
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join subscription_billing_records b on b.id::text=split_part(o.fingerprint,'.',3) and b.subscription_id=s.id and b.payment_account_id=s.payment_account_id
+                join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
+                where o.id=? and s.payment_account_id=? and o.kind='RECOVER' and o.fingerprint ~ '^v1\\.recover\\.[0-9a-f-]{36}\\.[a-f0-9]{64}$'
+                  and ?=o.provider_operation_key||':INVOICE_PAY' and o.provider_reference=s.provider_reference and s.provider_reference is not null
+                  and b.provider_invoice_reference ~ '^in_[A-Za-z0-9]{1,252}$' and site.status='ACTIVE' and c.status='ACTIVE'
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.SUBSCRIPTION_CANCEL){
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
+                where o.id=? and s.payment_account_id=? and o.kind='CANCEL' and o.fingerprint ~ '^v1\\.cancel\\.immediate\\.none\\.[a-f0-9]{64}$'
+                  and ?=o.provider_operation_key and o.provider_reference=s.provider_reference and s.provider_reference is not null and site.status='ACTIVE' and c.status='ACTIVE'
+                """,UUID.class,resourceId,account.value(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.SUBSCRIPTION_UPDATE&&jdbc.queryForList("""
+            select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+            join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
+            where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE'
+              and s.provider_reference is not null and o.provider_reference=s.provider_reference and ?=o.provider_operation_key
+              and ((o.kind='CANCEL' and o.fingerprint ~ '^v1\\.cancel\\.period_end\\.[0-9]+/0\\.[a-f0-9]{64}$')
+                or (o.kind='WITHDRAW_CANCEL' and o.fingerprint ~ '^v[12]\\.cancel\\.withdraw\\.[0-9]+/0\\.[a-f0-9]{64}$'))
+            """,UUID.class,resourceId,account.value(),key).size()==1)return;
+        if(kind==Kind.SETUP_INTENT_CREATE||kind==Kind.SUBSCRIPTION_UPDATE){
+            String suffix=kind==Kind.SETUP_INTENT_CREATE?":SETUP":":METHOD";
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join sites site on site.id=s.site_id join customers c on c.site_id=s.site_id and c.id=s.customer_id
+                where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE'
+                and ((?='SETUP_INTENT_CREATE' and o.kind in ('CREATE','SETUP') and ?=o.provider_operation_key||':SETUP')
+                  or (?='SUBSCRIPTION_UPDATE' and ((o.kind='SETUP' and ?=o.provider_operation_key||':METHOD') or (o.kind='RESUME' and ?=o.provider_operation_key)
+                    or (o.kind='CHANGE' and ?=o.provider_operation_key and exists(select 1 from subscription_change_intents i join subscription_quotes q on q.id=i.quote_id join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.subscription_id=s.id and p.payment_account_id=s.payment_account_id where i.operation_id=o.id and p.timing='IMMEDIATE')))))
+                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,key,key).size()!=1)throw conflict();
+            return;
+        }
+        if(java.util.Set.of(Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(kind)){
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join subscription_change_intents i on i.operation_id=o.id and i.site_id=o.site_id and i.subscription_id=o.subscription_id
+                join subscription_quotes q on q.id=i.quote_id and q.site_id=i.site_id and q.subscription_id=i.subscription_id
+                join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.subscription_id=s.id and p.payment_account_id=s.payment_account_id
+                join sites site on site.id=s.site_id join customers c on c.id=s.customer_id and c.site_id=s.site_id
+                where o.id=? and s.payment_account_id=? and site.status='ACTIVE' and c.status='ACTIVE' and p.timing='NEXT_PERIOD'
+                and ((o.kind='CHANGE' and ((?='SCHEDULE_CREATE' and ?=o.provider_operation_key||':SCHEDULE_CREATE')
+                    or (?='SCHEDULE_UPDATE' and ?=o.provider_operation_key||':SCHEDULE_UPDATE' and exists(select 1 from stripe_plan_schedules x where x.operation_id=o.id and x.quote_id=p.id))))
+                  or (o.kind='CLEAR_CHANGE' and ?='SCHEDULE_RELEASE' and ?=o.provider_operation_key||':SCHEDULE_RELEASE'
+                    and exists(select 1 from stripe_plan_schedules x where x.operation_id=s.pending_operation_id and x.quote_id=p.id and x.update_step is not null)))
+                """,UUID.class,resourceId,account.value(),kind.name(),key,kind.name(),key,kind.name(),key).size()!=1)throw conflict();return;
+        }
+        if(kind==Kind.SUBSCRIPTION_CREATE){
+            // Plain immutable identity proof: never wait on lifecycle Operation/Subscription locks
+            // while holding provider-step/Account locks (the lifecycle acquires them in the reverse order).
+            if(jdbc.queryForList("""
+                select o.id from subscription_operations o
+                join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+                join sites site on site.id=s.site_id
+                join customers c on c.id=s.customer_id and c.site_id=s.site_id
+                join payment_accounts a on a.id=s.payment_account_id
+                where o.id=? and o.kind='CREATE' and o.provider_operation_key=? and s.payment_account_id=?
+                  and site.status='ACTIVE' and c.status='ACTIVE' and a.provider='STRIPE' and a.account_mode='SANDBOX'
+                """,UUID.class,resourceId,key,account.value()).size()!=1)throw conflict();
+            return;
+        }
+        if (kind == Kind.CUSTOMER_CREATE) {
+            // Consistent Billing lock order: operation (if present), Account, Site, Customer.
+            // CustomerId is globally keyed; a fresh subscription UUID cannot be a create identity.
+            var sites = jdbc.queryForList("select site_id from customers where id=?", UUID.class, resourceId);
+            if (sites.size() != 1) throw conflict();
+            var site = sites.getFirst();
+            if (jdbc.queryForList("select id from sites where id=? and payment_account_id=? and status='ACTIVE' for share",
+                    UUID.class, site, account.value()).size() != 1) throw conflict();
+            if (jdbc.queryForList("select id from customers where id=? and site_id=? and status='ACTIVE' for share",
+                    UUID.class, resourceId, site).size() != 1) throw conflict();
+            if (jdbc.queryForList("select id from payment_accounts where id=? and provider='STRIPE' and account_mode='SANDBOX'",
+                    UUID.class, account.value()).size() != 1) throw conflict();
+            var intent=JdbcStripeBillingClockStore.ownerRow(jdbc,account,new SiteId(site),new CustomerId(resourceId));
+            if(intent.isPresent()) {
+                if(!ownedCustomer) throw conflict();
+                var owner=intent.get();
+                JdbcStripeBillingClockStore.lockOwner(jdbc,owner);
+                if(bindingRepair) JdbcStripeBillingClockStore.requireBindingRow(jdbc,owner);
+                else JdbcStripeBillingClockStore.requireActiveRow(jdbc,owner);
+                var ready=JdbcStripeBillingClockStore.readyRow(jdbc,owner.intent()).orElseThrow(JdbcProviderOperationStore::conflict);
+                if(!key.equals(owner.customerKey()) || !fingerprint.equals(ready.customerFingerprint())
+                    || jdbc.queryForList("""
+                        select id from provider_operations where id=? and payment_account_id=? and resource_id=?
+                         and kind='TEST_CLOCK_CREATE' and status='ACKNOWLEDGED' and provider_reference=?
+                         and external_account_id=? and credentials_ref=? and operation_key=? and fingerprint=?
+                        """,UUID.class,ready.creationOperation(),account.value(),owner.intent(),ready.reference(),
+                        owner.externalAccount(),owner.credentialsRef(),owner.createKey(),owner.createFingerprint()).size()!=1) throw conflict();
+            }
+            return;
+
+        }
         String query = switch (kind) {
             case PRODUCT_CREATE -> "select p.id from products p join sites s on s.id=p.site_id where p.id=? and s.payment_account_id=? for share of p,s";
             case PRICE_CREATE -> "select p.id from prices p join products product on product.id=p.product_id and product.site_id=p.site_id join sites s on s.id=p.site_id where p.id=? and s.payment_account_id=? for share of p,product,s";
             case PAYMENT_PREPARE -> "select p.id from payments p where p.id=? and p.payment_account_id=? for share of p";
             case REFUND_CREATE -> "select r.id from refunds r join payments p on p.id=r.payment_id where r.id=? and p.payment_account_id=? for share of r,p";
+            // Each later command needs its own durable resource proof. Never reuse payment recovery.
+            default -> throw conflict();
         };
         if (jdbc.queryForList(query, UUID.class, resourceId, account.value()).size() != 1) throw conflict();
+    }
+    /** Account FOR SHARE is already held. Plain reads avoid Step -> lifecycle row-lock inversion. */
+    private void requireFirstSubscriptionDispatch(ProviderOperation step){
+        if(jdbc.queryForList("""
+            select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+            where o.id=? and s.payment_account_id=? and o.kind='CREATE' and o.provider_operation_key=?
+              and o.status in ('RESERVED','PROCESSING','REQUIRES_ACTION','UNKNOWN') and o.provider_reference is null
+              and s.provider_reference is null and s.billing_status='INCOMPLETE' and s.entitled_price_id is null
+              and s.current_period_start is null and s.paid_through is null and s.trial_start is null
+              and s.debt_billing_record_id is null and s.pending_operation_id is null
+            """,UUID.class,step.resourceId(),step.accountId().value(),step.operationKey()).size()!=1)throw conflict();
+    }
+
+    private boolean firstDispatchOnly(ProviderOperation operation) {
+        return ((operation.kind()==Kind.SETUP_INTENT_CREATE||operation.kind()==Kind.SUBSCRIPTION_UPDATE)
+            &&JdbcOwnedFailedRenewalMethodStore.ownedStepResource(jdbc,operation.accountId(),operation.resourceId()))
+            || operation.kind()==Kind.TEST_CLOCK_ADVANCE || ownedSubscription(operation) || operation.kind()==Kind.TEST_CLOCK_CREATE || (operation.kind()==Kind.CUSTOMER_CREATE
+            && !jdbc.queryForList("select id from stripe_billing_clock_intents where payment_account_id=? and customer_id=?",
+                UUID.class,operation.accountId().value(),operation.resourceId()).isEmpty());
+    }
+    private boolean ownedSubscription(ProviderOperation operation) {
+        return operation.kind()==Kind.SUBSCRIPTION_CREATE && !jdbc.queryForList(
+            "select id from stripe_billing_owned_subscriptions where payment_account_id=? and create_operation=?",
+            UUID.class,operation.accountId().value(),operation.resourceId()).isEmpty();
+    }
+    private void requireSubscriptionReference(ProviderOperation operation,String reference){
+        if(operation.kind()==Kind.TEST_CLOCK_ADVANCE){
+            if(reference==null||!reference.matches("clock_[A-Za-z0-9]{1,249}")||!reference.equals(JdbcOwnedFirstRenewalStore.admissionForAdvance(jdbc,operation.accountId(),operation.resourceId()).receipt().intent().clock().reference()))throw conflict();return;
+        }
+        if(operation.kind()==Kind.TEST_CLOCK_CREATE){if(reference==null||!reference.matches("clock_[A-Za-z0-9]{1,249}"))throw conflict();return;}
+        if(operation.kind()==Kind.CUSTOMER_CREATE && firstDispatchOnly(operation)){if(reference==null||!reference.matches("cus_[A-Za-z0-9]{1,251}"))throw conflict();return;}
+        if(operation.kind()==Kind.PORTAL_CONFIGURATION_CREATE){if(reference==null||!reference.matches("bpc_[A-Za-z0-9]{1,251}"))throw conflict();return;}
+        if(operation.kind()==Kind.PORTAL_SESSION_CREATE){if(reference==null||!reference.matches("bps_[A-Za-z0-9]{1,251}"))throw conflict();return;}
+        if(java.util.Set.of(Kind.SCHEDULE_CREATE,Kind.SCHEDULE_UPDATE,Kind.SCHEDULE_RELEASE).contains(operation.kind())){
+            if(reference==null||!reference.matches("sub_sched_[A-Za-z0-9]{1,245}"))throw conflict();
+            if(operation.kind()!=Kind.SCHEDULE_CREATE&&jdbc.queryForList("""
+                select x.operation_id from stripe_plan_schedules x join subscription_operations o on o.id=?
+                join subscription_change_intents i on i.operation_id=o.id join subscription_quotes q on q.id=i.quote_id
+                join stripe_plan_quotes p on p.reference=q.provider_quote_reference and p.id=x.quote_id
+                where x.payment_account_id=? and x.schedule_reference=? and ((o.kind='CHANGE' and x.operation_id=o.id)
+                  or (o.kind='CLEAR_CHANGE' and x.subscription_id=o.subscription_id))
+                """,UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;
+        }
+        if(operation.kind()==Kind.INVOICE_PAY){
+            if(reference==null||!reference.matches("in_[A-Za-z0-9]{1,252}")||jdbc.queryForList("select o.id from subscription_operations o join subscription_billing_records b on b.id::text=split_part(o.fingerprint,'.',3) where o.id=? and o.kind='RECOVER' and b.payment_account_id=? and b.subscription_id=o.subscription_id and b.provider_invoice_reference=?",UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;
+        }
+        if(operation.kind()==Kind.SETUP_INTENT_CREATE){if(reference==null||!reference.matches("seti_[A-Za-z0-9]{1,250}"))throw conflict();return;}
+        if(operation.kind()==Kind.SUBSCRIPTION_UPDATE||operation.kind()==Kind.SUBSCRIPTION_CANCEL){if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}")||jdbc.queryForList("select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id where o.id=? and s.payment_account_id=? and s.provider_reference=?",UUID.class,operation.resourceId(),operation.accountId().value(),reference).size()!=1)throw conflict();return;}
+        if(operation.kind()!=Kind.SUBSCRIPTION_CREATE)return;
+        if(reference==null||!reference.matches("sub_[A-Za-z0-9]{1,251}")||jdbc.queryForList("""
+            select o.id from subscription_operations o join subscriptions s on s.id=o.subscription_id and s.site_id=o.site_id and s.customer_id=o.customer_id
+            where o.id=? and s.payment_account_id=? and (o.provider_reference is null or o.provider_reference=?)
+              and (s.provider_reference is null or s.provider_reference=?)
+            """,UUID.class,operation.resourceId(),operation.accountId().value(),reference,reference).size()!=1)throw conflict();
+    }
+
+    private static boolean supportedResource(Kind kind) {
+        return switch (kind) {
+            case PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE, TEST_CLOCK_CREATE, TEST_CLOCK_ADVANCE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SETUP_INTENT_CREATE, SUBSCRIPTION_UPDATE, SUBSCRIPTION_CANCEL, INVOICE_PAY, SCHEDULE_CREATE, SCHEDULE_UPDATE, SCHEDULE_RELEASE, PORTAL_CONFIGURATION_CREATE, PORTAL_SESSION_CREATE -> true;
+            default -> false;
+        };
     }
 
     private ProviderOperation operation(ResultSet row, int index) throws SQLException {

@@ -21,15 +21,25 @@ public class SubscriptionPlanService implements PreviewSubscriptionChangeUseCase
     public SubscriptionOperationResult clear(ClearSubscriptionChangeUseCase.Command command){return execute(command.context(),command.subscriptionId(),null,true);}
     private SubscriptionOperationResult execute(SubscriptionCommandContext context,java.util.UUID id,java.util.UUID quoteId,boolean clear){
         var c=transactions.candidate(context,id);var provider=providers.forAccount(c.account());boolean conditional=provider.capabilities(c.account()).conditionalUpdate();
-        var r=transactions.reserve(context,id,quoteId,c,conditional,clear);if(!r.owner())return transactions.result(r);
-        var request=new dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command(r.account(),r.operation(),r.subscription().billingPrice(),clear?null:r.quote().target(),r.subscription().providerReference(),null,clear?null:r.quote().providerQuoteReference(),false,false);
+        var r=transactions.reserve(context,id,quoteId,c,conditional,clear);
+        if(!r.owner()&&(r.quote()==null||r.account().provider()!=dev.genericpayments.platform.paymentaccounts.domain.PaymentProviderType.STRIPE
+            ||!java.util.Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(r.operation().status())))return transactions.result(r);
+        var request=dispatch(r,r.operation(),clear);
+        if(!r.owner()){
+            transactions.beforeOriginalReplay(context,r);
+            Reply replay;try{replay=provider.continueOriginalPlan(request);}catch(RuntimeException uncertain){replay=new Reply(Outcome.UNKNOWN,null,null);}
+            return replay==null?transactions.result(r):transactions.reply(r,replay);
+        }
         try{
             if(!clear){var read=provider.preview(new QuoteRequest(request,r.quote().target(),r.quote().timing()));var q=r.quote();
                 if(!new ProviderQuote(q.providerQuoteReference(),q.dueNowMinor(),q.nextAmountMinor(),q.currency(),q.effectiveAt(),q.expiresAt(),q.taxFinal()).equals(read))
                     throw SubscriptionRuleErrors.translate(new SubscriptionRuleViolation(SubscriptionRuleViolation.Reason.QUOTE_STALE,"Preview again"));}
-            transactions.beforeMutation(context,r,conditional);
+            request=dispatch(r,transactions.beforeMutation(context,r,conditional),clear);
         }catch(RuntimeException invalid){transactions.rejectBeforeMutation(r);throw invalid;}
         Reply reply;try{reply=clear?provider.clearChange(request):provider.change(request);}catch(RuntimeException unknown){reply=new Reply(Outcome.UNKNOWN,null,null);}
         return transactions.reply(r,reply);
+    }
+    private static dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command dispatch(SubscriptionPlanTransaction.Reserved r,SubscriptionOperation operation,boolean clear){
+        return new dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.Command(r.account(),operation,r.subscription().billingPrice(),clear?null:r.quote().target(),r.subscription().providerReference(),null,clear?null:r.quote().providerQuoteReference(),false,false);
     }
 }

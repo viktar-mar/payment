@@ -1,0 +1,22 @@
+services:
+  backend:
+    entrypoint:
+      - java
+      - -Dloader.path=/app/owned-runtime/
+      - -Dloader.main=dev.genericpayments.acceptance.runtime.OwnedSubscriptionRuntime
+      - -cp
+      - /app/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+    environment:
+      PAYMENT_STAGE4_TEST_RUNTIME: "true"
+      PAYMENT_STAGE4_CONTROL_KEY: ${PAYMENT_STAGE4_CONTROL_KEY:?fresh control capability required}
+      PAYMENT_STAGE4_CONTROL_BIND: 0.0.0.0
+      PAYMENT_STAGE4_CONTROL_PORT: "28081"
+      PAYMENT_STAGE4_TIME_FILE: /app/task17-time-fake/instant.txt
+      PAYMENT_CUSTOMER_EMAIL_OTP_RATE_LIMIT_SOURCE_IP_REQUESTS: "100"
+    ports:
+      - "127.0.0.1:28081:28081"
+    volumes:
+      - ${PAYMENT_FAKE_CI_RUNTIME:?fresh isolated launcher tree required}:/app/owned-runtime:ro
+      - ${PAYMENT_FAKE_CI_TIME:?fresh owned time directory required}:/app/task17-time-fake
+      - ${PAYMENT_FAKE_CI_ISSUER:?fresh issuer required}:/app/local-fixtures/customer-issuer-private.jwks.json:ro

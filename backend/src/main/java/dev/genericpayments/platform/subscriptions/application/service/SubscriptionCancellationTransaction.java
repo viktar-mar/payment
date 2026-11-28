@@ -17,6 +17,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 
 @Component
 public class SubscriptionCancellationTransaction {
+    private static final String STRIPE_WITHDRAW_V2 = "v2.cancel.withdraw.";
     private final SubscriptionTransactionPort tx;
     private final SubscriptionOperationStore operations;
     private final SubscriptionStore subscriptions;
@@ -26,6 +27,11 @@ public class SubscriptionCancellationTransaction {
     private final LockSitePort sites;
     private final CustomerStore customers;
     private final Clock clock;
+    @org.springframework.beans.factory.annotation.Autowired private TrialEligibilityStore trials;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionBillingProofStore billingProofs;
+    @org.springframework.beans.factory.annotation.Autowired private dev.genericpayments.platform.provider.application.port.out.ProviderOperationStore providerSteps;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionEventStore events;
+    @org.springframework.beans.factory.annotation.Autowired private SubscriptionCallbackPort callbacks;
     public SubscriptionCancellationTransaction(SubscriptionTransactionPort tx,SubscriptionOperationStore operations,SubscriptionStore subscriptions,
         SubscriptionAuthorityPort authority,SubscriptionPolicyPort policies,LockPaymentAccountPort accounts,LockSitePort sites,CustomerStore customers,Clock clock){
         this.tx=tx;this.operations=operations;this.subscriptions=subscriptions;this.authority=authority;this.policies=policies;
@@ -33,6 +39,71 @@ public class SubscriptionCancellationTransaction {
     }
     public record Candidate(Subscription subscription,PaymentAccount account,SubscriptionPolicy policy) {}
     public record Reserved(SubscriptionOperation operation,Subscription subscription,PaymentAccount account,boolean owner) {}
+    /** Explicitly close only a required trial whose Subscription write was positively never dispatched. */
+    public SubscriptionOperationResult abandon(SubscriptionCommandContext c,UUID id,CancelSubscriptionUseCase.Mode mode,Candidate candidate){
+        if(mode==null||candidate.account().provider()!=PaymentProviderType.STRIPE||trials==null||billingProofs==null||providerSteps==null)throw SubscriptionRuleErrors.conflict();
+        var request=requestHash(c,id,mode,null,SubscriptionOperation.Kind.CANCEL);var now=clock.instant();
+        return translated(()->tx.requiresNew(()->{
+            // Find the original owner before acquiring Account. No provider Step row lock is taken.
+            var eligibility=trials.find(c.siteId(),c.customerId(),candidate.subscription().productId()).orElse(null);
+            var original=eligibility==null||eligibility.reservedByOperation()==null?null:operations.lock(eligibility.reservedByOperation());
+            // Original-owner serialization precedes replay lookup: a concurrent winner may have
+            // closed CREATE and committed this exact CANCEL while we waited for that owner.
+            authority.revalidate(c,true);
+            var prior=operations.findByRequest(c.siteId(),principal(c),SubscriptionOperation.Kind.CANCEL,CreateSubscriptionFingerprint.digest(c.idempotencyKey()));
+            if(prior.isPresent()){
+                var replay=operations.lock(prior.orElseThrow().id());
+                if(!replay.siteId().equals(c.siteId())||!replay.subscriptionId().equals(id)||!replay.customerId().equals(c.customerId())
+                    ||replay.kind()!=SubscriptionOperation.Kind.CANCEL||!replay.authorityScope().equals(principal(c))
+                    ||!replay.keyDigest().equals(CreateSubscriptionFingerprint.digest(c.idempotencyKey()))
+                    ||!replay.fingerprint().startsWith("v1.cancel.abandon.")||!replay.fingerprint().endsWith("."+request))throw SubscriptionRuleErrors.conflict();
+                return result(replay);
+            }
+            var oid=UUID.randomUUID();
+            var proposed=new SubscriptionOperation(oid,c.siteId(),c.customerId(),id,SubscriptionOperation.Kind.CANCEL,SubscriptionOperation.Status.RESERVED,principal(c),
+                CreateSubscriptionFingerprint.digest(c.idempotencyKey()),"v1.cancel.abandon."+(original==null?new UUID(0,0):original.id())+"."+request,
+                "subscription:"+candidate.account().id().value()+":"+oid+":CANCEL",candidate.subscription().revision(),candidate.policy().version(),null,null,now,now,0);
+            var site=sites.findByIdForUpdate(c.siteId()).orElseThrow(SubscriptionRuleErrors::conflict);
+            var customer=customers.findByIdForUpdate(c.siteId(),c.customerId()).orElseThrow(SubscriptionRuleErrors::conflict);
+            var account=accounts.findByIdForUpdate(candidate.account().id()).orElseThrow(SubscriptionRuleErrors::conflict);
+            var s=subscriptions.lock(c.siteId(),id);var policy=policies.load(c.siteId());
+            if(original==null||!account.equals(candidate.account())||account.status()!=PaymentAccountStatus.ACTIVE||account.mode()!=PaymentAccountMode.SANDBOX
+                ||site.status()!=dev.genericpayments.platform.sites.domain.SiteStatus.ACTIVE||customer.status()!=dev.genericpayments.platform.customers.domain.CustomerStatus.ACTIVE
+                ||!s.customerId().equals(c.customerId())||!s.paymentAccountId().equals(account.id())||s.revision()!=candidate.subscription().revision()
+                ||!policy.enabled()||policy.version()!=candidate.policy().version()||original.policyVersion()!=policy.version()
+                ||s.billingStatus()!=Subscription.Status.INCOMPLETE||s.providerReference()!=null||s.entitledPrice()!=null||s.currentPeriod()!=null
+                ||s.paidThrough()!=null||s.trial()!=null||s.debt()!=null||s.pendingChange()!=null||s.cancellation()!=null
+                ||s.billingPrice().trialPolicy()!=dev.genericpayments.platform.catalog.domain.TrialPaymentMethodPolicy.REQUIRED_BEFORE_TRIAL
+                ||original.kind()!=SubscriptionOperation.Kind.CREATE||!CreateSubscriptionFingerprint.startsTrial(original.fingerprint())
+                ||!original.siteId().equals(s.siteId())||!original.customerId().equals(s.customerId())||!original.subscriptionId().equals(s.id())
+                ||original.providerReference()!=null||Set.of(SubscriptionOperation.Status.SUCCEEDED,SubscriptionOperation.Status.FAILED).contains(original.status())
+                ||operations.unresolved(c.siteId(),id).stream().anyMatch(other->!other.id().equals(original.id())&&other.kind()!=SubscriptionOperation.Kind.RECONCILE&&other.kind()!=SubscriptionOperation.Kind.PORTAL))throw SubscriptionRuleErrors.conflict();
+            if(!trials.find(s.siteId(),s.customerId(),s.productId()).filter(e->e.consumedAt()==null&&original.id().equals(e.reservedByOperation())).isPresent())throw SubscriptionRuleErrors.conflict();
+            var setup=billingProofs.setup(account.id(),original.id()).orElseThrow(SubscriptionRuleErrors::conflict);
+            var setupStep=providerSteps.findById(setup.step()).orElseThrow(SubscriptionRuleErrors::conflict);
+            if(!setup.account().equals(account.id())||!setup.subscription().equals(s.id())||!setup.operation().equals(original.id())
+                ||setupStep.kind()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SETUP_INTENT_CREATE
+                ||setupStep.status()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED
+                ||!setupStep.accountId().equals(account.id())||!setupStep.resourceId().equals(original.id())||!setupStep.providerReference().equals(setup.reference())
+                ||!setupStep.operationKey().equals(original.providerOperationKey()+":SETUP")||!setupStep.externalAccountId().equals(account.externalAccountId())||!setupStep.credentialsRef().equals(account.credentialsRef()))throw SubscriptionRuleErrors.conflict();
+            var step=providerSteps.find(account.id(),original.providerOperationKey()).orElse(null);
+            if(step!=null&&(step.kind()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.SUBSCRIPTION_CREATE
+                ||!step.resourceId().equals(original.id())||step.status()!=dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.RESERVED
+                ||step.firstDispatchedAt()!=null||step.retryBefore()!=null||step.providerReference()!=null||step.leaseOwner()!=null||step.leaseExpiresAt()!=null))throw SubscriptionRuleErrors.conflict();
+            operations.save(status(original,SubscriptionOperation.Status.FAILED,"ABANDONED_BEFORE_DISPATCH"),original.version());
+            // Keep the single unresolved-owner index intact. Closure and the new local CANCEL
+            // claim commit together; any claim/journal/callback failure rolls both back.
+            var claim=operations.claim(proposed);var o=claim.operation();
+            if(!claim.owner())throw SubscriptionRuleErrors.conflict();
+            var closed=subscriptions.save(s.cancel("CUSTOMER_ABANDONED",now),s.revision());
+            trials.releaseConfirmedFailure(original.id());
+            var done=operations.save(status(o,SubscriptionOperation.Status.SUCCEEDED,null),o.version());
+            var event=new SubscriptionEvent(UUID.randomUUID(),s.siteId(),s.id(),s.paymentAccountId(),0,closed.revision(),SubscriptionEvent.Type.CANCELLED,
+                SubscriptionEvent.Source.API,now,now,o.id(),null,null,null,"operation:"+o.id()+":CANCELLED",c.requestId());
+            if(events.append(event))callbacks.snapshot(closed,event,new SubscriptionAccessPolicy().evaluate(closed,now),now);
+            return result(done);
+        }));
+    }
     public Candidate candidate(SubscriptionCommandContext c,UUID id){
         if(tx.active())throw new IllegalStateException("Provider workflow requires no ambient transaction");
         principal(c);validateKey(c);if(id==null)throw SubscriptionRuleErrors.conflict();
@@ -51,8 +122,9 @@ public class SubscriptionCancellationTransaction {
         Instant boundary=withdraw?(candidate.subscription().cancellation()==null?null:candidate.subscription().cancellation().effectiveAt()):
             mode==CancelSubscriptionUseCase.Mode.PERIOD_END?liveBoundary(candidate.subscription(),now):null;
         var requestHash=requestHash(c,id,mode,confirmation,kind);
-        var fingerprint="v1.cancel."+(withdraw?"withdraw":mode==CancelSubscriptionUseCase.Mode.IMMEDIATE?"immediate":"period_end")+"."
-            +(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+requestHash;
+        var prefix=withdraw&&candidate.account().provider()==PaymentProviderType.STRIPE?STRIPE_WITHDRAW_V2:
+            "v1.cancel."+(withdraw?"withdraw":mode==CancelSubscriptionUseCase.Mode.IMMEDIATE?"immediate":"period_end")+".";
+        var fingerprint=prefix+(boundary==null?"none":boundary.getEpochSecond()+"/"+boundary.getNano())+"."+requestHash;
         var proposed=new SubscriptionOperation(oid,c.siteId(),c.customerId(),id,kind,SubscriptionOperation.Status.RESERVED,principal(c),
             CreateSubscriptionFingerprint.digest(c.idempotencyKey()),fingerprint,"subscription:"+candidate.account().id().value()+":"+oid+":"+kind,
             candidate.subscription().revision(),candidate.policy().version(),candidate.subscription().providerReference(),null,now,now,0);
@@ -98,6 +170,29 @@ public class SubscriptionCancellationTransaction {
         return result(saved);
     });}
     public SubscriptionOperationResult result(Reserved r){return tx.required(()->result(operations.lock(r.operation().id())));}
+    /** Final local fence for an explicit same-command replay; it grants no provider result proof. */
+    public void beforeOriginalReplay(SubscriptionCommandContext c,Reserved r,Snapshot snapshot){translated(()->tx.requiresNew(()->{
+        var o=operations.lock(r.operation().id());authority.revalidate(c,true);
+        var current=owned(c,o.subscriptionId());var a=accounts.findByIdForUpdate(current.paymentAccountId()).orElseThrow(SubscriptionRuleErrors::conflict);
+        var s=subscriptions.lock(c.siteId(),o.subscriptionId());var policy=policies.load(c.siteId());
+        if(!o.equals(r.operation())||!o.authorityScope().equals(principal(c))||!a.equals(r.account())
+            ||a.provider()!=PaymentProviderType.STRIPE||a.mode()!=PaymentAccountMode.SANDBOX||a.status()!=PaymentAccountStatus.ACTIVE
+            ||!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
+            ||!policy.enabled()||policy.version()!=o.policyVersion()||s.revision()!=o.expectedRevision()||!s.nonTerminal()||s.pendingChange()!=null
+            ||!s.paymentAccountId().equals(a.id())||!s.billingPrice().equals(r.subscription().billingPrice())
+            ||!Objects.equals(s.providerReference(),snapshot.subscriptionReference())||snapshot.status()==Subscription.Status.CANCELLED
+            ||operations.unresolved(c.siteId(),s.id()).stream().anyMatch(other->!other.id().equals(o.id())&&other.kind()!=SubscriptionOperation.Kind.RECONCILE&&other.kind()!=SubscriptionOperation.Kind.PORTAL))throw SubscriptionRuleErrors.conflict();
+        if(!immediate(o)){
+            var boundary=boundary(o).orElseThrow(SubscriptionRuleErrors::conflict);
+            if(!clock.instant().isBefore(boundary))throw SubscriptionRuleErrors.conflict();
+            if(o.kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL){
+                SubscriptionCancellationRules.requireWithdrawable(s,clock.instant());
+                if(!boundary.equals(s.cancellation().effectiveAt())||snapshot.cancellationAt()!=null&&!boundary.equals(snapshot.cancellationAt()))throw SubscriptionRuleErrors.conflict();
+            }else if(o.kind()!=SubscriptionOperation.Kind.CANCEL||s.cancellation()!=null||!boundary.equals(liveBoundary(s,clock.instant()))
+                ||!boundary.equals(providerBoundary(snapshot,clock.instant()))||snapshot.cancellationAt()!=null&&!boundary.equals(snapshot.cancellationAt()))throw SubscriptionRuleErrors.conflict();
+        }else if(!SubscriptionCancellationRules.allowImmediate(s,policy,clock.instant()))throw SubscriptionRuleErrors.conflict();
+        return null;
+    }));}
     static Instant liveBoundary(Subscription s,Instant now){
         return SubscriptionCancellationRules.liveBoundary(s,now);
     }
@@ -108,12 +203,17 @@ public class SubscriptionCancellationTransaction {
             .map(i->i.period().end()).min(Comparator.naturalOrder()).orElse(null);
         return paid==null?trial:trial==null?paid:paid.isBefore(trial)?paid:trial;
     }
-    static Optional<Instant> boundary(SubscriptionOperation o){
+    public static Optional<Instant> boundary(SubscriptionOperation o){
         if(!valid(o))return Optional.empty();var value=o.fingerprint().split("\\.")[3];if(value.equals("none"))return Optional.empty();
         try{var parts=value.split("/");return Optional.of(Instant.ofEpochSecond(Long.parseLong(parts[0]),Long.parseLong(parts[1])));}catch(RuntimeException invalid){return Optional.empty();}
     }
-    static boolean immediate(SubscriptionOperation o){return valid(o)&&o.kind()==SubscriptionOperation.Kind.CANCEL&&o.fingerprint().split("\\.")[2].equals("immediate");}
-    private static boolean valid(SubscriptionOperation o){return o.fingerprint().matches("v1\\.cancel\\.(immediate|period_end|withdraw)\\.(none|-?[0-9]+/[0-9]+)\\.[a-f0-9]{64}");}
+    public static boolean immediate(SubscriptionOperation o){return valid(o)&&o.kind()==SubscriptionOperation.Kind.CANCEL&&o.fingerprint().split("\\.")[2].equals("immediate");}
+    public static boolean versionedWithdrawal(SubscriptionOperation o){
+        return o.kind()==SubscriptionOperation.Kind.WITHDRAW_CANCEL&&o.fingerprint().startsWith(STRIPE_WITHDRAW_V2)&&valid(o);
+    }
+    private static boolean valid(SubscriptionOperation o){
+        return o.fingerprint().matches("(v1\\.cancel\\.(immediate|period_end|withdraw)|v2\\.cancel\\.withdraw)\\.(none|-?[0-9]+/[0-9]+)\\.[a-f0-9]{64}");
+    }
     private static String requestHash(SubscriptionCommandContext c,UUID id,CancelSubscriptionUseCase.Mode mode,UUID confirmation,SubscriptionOperation.Kind kind){
         var value=new StringBuilder();for(Object field:Arrays.asList(kind,principal(c),c.siteId(),c.customerId(),c.origin(),id,mode,confirmation)){
             var text=String.valueOf(field);value.append(text.length()).append(':').append(text);

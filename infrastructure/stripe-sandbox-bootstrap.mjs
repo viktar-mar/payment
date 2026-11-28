@@ -1,5 +1,15 @@
+import {openSandboxUserEnv,parseSandboxUserEnv,requireSandboxUserEnvUnchanged,sandboxUserFile as USERFILE,stripeKeyNames as STRIPE_NAMES,validPrivateFile as validFile} from './stripe-sandbox-user-env.mjs';
+import {billingBounded} from './stripe-billing-limits.mjs';
+import {billingFailedRenewalOptIn,validateBillingFailedRenewalOptions} from './stripe-billing-failed-renewal-options.mjs';
+import {billingOptionalTrialOptIn,OPTIONAL_TRIAL_SUBNET,validateBillingOptionalTrialOptions} from './stripe-billing-optional-trial-options.mjs';
+import {hasOnlyTrackedOptionalTrialInputs} from './stripe-billing-optional-trial-source.mjs';
+import {isBrowserProviderOriginWitness} from './stripe-billing-first-payment-browser-diagnostic.mjs';
+import {billingFirstRenewalOptIn,validateBillingFirstRenewalOptions} from './stripe-billing-first-renewal-options.mjs';
+import {billingFirstPaymentOptIn,validateBillingFirstPaymentOptions} from './stripe-billing-first-payment-options.mjs';
 import {manualRefundRemainderExcluded as remainderExcluded} from './stripe-manual-refund-remainder-options.mjs';
-import {proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
+import {billingAcceptanceExcluded,billingAcceptanceOptIn,billingAcceptanceSubnet,validateBillingAcceptanceOptions} from './stripe-billing-acceptance-options.mjs';
+import {preflightOwnedBillingFailedRenewal,preflightOwnedBillingFirstRenewal,preflightOwnedBillingFirstPayment,preflightOwnedBilling,preflightOwnedBillingOptionalTrial} from './stripe-sandbox-owned.mjs';
+import {failedRenewalContainerFormat,proveFailedRenewalRuntime,firstRenewalContainerFormat,firstRenewalImageFormat,proveFirstRenewalRuntime,firstPaymentContainerFormat,firstPaymentImageFormat,optionalTrialContainerFormat,proveOptionalTrialRuntime,proveFirstPaymentRuntime,proveOwnedContainer,proveOwnedPorts as portProof,CONTAINER_FORMAT,NETWORK_FORMAT,VOLUME_FORMAT} from './stripe-sandbox-ownership.mjs';
 import {execFile} from 'node:child_process';
 import {constants} from 'node:fs';
 import {lstat,realpath,readFile,readdir,mkdir,open,rename,unlink} from 'node:fs/promises';
@@ -12,10 +22,14 @@ import {manualPaymentOptIn,validateManualPaymentOptions} from './stripe-manual-p
 
 const ROOT=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const DOCKER='/Applications/Docker.app/Contents/Resources/bin/docker';
-const USERFILE=ROOT+'/infrastructure/stripe-sandbox.env.local';
 const SERVICES=['postgres','mailpit','backend','demo-site','callback-receiver'];
 const PORT_NAMES=['backend','demo','receiver','postgres','mailpitHttp','mailpitSmtp'];
-const STRIPE_NAMES=['PAYMENT_STRIPE_SANDBOX_SECRET_KEY','PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY','PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET'];
+// Explicit property names keep only the subscription sweep paused while the real inbox and callback workers run.
+const invoiceWorkerConfig=JSON.stringify({'payment.subscriptions.scheduling-enabled':false,'payment.inbox.scheduling-enabled':true,'payment.callbacks.scheduling-enabled':true});
+const requiredTrialWorkerConfig=JSON.stringify({'payment.subscriptions.scheduling-enabled':true,'payment.inbox.scheduling-enabled':false,'payment.callbacks.scheduling-enabled':true});
+const optionalTrialWorkerConfig=JSON.stringify({'payment.subscriptions.scheduling-enabled':false,'payment.inbox.scheduling-enabled':false,'payment.callbacks.scheduling-enabled':true});
+const workerContainerFormat=workerConfig=>CONTAINER_FORMAT.slice(0,-1)+',"BillingWorkers":{{$seen := false}}{{$duplicate := false}}{{$ok := false}}{{range .Config.Env}}{{if eq (index (split . "=") 0) "SPRING_APPLICATION_JSON"}}{{if $seen}}{{$duplicate = true}}{{end}}{{$seen = true}}{{if eq . '+JSON.stringify('SPRING_APPLICATION_JSON='+workerConfig)+'}}{{$ok = true}}{{end}}{{end}}{{end}}{{and $ok (not $duplicate)}}}';
+const BILLING_CONFIG=Object.freeze({PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'});
 const EXHAUSTED=new Set(['2f3f49b1-df07-41b1-b978-bc884b390813','6f684b69-32e6-429f-a34c-e4f69ba2ce18']);
 const CHILD_ENV=Object.freeze({PATH:'/usr/bin:/bin:/usr/sbin:/sbin',LANG:'C',LC_ALL:'C'});
 const ERRORS=new Set(['OPT_IN_REQUIRED','INPUTS_CONFIGURATION','OPERATION_BUSY',
@@ -33,6 +47,24 @@ function canonical(value) {
 const same=(a,b)=>JSON.stringify(canonical(a))===JSON.stringify(canonical(b));
 // Only internally created failures carry diagnostic metadata. Never traverse a dependency rejection.
 const failures=new WeakMap();
+const failedRenewalVerificationCheckpoints=new WeakMap();
+const helperCreateDiagnostics=new WeakMap();
+const helperCreateCategories=['REJECTED','ABORT','TIMEOUT'];
+const helperCreateCommandCategories=['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'];
+const helperCreateCodes=new Set(['ISSUER_INSTALLER','ISSUER_PROBE'].flatMap(service=>
+  ['INTENT','COMMAND','OUTPUT','PROOF','ACK'].flatMap(stage=>
+    [...helperCreateCategories,...(stage==='COMMAND'||stage==='PROOF'?helperCreateCommandCategories:[])]
+      .map(category=>'PREPARE_'+service+'_CREATE_'+stage+'_'+category))));
+
+export const isBillingFailedRenewalHelperCreateDiagnostic=code=>helperCreateCodes.has(code);
+export const billingFailedRenewalHelperCreateDiagnostic=bootstrap=>helperCreateDiagnostics.get(bootstrap)??null;
+
+/** Last local VERIFY boundary for the exact invocation, including while a cancelled child settles. */
+export function billingFailedRenewalVerificationCheckpoint(bootstrap,limits) {
+  const verification=failedRenewalVerificationCheckpoints.get(bootstrap);
+  return verification&&verification.limits===limits ? verification.stage : null;
+}
+
 function diagnosticFailure(category,exitCode) {
   const error=Object.create(null);failures.set(error,{category,...(Number.isSafeInteger(exitCode)?{exitCode}:{})});return error;
 }
@@ -115,13 +147,38 @@ export async function createOwnedManualPaymentBootstrap(options,dependencies={})
   const selected=validateManualPaymentOptions(options);if(!selected)throw fixed('INPUTS_CONFIGURATION');
   return createBootstrap(selected,dependencies,false,true);
 }
-async function createBootstrap(options,dependencies,diagnostic,manualPayment=false) {
+export async function createOwnedBillingBootstrap(options,dependencies={}) {
+  const selected=validateBillingAcceptanceOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');
+  return createBootstrap(selected,dependencies,false,false,true);
+}
+export async function createOwnedBillingFirstPaymentBootstrap(options,dependencies={}){const selected=validateBillingFirstPaymentOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');return createBootstrap(selected,dependencies,false,false,true,'INITIAL');}
+export async function createOwnedBillingFirstRenewalBootstrap(options,dependencies={}){const selected=validateBillingFirstRenewalOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');return createBootstrap(selected,dependencies,false,false,true,'FIRST_RENEWAL');}
+export async function createOwnedBillingFailedRenewalBootstrap(options,dependencies={}){
+ const selected=validateBillingFailedRenewalOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');
+ return createBootstrap(selected,dependencies,false,false,true,'FAILED_RENEWAL');
+}
+export async function createOwnedBillingOptionalTrialBootstrap(options,dependencies={}){
+ const selected=validateBillingOptionalTrialOptions(options);if(!selected)throw fixed('OPT_IN_REQUIRED');
+ return createBootstrap(selected,dependencies,false,false,true,'OPTIONAL_TRIAL');
+}
+async function createBootstrap(options,dependencies,diagnostic,manualPayment=false,billing=false,purpose=null) {
+  const invoiceCase=billing&&options.selectedCase==='initial_missed_reordered';
+  const requiredTrial=billing&&options.selectedCase==='initial_required_trial';
+  const optionalTrial=purpose==='OPTIONAL_TRIAL';
+  // Prove the ordinary sweep's own trial publication while the inbox retains inbound events.
+  const workerConfig=optionalTrial?optionalTrialWorkerConfig:invoiceCase?invoiceWorkerConfig:requiredTrial?requiredTrialWorkerConfig:null;
+  const firstPayment=purpose!==null,firstRenewal=purpose==='FIRST_RENEWAL',failedRenewal=purpose==='FAILED_RENEWAL';
+  const isolatedPersistence=failedRenewal||optionalTrial;
+  const drainBeforeStop=requiredTrial||optionalTrial;
+  const initial3ds=billing&&!firstPayment&&options.selectedCase==='initial_3ds';
   const descriptor=Object.getOwnPropertyDescriptor(options??{},'env');
   const rawEnv=descriptor?.enumerable&&Object.hasOwn(descriptor,'value')?descriptor.value:undefined;
-  if(!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billing&&!billingAcceptanceExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
+  if(!billing&&!remainderExcluded(rawEnv))throw fixed('OPT_IN_REQUIRED');
   let enabled=false;
   try {const env=rawEnv;enabled=env?.PAYMENT_STRIPE_SANDBOX_MANUAL_REFUND==='true'?false:manualPayment?manualPaymentOptIn(env):diagnostic?formDiagnosticOptIn(env):env?.PAYMENT_STRIPE_SANDBOX_ENABLED==='true'&&env?.PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS==='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT!=='true'
     &&env.PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC!=='true'&&env.PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY!=='true'&&env.PAYMENT_STRIPE_SANDBOX_MANUAL_FORM_DIAGNOSTIC!=='true';} catch {}
+  if(billing)enabled=(optionalTrial?billingOptionalTrialOptIn:failedRenewal?billingFailedRenewalOptIn:firstRenewal?billingFirstRenewalOptIn:firstPayment?billingFirstPaymentOptIn:billingAcceptanceOptIn)(rawEnv);
   if(!enabled)throw fixed('OPT_IN_REQUIRED');
   let runId,expectedSource,daemon,ports,env,io;
   try {
@@ -139,10 +196,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const binding=diagnostic||manualPayment?{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'}:options.approvedBinding;
     if(!object(binding)||Object.keys(binding).sort().join(',')!=='apiVersion,externalAccountId'
       ||binding.externalAccountId!=='acct_1UPiMpELswAd8tpR'||binding.apiVersion!=='2026-09-30.endive')fail();
-    env=Object.freeze(manualPayment?rawEnv:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
+    env=Object.freeze(billing||manualPayment?rawEnv:diagnostic?{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'}:
       {PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_TEST_OPERATIONS:'true',DEBUG:flags.DEBUG,NODE_DEBUG:flags.NODE_DEBUG,PWDEBUG:flags.PWDEBUG});
     const raw=dependencies.execFile??execFile;
-    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
+    io=Object.freeze({execute:dependencies.execute??((...args)=>executeAwaited(raw,...args)),preflight:dependencies.preflight??(optionalTrial?preflightOwnedBillingOptionalTrial:failedRenewal?preflightOwnedBillingFailedRenewal:firstRenewal?preflightOwnedBillingFirstRenewal:firstPayment?preflightOwnedBillingFirstPayment:billing?preflightOwnedBilling:manualPayment?preflightOwnedManualPayment:diagnostic?preflightOwnedFormDiagnostic:preflightOwnedSandbox),
       lstat:dependencies.lstat??lstat,realpath:dependencies.realpath??realpath,readFile:dependencies.readFile??readFile,readdir:dependencies.readdir??readdir,
       mkdir:dependencies.mkdir??mkdir,open:dependencies.open??open,rename:dependencies.rename??rename,unlink:dependencies.unlink??unlink,
       randomBytes:dependencies.randomBytes??randomBytes,generateKeyPairSync:dependencies.generateKeyPairSync??generateKeyPairSync,
@@ -157,8 +214,41 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   const endpoints=frozen({backend:'http://127.0.0.1:'+ports.backend,demo:'http://127.0.0.1:'+ports.demo,receiver:'http://127.0.0.1:'+ports.receiver,
     postgres:'postgresql://127.0.0.1:'+ports.postgres,mailpitHttp:'http://127.0.0.1:'+ports.mailpitHttp,mailpitSmtp:'smtp://127.0.0.1:'+ports.mailpitSmtp});
   let busy=false,pending=false,status='NEW',startup=null,lock=null,sequence=0,issuerProved=false,webhookReady=false,live=false,retired=false,manualDeadline=null;
-  let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false;
+  let activeTrialOperation,trialStop;
+  let refusedOriginUsed=false,originalDirectory=null;
+  let inputs=null,admin=null,providerKeys=null,diagnosticConfigured=false,controlCapability;
+  const runtimePrefix=optionalTrial?'PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL':failedRenewal?'PAYMENT_STRIPE_BILLING_FAILED_RENEWAL':firstRenewal?'PAYMENT_STRIPE_BILLING_FIRST_RENEWAL':'PAYMENT_STRIPE_BILLING_FIRST_PAYMENT';
+  const runtimeDockerfile=optionalTrial?'Dockerfile.billing-optional-trial':failedRenewal?'Dockerfile.billing-failed-renewal':firstRenewal?'Dockerfile.billing-first-renewal':'Dockerfile.billing-first-payment';
+  const runtimeImageFormat=firstRenewal?firstRenewalImageFormat:firstPaymentImageFormat;
+  const runtimeContainerFormat=optionalTrial?expected=>optionalTrialContainerFormat(expected,workerConfig):failedRenewal?failedRenewalContainerFormat:firstRenewal?firstRenewalContainerFormat:firstPaymentContainerFormat;
+  const proveRuntime=optionalTrial?proveOptionalTrialRuntime:failedRenewal?proveFailedRenewalRuntime:firstRenewal?proveFirstRenewalRuntime:proveFirstPaymentRuntime;
+  const runtimeEnv=key=>Object.fromEntries(Object.entries({'': 'true',_RUN_ID:runId,_SOURCE_SHA:expectedSource,
+    ...(!optionalTrial?{_FROZEN_TIME:String(options.frozenTime)}:{}),_CONTROL_PORT:String(options.controlPort),_CONTROL_BIND:'0.0.0.0',_CONTROL_KEY:key})
+    .map(([suffix,value])=>[runtimePrefix+suffix,value]));
   let terminalBuild=false,buildDiagnostic=null,buildxIdentity=null;
+  let helperCreate=null;
+  function retainHelperCreate(error) {
+    if(!helperCreate||helperCreateDiagnostics.has(capabilities))return;
+    const {service,stage}=helperCreate;
+    const prefix='PREPARE_'+service+'_CREATE_'+stage+'_';
+    const code=prefix+failures.get(error)?.category;
+    helperCreateDiagnostics.set(capabilities,helperCreateCodes.has(code)?code:prefix+'REJECTED');
+  }
+  // First-payment START only: local checkpoints and trusted internal failure categories.
+  let startupCode=null,startupStage='ADMISSION',startupService='BOOTSTRAP';
+  let startAckUncertain=false;
+  // Failed-renewal persistence exposes only the first refused local checkpoint.
+  let persistenceCode=null,persistenceStage='PERSIST_ADMISSION';
+  const persistenceStep=stage=>{if(isolatedPersistence&&persistenceCode===null)persistenceStage=stage;};
+  const backendHealthFailures=new Set(['HTTP_UNAVAILABLE','HTTP_REJECTED','HTTP_ERROR','CONNECTION_FAILED','PROBE_TIMEOUT']);
+  const startupStep=(stage,service='BOOTSTRAP')=>{if(firstPayment&&startupCode===null){startupStage=stage;startupService=service==='BOOTSTRAP'?service:service.toUpperCase().replaceAll('-','_');}};
+  function retainStartup(error,controller,external) {
+    if(!firstPayment||startupCode!==null)return;
+    const category=failures.get(error)?.category??(controller.signal.aborted?(external?.aborted?'ABORT':'TIMEOUT'):null);
+    const backendUnhealthy=startupService==='BACKEND'&&typeof category==='string'&&category.startsWith('UNHEALTHY_')&&backendHealthFailures.has(category.slice('UNHEALTHY_'.length));
+    const allowed=category==='ABORT'||category==='TIMEOUT'||startupStage==='COMMAND'&&['NONZERO_EXIT','OUTPUT_LIMIT','SPAWN_FAILURE'].includes(category)||startupStage==='HEALTH'&&(['NOT_RUNNING','UNHEALTHY'].includes(category)||backendUnhealthy);
+    startupCode='START_'+startupService+'_'+startupStage+'_'+(allowed?category:'REJECTED');
+  }
   const buildxDirectory=directory+'/buildx',dockerEnvironment=Object.freeze({...CHILD_ENV,DOCKER_CONFIG:'/private/var/empty',BUILDX_CONFIG:buildxDirectory});
   const recorded={images:{},network:null,volumes:{},containers:{},retiredBackend:null},intents=[],privateIdentities=new Map();
   const ownLabels=kind=>({'payment.sandbox.project':project,'payment.sandbox.run':runId,'payment.sandbox.kind':kind});
@@ -172,9 +262,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       status:pending?'PENDING':status,webhookReady,...(manualPayment?{mode:'MANUAL_PAYMENT',manualPort:options.manualPort}:diagnostic?{mode:'FORM_DIAGNOSTIC'}:{}),...recorded,...(buildDiagnostic?{buildDiagnostic}:{})})));
   }
   async function operation(phase,limits,body,{cleanup=false,diagnostic=false,adminChild=false}={}) {
-    if(terminalBuild&&!diagnostic)throw fixed(phase+'_PENDING');
+    if(terminalBuild&&!diagnostic||trialStop&&!cleanup)throw fixed(phase+'_PENDING');
     if(busy)throw fixed('OPERATION_BUSY');busy=true;
-    const controller=new AbortController();let timer,external,original,onAbort;
+    const controller=new AbortController();let timer,external,original,onAbort,finishTrialOperation;
+    if(drainBeforeStop&&!cleanup){
+      activeTrialOperation={abort:()=>controller.abort(),done:new Promise(resolve=>finishTrialOperation=resolve)};
+    }
+    const captureStartup=firstPayment&&phase==='START'&&!pending;if(captureStartup)startupStep('ADMISSION');
+    const capturePersistence=isolatedPersistence&&phase==='PERSIST'&&persistenceCode===null;if(capturePersistence)persistenceStep('PERSIST_ADMISSION');
     try {
       if(pending&&!cleanup)fail();
       if(adminChild){
@@ -184,19 +279,32 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         limits={deadline:fields.deadline.value,signal:fields.signal?.value};
       }
       if(!Number.isSafeInteger(limits?.deadline)||limits.deadline<=io.now()||(limits.signal!==undefined&&!(limits.signal instanceof AbortSignal)))fail();
-      if(manualPayment){
+      if(manualPayment||billing){
         if(manualDeadline===null){if(limits.deadline>io.now()+45*60000)fail();manualDeadline=limits.deadline;}
         if(cleanup?limits.deadline>manualDeadline+120000:phase==='VERIFY'||adminChild?limits.deadline>manualDeadline:limits.deadline!==manualDeadline)fail();
       }
-      external=limits.signal;onAbort=()=>controller.abort();external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
+      external=limits.signal;onAbort=()=>{
+        if(captureStartup)retainStartup(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'),controller,external);
+        if(phase==='PREPARE'&&helperCreate)retainHelperCreate(diagnosticFailure(external?.aborted?'ABORT':'TIMEOUT'));
+        controller.abort();
+      };external?.addEventListener('abort',onAbort,{once:true});if(external?.aborted)controller.abort();
       // A clipped manual child supplements the captured startup authority.
       original=adminChild?startup?.signal:undefined;original?.addEventListener('abort',onAbort,{once:true});if(original?.aborted)controller.abort();
       timer=io.setTimeout(onAbort,Math.min(limits.deadline-io.now(),2147483647));
       const context={deadline:limits.deadline,signal:controller.signal,externalSignal:external};check(context);
       const result=await body(context);
       if(!diagnostic||context.buildCompleted!==true)check(context);return result;
-    } catch {pending=true;throw fixed(phase+'_PENDING');}
-    finally {io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);busy=false;}
+    } catch(error) {
+      if(captureStartup)retainStartup(error,controller,external);
+      if(phase==='PREPARE')retainHelperCreate(error);
+      if(capturePersistence)persistenceCode=persistenceStage;
+      pending=true;throw fixed(phase+'_PENDING');
+    }
+    finally {
+      io.clearTimeout(timer);external?.removeEventListener('abort',onAbort);original?.removeEventListener('abort',onAbort);
+      busy=false;
+      if(finishTrialOperation){activeTrialOperation=undefined;finishTrialOperation();}
+    }
   }
   async function execute(file,args,settings,context) {
     check(context);
@@ -222,9 +330,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   function composeArgs(envFile,action,{override=true,stripe=false}={}) {
     return ['compose','-p',project,'--project-directory',ROOT+'/infrastructure','--env-file',envFile,'-f',ROOT+'/infrastructure/compose.yaml',
-      ...(override?['-f',directory+'/owned.yaml']:[]),...(stripe?['-f',ROOT+'/infrastructure/compose.stripe-sandbox.yaml']:[]),'--profile','smoke',...action];
+      ...(firstPayment?['-f',directory+'/runtime-build.yaml']:[]),...(override?['-f',directory+'/owned.yaml']:[]),...(stripe?['-f',ROOT+'/infrastructure/compose.stripe-sandbox.yaml']:[]),'--profile','smoke',...action];
   }
-  const validFile=s=>s.isFile()&&!s.isSymbolicLink()&&s.uid===process.getuid()&&(s.mode&0o7777)===0o600&&s.nlink===1&&Number.isSafeInteger(s.size)&&s.size>=0&&s.size<=65536;
   async function directoryProof(path,context,privateMode=false) {
     check(context);const s=await io.lstat(path);
     if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid())||await io.realpath(path)!==path
@@ -235,25 +342,25 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const actual=await directoryProof(buildxDirectory,context,true);
     if(!buildxIdentity||actual.ino!==buildxIdentity.ino||actual.dev!==buildxIdentity.dev)fail();
   }
-  async function syncDirectory(path,context,identity=null) {
-    check(context);const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY);
+  async function syncDirectory(path,context,identity=null,refusedOriginCurrent=null) {
+    check(context);refusedOriginCurrent?.();const file=await io.open(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_DIRECTORY);
     try {
       const s=await file.stat();if(!s.isDirectory()||s.isSymbolicLink()||(s.uid!==0&&s.uid!==process.getuid()))fail();
       if(identity&&(s.ino!==identity.ino||s.dev!==identity.dev||s.uid!==process.getuid()||(s.mode&0o7777)!==0o700))fail();
-      await file.sync();
+      refusedOriginCurrent?.();await file.sync();
     }
     finally {await file.close();}check(context);
   }
-  async function exclusiveFile(path,contents,context,hold=false) {
+  async function exclusiveFile(path,contents,context,hold=false,refusedOriginCurrent=null) {
     await directoryProof(dirname(path),context,true);
-    check(context);const file=await io.open(path,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
+    check(context);refusedOriginCurrent?.();const file=await io.open(path,constants.O_WRONLY|constants.O_CREAT|constants.O_EXCL|constants.O_NOFOLLOW,0o600);
     let retain=false;
     try {
       check(context);const initial=await file.stat();check(context);if(!validFile(initial))fail();
-      await file.writeFile(contents);check(context);
+      refusedOriginCurrent?.();await file.writeFile(contents);check(context);
       const actual=await file.stat(),named=await io.lstat(path);
       if(!validFile(actual)||!validFile(named)||actual.ino!==initial.ino||actual.dev!==initial.dev||named.ino!==initial.ino||named.dev!==initial.dev||await io.realpath(path)!==path)fail();
-      check(context);await file.sync();check(context);await syncDirectory(dirname(path),context);privateIdentities.set(path,{ino:actual.ino,dev:actual.dev});
+      check(context);refusedOriginCurrent?.();await file.sync();check(context);await syncDirectory(dirname(path),context,null,refusedOriginCurrent);privateIdentities.set(path,{ino:actual.ino,dev:actual.dev});
       check(context);retain=hold;return file;
     } finally {if(!retain)await file.close();}
   }
@@ -273,17 +380,22 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   async function intent(action,name,context) {intents.push({action,name,status:'DISPATCHING'});await ledger(context);}
   async function acknowledgement(context) {intents.at(-1).status='ACKNOWLEDGED';await ledger(context);}
   async function sourceGate(context,portsCheck=true) {
-    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,
-      execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)});
+    // Preflight uses the process clock. Carry the remaining bootstrap budget and its live signal.
+    const limits=isolatedPersistence?{deadline:Date.now()+(context.deadline-io.now()),signal:context.signal}:undefined;
+    const result=await io.preflight({runId,expectedSource,daemon,ports,env,...(billing?{approvedBinding:options.approvedBinding,selectedCase:options.selectedCase}:{}),
+      ...(firstPayment?{controlPort:options.controlPort,...(!optionalTrial?{frozenTime:options.frozenTime}:{})}:{}),
+      ...(manualPayment?{manualPort:options.manualPort}:{})},{lstat:io.lstat,realpath:io.realpath,...(isolatedPersistence?{open:io.open}:{}),
+      execute:(file,args,settings)=>execute(file,args,settings,context),portAvailable:(port,host)=>io.portAvailable(port,host,context)},limits);
     check(context);if(!object(result)||Object.keys(result).length!==1||result.status!=='READY')fail();
-    if(portsCheck)for(const port of [...Object.values(ports),...(manualPayment?[options.manualPort]:[])]) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
+    if(portsCheck)for(const port of [...Object.values(ports),...(manualPayment?[options.manualPort]:[]),...(firstPayment?[options.controlPort]:[])]) {check(context);if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();}
   }
   async function sourceIdentity(context) {
     const settings={cwd:ROOT,env:{...CHILD_ENV,GIT_OPTIONAL_LOCKS:'0',GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_SYSTEM:'/dev/null'},shell:false,timeout:10000,maxBuffer:65536};
     const head=await execute('/usr/bin/git',['rev-parse','HEAD'],settings,context);
     if(![expectedSource,expectedSource+'\n'].includes(head.stdout)||head.stderr!=='')fail();
-    const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1','--untracked-files=no'],settings,context);
+    const status=await execute('/usr/bin/git',['-c','core.fsmonitor=false','status','--porcelain=v1',optionalTrial?'--untracked-files=all':'--untracked-files=no'],settings,context);
     if(status.stdout!==''||status.stderr!=='')fail();
+    if(optionalTrial&&!await hasOnlyTrackedOptionalTrialInputs((file,args,options)=>execute(file,args,options,context),settings))fail();
   }
   async function privateTree(context) {
     for(let path=ROOT;;path=dirname(path)) {await directoryProof(path,context);if(path==='/')break;}
@@ -296,7 +408,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       const names=await io.readdir(dirname(path));if(!names.includes(path.slice(dirname(path).length+1)))await io.mkdir(path,{mode:0o700});
       await directoryProof(path,context,path.endsWith('/stripe-sandbox'));await syncDirectory(dirname(path),context);
     }
-    await io.mkdir(directory,{mode:0o700});await directoryProof(directory,context,true);await syncDirectory(dirname(directory),context);
+    await io.mkdir(directory,{mode:0o700});const ownedDirectory=await directoryProof(directory,context,true);originalDirectory={ino:ownedDirectory.ino,dev:ownedDirectory.dev};await syncDirectory(dirname(directory),context);
     lock=await exclusiveFile(directory+'/owner.lock',runId+'\n',context,true);await ledger(context);
     await io.mkdir(buildxDirectory,{mode:0o700});
     const owned=await directoryProof(buildxDirectory,context,true);buildxIdentity={ino:owned.ino,dev:owned.dev};
@@ -306,16 +418,31 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   function portInputs() {return {PAYMENT_BACKEND_HOST_PORT:ports.backend,PAYMENT_DEMO_HOST_PORT:ports.demo,PAYMENT_POSTGRES_HOST_PORT:ports.postgres,
     PAYMENT_MAILPIT_HOST_PORT:ports.mailpitHttp,PAYMENT_MAILPIT_SMTP_HOST_PORT:ports.mailpitSmtp};}
   async function imageProof(service,context) {
-    const value=await inspect('image',tags[service],'{"Id":{{json .ID}},"User":{{json .Config.User}}}',context);
+    const value=await inspect('image',tags[service],firstPayment&&service==='backend'?runtimeImageFormat(expectedSource):'{"Id":{{json .ID}},"User":{{json .Config.User}}}',context);
+    if(firstPayment&&service==='backend')proveRuntime(value,'image');
     if(!imageId(value.Id)||typeof value.User!=='string') {if(buildDiagnostic)throw diagnosticFailure('INVALID_IMAGE_PROOF');fail();}
     recorded.images[service]={tag:tags[service],id:value.Id,user:value.User};
   }
   async function build(context) {
     const synthetic={PAYMENT_DB_PASSWORD:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_USERNAME:'buildOnly',PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:'buildOnly',
       PAYMENT_DATA_ENCRYPTION_KEY:'buildOnly',PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:'buildOnly',PAYMENT_CUSTOMER_DIGEST_KEY_V1:'buildOnly',PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:'buildOnly',...portInputs()};
-    await exclusiveFile(directory+'/build.env',envText(synthetic),context);await intent('BUILD','backend+demo-site',context);
+    if(billing)synthetic.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1='buildOnly';
+    if(firstPayment){Object.assign(synthetic,runtimeEnv('buildOnly'));await exclusiveFile(directory+'/runtime-build.yaml','services:\n  backend:\n    build:\n      context: '+ROOT+'/backend\n      dockerfile: '+runtimeDockerfile+'\n      args:\n        PAYMENT_RUNTIME_SOURCE_SHA: '+expectedSource+'\n',context);}
+    await exclusiveFile(directory+'/build.env',envText(synthetic),context);
+    if(optionalTrial)await sourceIdentity(context);
+    await intent('BUILD','backend+demo-site',context);
     if(buildDiagnostic) {buildDiagnostic.stage='BUILD_COMMAND';await ledger(context);}
-    await docker(composeArgs(directory+'/build.env',['build','--quiet',...(manualPayment?['--build-arg','PAYMENT_DEMO_BUILD_MODE=manual-payment']:diagnostic?['--build-arg','PAYMENT_DEMO_BUILD_MODE=form-diagnostic']:[]),'backend','demo-site'],{override:false}),context,1200000);
+    let demoBuildMode;
+    if(optionalTrial)demoBuildMode='billing-optional-trial';
+    else if(failedRenewal)demoBuildMode='billing-failed-renewal';
+    else if(firstPayment)demoBuildMode='billing-first-payment';
+    else if(billing && options.selectedCase==='initial_decline_retry')demoBuildMode='billing-decline-retry';
+    else if(invoiceCase || billing && ['initial_cancel_withdraw','initial_required_trial'].includes(options.selectedCase))demoBuildMode='billing-invoice-webhooks';
+    else if(billing && options.selectedCase==='initial_3ds')demoBuildMode='billing-initial-3ds';
+    else if(manualPayment)demoBuildMode='manual-payment';
+    else if(diagnostic)demoBuildMode='form-diagnostic';
+    const buildArgs=demoBuildMode?['--build-arg','PAYMENT_DEMO_BUILD_MODE='+demoBuildMode]:[];
+    await docker(composeArgs(directory+'/build.env',['build','--quiet',...buildArgs,'backend','demo-site'],{override:false}),context,1200000);
     for(const service of ['backend','demo-site']) {
       if(buildDiagnostic) {buildDiagnostic.stage=service==='backend'?'BACKEND_IMAGE_PROOF':'DEMO_IMAGE_PROOF';await ledger(context);}
       await imageProof(service,context);
@@ -328,12 +455,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }
   }
   async function generate(context) {
-    const values=Array.from({length:6},()=>io.randomBytes(32).toString('base64'));
-    if(values.some(value=>!/^([A-Za-z0-9+/]{43})=$/.test(value))||new Set(values).size!==6)fail();
+    const values=Array.from({length:firstPayment?8:billing?7:6},()=>io.randomBytes(32).toString('base64'));
+    if(values.some(value=>!/^([A-Za-z0-9+/]{43})=$/.test(value))||new Set(values).size!==values.length)fail();
     admin={username:'s5a-'+io.randomBytes(16).toString('hex'),password:values[1]};
     inputs={PAYMENT_DB_PASSWORD:values[0],PAYMENT_ADMIN_BOOTSTRAP_USERNAME:admin.username,PAYMENT_ADMIN_BOOTSTRAP_PASSWORD:admin.password,
       PAYMENT_DATA_ENCRYPTION_KEY:values[2],PAYMENT_DONATION_MESSAGE_FINGERPRINT_KEY:values[3],PAYMENT_CUSTOMER_DIGEST_KEY_V1:values[4],
       PAYMENT_CUSTOMER_HISTORY_CURSOR_KEY_V1:values[5],PAYMENT_FAKE_AUTO_SUCCESS:'false',PAYMENT_TELEMETRY_SITEKEYS:siteKey,...portInputs()};
+    if(billing)inputs.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1=values[6];
+    if(firstPayment){controlCapability=Buffer.from(values[7],'base64').toString('base64url');Object.assign(inputs,runtimeEnv(controlCapability));}
     const rsa=io.generateKeyPairSync('rsa',{modulusLength:2048}),ec=io.generateKeyPairSync('ec',{namedCurve:'prime256v1'});
     const keys=[{...rsa.privateKey.export({format:'jwk'}),kid:'local-fixture-rs',alg:'RS256',use:'sig'},
       {...ec.privateKey.export({format:'jwk'}),kid:'local-fixture-es',alg:'ES256',use:'sig'}];
@@ -354,9 +483,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     await absent(['ps','--all','--no-trunc','--filter','label=com.docker.compose.project='+project,'--format','{{.ID}}'],context);
     await absent(['network','ls','--no-trunc','--filter','name='+networkName,'--format','{{.ID}}'],context);
     await intent('CREATE_NETWORK',networkName,context);
-    const output=await docker(['network','create','--driver','bridge',...Object.entries(ownLabels('network')).flatMap(([key,value])=>['--label',key+'='+value]),networkName],context);
+    const subnet=optionalTrial?env[OPTIONAL_TRIAL_SUBNET]:billing&&!firstPayment?billingAcceptanceSubnet(env):undefined;
+    const output=await docker(['network','create','--driver','bridge',...(subnet?['--subnet',subnet]:[]),...Object.entries(ownLabels('network')).flatMap(([key,value])=>['--label',key+'='+value]),networkName],context);
     const network=await inspect('network',networkName,NETWORK_FORMAT,context);
     if(!fullId(network.Id)||output.stdout.trim()!==network.Id||network.Name!==networkName||network.Driver!=='bridge'||network.Scope!=='local'||!same(network.Labels,ownLabels('network')))fail();
+    if(subnet){
+      const ipam=await inspect('network',network.Id,'{"Config":{{json .IPAM.Config}}}',context);
+      if(!Array.isArray(ipam.Config)||ipam.Config.length!==1||ipam.Config[0]?.Subnet!==subnet)fail();
+    }
     recorded.network=network;await acknowledgement(context);
     for(const [kind,name] of Object.entries(volumeNames)) {
       await absent(['volume','ls','--filter','name='+name,'--format','{{.Name}}'],context);await intent('CREATE_VOLUME',name,context);
@@ -368,7 +502,7 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   function expectedPorts(service) {
     const pairs={postgres:[['5432/tcp',ports.postgres]],mailpit:[['8025/tcp',ports.mailpitHttp],['1025/tcp',ports.mailpitSmtp]],
-      backend:[['8080/tcp',ports.backend]],'demo-site':[['8080/tcp',ports.demo]],'callback-receiver':[['8080/tcp',ports.receiver]]}[service]??[];
+      backend:[['8080/tcp',ports.backend],...(firstPayment?[[options.controlPort+'/tcp',options.controlPort]]:[])],'demo-site':[['8080/tcp',ports.demo]],'callback-receiver':[['8080/tcp',ports.receiver]]}[service]??[];
     return Object.fromEntries(pairs.map(([container,host])=>[container,[{HostIp:'127.0.0.1',HostPort:String(host)}]]));
   }
   function expectedMounts(service) {
@@ -383,12 +517,14 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     for(const volume of Object.values(recorded.volumes))if(!same(await inspect('volume',volume.Name,VOLUME_FORMAT,context),volume))fail();
   }
   async function containerProof(service,selector,context,{liveRequired=false,neverStarted=false,cleanupOnly=false}={}) {
-    const value=await inspect('container',selector,CONTAINER_FORMAT,context),recordedContainer=recorded.containers[service];
+    const value=await inspect('container',selector,firstPayment&&service==='backend'?runtimeContainerFormat({...runtimeEnv(controlCapability),PAYMENT_RUNTIME_SOURCE_SHA:expectedSource,PAYMENT_STRIPE_SANDBOX_ENABLED:retired?'true':'false'}):workerConfig&&service==='backend'?workerContainerFormat(workerConfig):CONTAINER_FORMAT,context),recordedContainer=recorded.containers[service];
+    if(workerConfig&&!firstPayment&&service==='backend'&&value.BillingWorkers!==true)fail();
+    if(firstPayment&&service==='backend')proveRuntime(value,'container');
     const proof=proveOwnedContainer(value,{service,project,runId,network:recorded.network,sourceImage:recorded.images[service.startsWith('issuer-')?'backend':service],
       recordedContainer,expectedMounts:expectedMounts(service),expectedPorts:expectedPorts(service),liveRequired,neverStarted,cleanupOnly,backendStripeEnabled:Boolean(retired||diagnosticConfigured)});
     if(proof.infrastructureRequired)await infrastructureProof(context);
     if(recordedContainer)recorded.containers[service]=proof.safe;
-    return {safe:proof.safe,state:proof.state};
+    return {safe:proof.safe,state:proof.state,backendHealthFailure:firstPayment&&service==='backend'&&backendHealthFailures.has(value.BackendHealthFailure)?value.BackendHealthFailure:null};
   }
   async function projectProof(context) {
     const output=await docker(['ps','--all','--no-trunc','--filter','label=com.docker.compose.project='+project,'--format','{{.ID}}'],context,10000);
@@ -419,13 +555,17 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }finally{await handle.close();}
   }
   async function helper(service,command,context) {
-    const installer=service==='issuer-installer',name=project+'-'+service;await intent('CREATE_HELPER',name,context);
+    const installer=service==='issuer-installer',name=project+'-'+service;
+    const createStep=stage=>{if(failedRenewal)helperCreate={service:installer?'ISSUER_INSTALLER':'ISSUER_PROBE',stage};};
+    createStep('INTENT');await intent('CREATE_HELPER',name,context);
     const args=['container','create','--name',name,'--pull','never','--network','none','--read-only','--user',installer?'0:0':'10001:10001','--cap-drop','ALL',
       ...(installer?['--cap-add','CHOWN','--cap-add','DAC_OVERRIDE']:[]),...Object.entries(containerLabels(service)).flatMap(([key,value])=>['--label',key+'='+value]),
       ...(installer?['--mount','type=bind,src='+directory+'/issuer.jwks.json,dst=/input/issuer.json,readonly']:[]),
       '--mount','type=volume,src='+volumeNames.issuer+',dst=/issuer'+(installer?'':',readonly'),'--entrypoint','/bin/sh',recorded.images.backend.id,'-ec',command];
-    const output=await docker(args,context),id=output.stdout.trim();if(!fullId(id))fail();
-    const proof=await containerProof(service,id,context,{neverStarted:true});recorded.containers[service]=proof.safe;await acknowledgement(context);
+    createStep('COMMAND');const output=await docker(args,context);
+    createStep('OUTPUT');const id=output.stdout.trim();if(!fullId(id))fail();
+    createStep('PROOF');const proof=await containerProof(service,id,context,{neverStarted:true});recorded.containers[service]=proof.safe;
+    createStep('ACK');await acknowledgement(context);helperCreate=null;
     await infrastructureProof(context);await containerProof(service,id,context,{neverStarted:true});await intent('START_HELPER',id,context);
     await docker(['container','start',id],context);const wait=await docker(['container','wait',id],context);
     if(!/^0\n?$/.test(wait.stdout))fail();const done=await containerProof(service,id,context);
@@ -443,6 +583,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       for(const [key,value] of Object.entries(ownLabels('container')))lines.push('      '+key+': '+value);
       lines.push('    ports: !override');for(const [port,bindings] of Object.entries(expectedPorts(service)))for(const binding of bindings)lines.push('      - "127.0.0.1:'+binding.HostPort+':'+port.split('/')[0]+'"');
       if(service==='backend')lines.push('    environment:','      PAYMENT_STRIPE_SANDBOX_ENABLED: "false"','    volumes: !override','      - type: volume','        source: owned-issuer','        target: /app/local-fixtures','        read_only: true');
+      if(service==='backend'&&workerConfig)lines.splice(lines.indexOf('    volumes: !override'),0,"      SPRING_APPLICATION_JSON: '"+workerConfig+"'");
+      if(service==='backend'&&firstPayment){const at=lines.indexOf('    volumes: !override');lines.splice(at,0,...Object.keys(runtimeEnv('')).map(name=>'      '+name+': "${'+name+':?owned initial runtime required}"'));}
+      if(service==='backend'&&billing){const at=lines.indexOf('    volumes: !override');lines.splice(at,0,'      PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED: "true"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION: "v1"','      PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1: "${PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:?owned Billing key required}"');}
     }
     lines.push('networks:','  default:','    external: true','    name: '+networkName,'volumes:','  payment-postgres:','    external: true','    name: '+volumeNames.postgres,
       '  owned-issuer:','    external: true','    name: '+volumeNames.issuer);
@@ -473,6 +616,10 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         if(!actual||actual.type!==mount.Type||actual.source!==source||Boolean(actual.read_only)!==!mount.RW)fail();
       }
       if(STRIPE_NAMES.some(name=>Object.hasOwn(value.environment??{},name))||(service==='backend'&&value.environment?.PAYMENT_STRIPE_SANDBOX_ENABLED!=='false'))fail();
+      if(firstPayment){const expected=runtimeEnv('buildOnly');if(Object.entries(expected).some(([name,want])=>service==='backend'?value.environment?.[name]!==want:Object.hasOwn(value.environment??{},name)))fail();if(service==='backend'&&(value.build?.context!==ROOT+'/backend'||value.build?.dockerfile!==runtimeDockerfile||!same(value.build?.args,{PAYMENT_RUNTIME_SOURCE_SHA:expectedSource})||(value.entrypoint!==undefined&&value.entrypoint!==null)||(value.command!==undefined&&value.command!==null)))fail();}
+      if(optionalTrial&&['_FROZEN_TIME','_ACCOUNT_ID'].some(suffix=>Object.hasOwn(value.environment??{},runtimePrefix+suffix)))fail();
+      if(workerConfig&&(service==='backend'?value.environment?.SPRING_APPLICATION_JSON!==workerConfig:Object.hasOwn(value.environment??{},'SPRING_APPLICATION_JSON')))fail();
+      if(billing&&Object.entries(BILLING_CONFIG).some(([name,expected])=>service==='backend'?value.environment?.[name]!==expected:Object.hasOwn(value.environment??{},name)))fail();
     }
   }
   async function prepare(context) {
@@ -509,29 +656,8 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     return true;
   }
 
-  async function boundedRead(file,context) {
-    check(context);const buffer=Buffer.alloc(65537),result=await file.read(buffer,0,buffer.length,0);
-    if(!Number.isInteger(result.bytesRead)||result.bytesRead<0||result.bytesRead>65536)fail();check(context);
-    return buffer.subarray(0,result.bytesRead);
-  }
-  async function userFile(context) {
-    await directoryProof(ROOT+'/infrastructure',context);
-    const before=await io.lstat(USERFILE);
-    if(!validFile(before)||await io.realpath(USERFILE)!==USERFILE)fail();
-    const file=await io.open(USERFILE,constants.O_RDONLY|constants.O_NOFOLLOW);
-    try {
-      const actual=await file.stat();
-      if(!validFile(actual)||actual.ino!==before.ino||actual.dev!==before.dev)fail();
-      const bytes=await boundedRead(file,context);
-      if(bytes.length!==actual.size)fail();return {file,stat:actual,bytes};
-    } catch {await file.close();fail();}
-  }
-  async function unchanged(original,context) {
-    const current=await io.lstat(USERFILE),held=await original.file.stat();
-    if(!validFile(current)||!validFile(held)||current.ino!==original.stat.ino||current.dev!==original.stat.dev
-      ||held.ino!==original.stat.ino||held.dev!==original.stat.dev||await io.realpath(USERFILE)!==USERFILE
-      ||!(await boundedRead(original.file,context)).equals(original.bytes))fail();
-  }
+  const userFile=context=>openSandboxUserEnv(io,()=>check(context));
+  const unchanged=(original,context)=>requireSandboxUserEnvUnchanged(original,io,()=>check(context));
   async function configureDiagnostic(context) {
     const original=await userFile(context);
     try {
@@ -551,20 +677,9 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     }finally{await original.file.close();}
   }
   function parsedUser(bytes,secret) {
-    const text=bytes.toString('utf8');if(!Buffer.from(text).equals(bytes)||text.includes('\0'))fail();
-    const assignments={},lines=text.split(/(?<=\n)/);let webhookIndex=-1;
-    for(let index=0;index<lines.length;index++) {
-      const body=lines[index].replace(/\r?\n$/,'');
-      if(/^\s*(?:#.*)?$/.test(body))continue;
-      const match=/^([A-Z_]+)=(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s'"\r\n]*))$/.exec(body);
-      if(!match||!STRIPE_NAMES.includes(match[1])||Object.hasOwn(assignments,match[1]))fail();
-      assignments[match[1]]=match[2]??match[3]??match[4];
-      if(match[1]===STRIPE_NAMES[2])webhookIndex=index;
-    }
-    if(Object.keys(assignments).length!==3||! /^(?:sk|rk)_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[0]])
-      ||!/^pk_test_[A-Za-z0-9]+$/.test(assignments[STRIPE_NAMES[1]]))fail();
-    if(Object.values(assignments).some(value=>/replace_me|your_key|synthetic|sentinel|example/i.test(value)))fail();
-    const previous=assignments[STRIPE_NAMES[2]];if(previous!==''&&previous!==secret)fail();
+    const {assignments,lines,webhookIndex}=parseSandboxUserEnv(bytes);
+    const previous=assignments[STRIPE_NAMES[2]];
+    if(!isolatedPersistence&&previous!==''&&previous!==secret)fail();
     if(previous==='') {
       const line=lines[webhookIndex],offset=line.indexOf('=')+1,quote=["'",'"'].includes(line[offset])?line[offset]:'';
       lines[webhookIndex]=line.slice(0,offset)+quote+secret+quote+line.slice(offset+(quote?2:0));
@@ -580,7 +695,17 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function persist(secret,context) {
     if(status!=='PREPARED'||!issuerProved||webhookReady||typeof secret!=='string'||!/^whsec_[A-Za-z0-9_]{16,256}$/.test(secret))fail();
+    persistenceStep('PERSIST_OWNERSHIP');
     await topology(context,false,true);await sourceIdentity(context);await intent('PERSIST_WEBHOOK','backend-key-persistence',context);
+    if(isolatedPersistence) {
+      let original;
+      try {
+        persistenceStep('PERSIST_INPUT');original=await userFile(context);const parsed=parsedUser(original.bytes,secret);
+        persistenceStep('PERSIST_UNCHANGED');await unchanged(original,context);
+        persistenceStep('PERSIST_FINAL_STORE');await exclusiveFile(directory+'/final.env',envText({...inputs,...parsed.assignments}),context);
+        persistenceStep('PERSIST_ACK');webhookReady=true;await acknowledgement(context);return true;
+      } finally {if(original)await original.file.close();}
+    }
     const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
     const writer=await exclusiveFile(writerPath,runId+'\n',context,true);let complete=false,original;
     try {
@@ -607,24 +732,45 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
   }
   async function healthy(service,context) {
     for(;;) {
-      await infrastructureProof(context);const proof=await containerProof(service,recorded.containers[service].id,context);
-      if(!proof.state.Running||proof.state.Status!=='running'||!['starting','healthy'].includes(proof.state.Health))fail();
-      if(proof.state.Health==='healthy') {await containerProof(service,proof.safe.id,context,{liveRequired:true});return;}
-      await sleepForHealth(context);
+      startupStep('HEALTH_PROOF',service);await infrastructureProof(context);const proof=await containerProof(service,recorded.containers[service].id,context);
+      startupStep('HEALTH',service);
+      if(!proof.state.Running||proof.state.Status!=='running'){if(firstPayment)throw diagnosticFailure('NOT_RUNNING');fail();}
+      if(!['starting','healthy'].includes(proof.state.Health)){if(firstPayment&&proof.state.Health==='unhealthy')throw diagnosticFailure('UNHEALTHY'+(proof.backendHealthFailure?'_'+proof.backendHealthFailure:''));fail();}
+      if(proof.state.Health==='healthy') {startupStep('HEALTH_PROOF',service);await containerProof(service,proof.safe.id,context,{liveRequired:true});return;}
+      startupStep('HEALTH_WAIT',service);await sleepForHealth(context);
     }
   }
   async function healthRequests(context) {
-    for(const [service,path] of [['backend','/actuator/health/readiness'],['demo-site','/health'],['callback-receiver','/health']]) {
-      await infrastructureProof(context);await containerProof(service,recorded.containers[service].id,context,{liveRequired:true});
+    for(const [service,path] of [['backend','/actuator/health/readiness'],['demo-site',optionalTrial?'/healthz':'/health'],...(failedRenewal?[['demo-site','/billing-failed-renewal.html']]:[]),['callback-receiver','/health']]) {
+      startupStep('HEALTH_PROOF',service);await infrastructureProof(context);await containerProof(service,recorded.containers[service].id,context,{liveRequired:true});
       const endpoint=service==='demo-site'?endpoints.demo:service==='callback-receiver'?endpoints.receiver:endpoints.backend;
-      if(await io.health(endpoint+path,{signal:context.signal,deadline:Math.min(context.deadline,io.now()+10000)})!==true)fail();check(context);
+      startupStep('PUBLIC_HEALTH',service);if(await io.health(endpoint+path,{signal:context.signal,deadline:Math.min(context.deadline,io.now()+10000)})!==true)fail();check(context);
     }
+  }
+  async function dedicatedBackendStartup(parent,body) {
+    const controller=new AbortController(),context={deadline:Math.min(parent.deadline,io.now()+300000),signal:controller.signal,externalSignal:parent.externalSignal};
+    let timer,active=true;
+    const abort=()=>{if(active)controller.abort();};
+    const expire=()=>{
+      if(!active)return;
+      // Native abort callbacks can precede close; retain the boundary immediately.
+      retainStartup(diagnosticFailure('TIMEOUT'),controller,parent.externalSignal);controller.abort();
+    };
+    try {
+      parent.signal.addEventListener('abort',abort,{once:true});if(parent.signal.aborted)abort();
+      timer=io.setTimeout(expire,Math.max(1,context.deadline-io.now()));check(context);
+      const result=await body(context);check(context);return result;
+    } catch(error) {
+      // A health sleep rejects null. Classify only through trusted child state;
+      // an already trusted failure retains its original boundary.
+      if(!failures.has(error))check(context);throw error;
+    } finally {active=false;io.clearTimeout(timer);parent.signal.removeEventListener('abort',abort);}
   }
   async function start(context) {
     if(status!=='PREPARED'||!(diagnostic?diagnosticConfigured:webhookReady)||!issuerProved||retired||live)fail();
-    await sourceIdentity(context);await topology(context,false,true);
-    for(const port of Object.values(ports))if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
-    if(!diagnostic){if(!manualPayment){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
+    startupStep('PROOF');await sourceIdentity(context);await topology(context,false,true);
+    startupStep('PORTS');for(const port of [...Object.values(ports),...(firstPayment?[options.controlPort]:[])])if(await io.portAvailable(port,'127.0.0.1',context)!==true)fail();
+    startupStep('REPLACEMENT');if(!diagnostic){if(!manualPayment){const old=recorded.containers.backend;await containerProof('backend',old.id,context,{neverStarted:true});
     await intent('RETIRE_PLACEHOLDER',old.id,context);
     const removed=await docker(['container','rm',old.id],context);if(removed.stdout.trim()!==old.id)fail();
     recorded.retiredBackend=old;delete recorded.containers.backend;retired=true;await projectProof(context);await acknowledgement(context);
@@ -634,14 +780,36 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     const proof=await containerProof('backend',project+'-backend',context,{neverStarted:true});recorded.containers.backend=proof.safe;
     await topology(context,false,true);await acknowledgement(context);}
     for(const service of SERVICES) {
-      await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
-      await intent('START_SERVICE',recorded.containers[service].id,context);await docker(['container','start',recorded.containers[service].id],context);
-      await healthy(service,context);await acknowledgement(context);
+      startupStep('PROOF',service);await topology(context);await containerProof(service,recorded.containers[service].id,context,{neverStarted:true});
+      startupStep('INTENT',service);await intent('START_SERVICE',recorded.containers[service].id,context);startupStep('COMMAND',service);
+      const commandAndHealthy=async budget=>{await docker(['container','start',recorded.containers[service].id],budget);await healthy(service,budget);};
+      if(firstPayment&&service==='backend')await dedicatedBackendStartup(context,commandAndHealthy);else await commandAndHealthy(context);
+      startupStep('ACK',service);
+      try {await acknowledgement(context);}
+      catch(error) {if(isolatedPersistence)startAckUncertain=true;throw error;}
     }
-    await topology(context,true);await healthRequests(context);live=true;status='LIVE';await ledger(context);return true;
+    startupStep('FINAL_PROOF');await topology(context,true);await healthRequests(context);live=true;status='LIVE';startupStep('LEDGER');await ledger(context);return true;
   }
-  async function verify(context) {
-    if(!live||status!=='LIVE')fail();await sourceIdentity(context);await topology(context,true);await healthRequests(context);return true;
+  async function verify(context,verification) {
+    if(!live||status!=='LIVE')fail();
+    const step=stage=>{if(verification&&!context.signal.aborted)verification.stage=stage;};
+    step('SOURCE');await sourceIdentity(context);
+    step('TOPOLOGY');await topology(context,true);
+    step('HEALTH');await healthRequests(context);
+    return true;
+  }
+  async function verifyFailedRenewal(limits) {
+    // A contender cannot replace the checkpoint while the current child still owns the operation.
+    if(busy)return operation('VERIFY',limits,verify);
+    if(limits===null||typeof limits!=='object'){
+      failedRenewalVerificationCheckpoints.delete(capabilities);
+      return operation('VERIFY',limits,verify);
+    }
+    const verification={limits,stage:'ADMISSION'};
+    failedRenewalVerificationCheckpoints.set(capabilities,verification);
+    const result=await operation('VERIFY',limits,context=>verify(context,verification));
+    if(failedRenewalVerificationCheckpoints.get(capabilities)===verification)failedRenewalVerificationCheckpoints.delete(capabilities);
+    return result;
   }
   function controlled(promise,context) {
     check(context);
@@ -651,9 +819,92 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       if(context.signal.aborted)abort();
     });
   }
+  // Descriptive evidence only. This does not enter operation(), reserve busy,
+  // publish an intent, or participate in STOP. Dispatched FS calls may finish
+  // after this independent budget and may leave partial/unsynced bytes.
+  async function persistRefusedStripeOrigin(witness,limits) {
+    if(refusedOriginUsed)return false;refusedOriginUsed=true;
+    let timer,external,abort;
+    try {
+      if(!(failedRenewal||initial3ds)||busy||pending||status!=='LIVE'||!live||!lock||!originalDirectory||manualDeadline===null)return false;
+      if(!witness||typeof witness!=='object'||Object.getPrototypeOf(witness)!==Object.prototype)return false;
+      // Capture caller descriptors once. The validator rejects accessors and
+      // extra fields before any values are read from the frozen copy.
+      const snapshot=Object.freeze(Object.create(Object.prototype,Object.getOwnPropertyDescriptors(witness)));
+      if(!isBrowserProviderOriginWitness(snapshot)||snapshot.runId!==runId||snapshot.expectedSource!==expectedSource)return false;
+      const checkpoint=Object.hasOwn(snapshot,'checkpoint')?snapshot.checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER';
+      if(initial3ds!==(checkpoint==='BROWSER_PROVIDER_ORIGIN_STRIPE_COM'))return false;
+      if(!limits||typeof limits!=='object'||![Object.prototype,null].includes(Object.getPrototypeOf(limits)))return false;
+      const fields=Object.getOwnPropertyDescriptors(limits);
+      if(Reflect.ownKeys(fields).some(name=>!['deadline','signal'].includes(name))||!fields.deadline||!Object.hasOwn(fields.deadline,'value')
+        ||fields.signal&&!Object.hasOwn(fields.signal,'value'))return false;
+      const deadline=fields.deadline.value;external=fields.signal?.value;
+      if(!Number.isSafeInteger(deadline)||(external!==undefined&&!(external instanceof AbortSignal)))return false;
+      const end=Math.min(deadline,io.now()+2000,manualDeadline+120000);
+      if(end<=io.now()||external?.aborted)return false;
+      const controller=new AbortController(),context={deadline:end,signal:controller.signal},owner=lock;
+      const current=()=>{check(context);if(busy||pending||status!=='LIVE'||!live||lock!==owner)fail();};
+      async function ownership() {
+        current();const actual=await directoryProof(directory,context,true);current();
+        if(actual.ino!==originalDirectory.ino||actual.dev!==originalDirectory.dev)fail();
+        const expected=privateIdentities.get(directory+'/owner.lock');
+        if(!expected)fail();
+        const held=await owner.stat();current();const named=await io.lstat(directory+'/owner.lock');current();
+        if(!validFile(held)||!validFile(named)||held.ino!==expected.ino||held.dev!==expected.dev||named.ino!==expected.ino||named.dev!==expected.dev)fail();
+        if(await io.realpath(directory+'/owner.lock')!==directory+'/owner.lock')fail();current();
+      }
+      return await new Promise(resolveWrite=>{
+        let settled=false;
+        const finish=value=>{if(settled)return;settled=true;resolveWrite(value);};
+        abort=()=>{controller.abort();finish(false);};
+        timer=io.setTimeout(abort,Math.max(1,end-io.now()));
+        external?.addEventListener('abort',abort,{once:true});if(external?.aborted)abort();
+        const work=(async()=>{
+          await ownership();
+          const contents=JSON.stringify({runId:snapshot.runId,expectedSource:snapshot.expectedSource,checkpoint,origin:snapshot.origin,
+            ...(Object.hasOwn(snapshot,'issuerRelation')?{issuerRelation:snapshot.issuerRelation}:{})})+'\n';
+          if(Buffer.byteLength(contents)>1024)fail();current();
+          await exclusiveFile(directory+'/refused-provider-origin.private.json',contents,context,false,current);
+          await ownership();return true;
+        })();
+        work.then(()=>finish(true),()=>finish(false));
+      });
+    } catch {return false;}
+    finally {try{if(timer!==undefined)io.clearTimeout(timer);}catch{}try{if(abort)external?.removeEventListener('abort',abort);}catch{}}
+  }
   async function stop(context) {
     // Root must stop its R2 listener before calling this capability.
+    if(startAckUncertain&&lock===null)fail();
+    // First-payment cleanup can prove stopped state without acknowledging an uncertain start.
+    const ownedStartsOnly=firstPayment&&[...SERVICES,'issuer-installer','issuer-probe'].every(service=>recorded.containers[service])
+      &&intents.every(value=>value.status==='ACKNOWLEDGED'||value.status==='DISPATCHING'&&value.action==='START_SERVICE'
+        &&fullId(value.name)&&SERVICES.some(service=>recorded.containers[service].id===value.name));
+    const preparedServices=[...SERVICES,'issuer-installer','issuer-probe'];
+    const failedPersistence=isolatedPersistence&&persistenceCode!==null;
+    const pendingPersistence=failedPersistence&&lock!==null&&pending&&status==='PREPARED'&&issuerProved&&!retired&&!live&&!recorded.retiredBackend
+      &&Object.keys(recorded.containers).length===preparedServices.length&&preparedServices.every(service=>recorded.containers[service])
+      &&intents.length>0&&intents.at(-1).action==='PERSIST_WEBHOOK'&&intents.at(-1).name==='backend-key-persistence'
+      &&(intents.at(-1).status==='DISPATCHING'||persistenceCode==='PERSIST_ACK'&&intents.at(-1).status==='ACKNOWLEDGED')
+      &&intents.slice(0,-1).every(value=>value.status==='ACKNOWLEDGED'&&value.action!=='PERSIST_WEBHOOK'&&value.action!=='START_SERVICE');
+    // Memory ACK can precede an uncertain durable write or a failing input close.
+    // Every failed persistence stays outside the generic stop-and-ledger path.
+    if(failedPersistence?!pendingPersistence:firstPayment&&!ownedStartsOnly)fail();
     await infrastructureProof(context);await projectProof(context);
+    if(pendingPersistence) {
+      // This exception proves the live owner's untouched pre-start shape; it grants no stop or write authority.
+      for(const service of preparedServices) {
+        const container=recorded.containers[service],helper=service.startsWith('issuer-');
+        try {
+          const proof=await containerProof(service,container.id,context,{cleanupOnly:true,neverStarted:!helper});
+          if(helper&&(proof.state.Running||proof.state.Status!=='exited'||proof.state.ExitCode!==0||container.status!=='exited'
+            ||container.startedAt==='0001-01-01T00:00:00Z'||proof.state.StartedAt!==container.startedAt))fail();
+        } finally {recorded.containers[service]=container;}
+      }
+      await projectProof(context);
+      // Preserve the exact existing ledger bytes, including absent/ambiguous ACKs.
+      // Consume this retained descriptor even when its close outcome is uncertain.
+      const owner=lock;lock=null;await owner.close();return true;
+    }
     for(const [service,container] of Object.entries(recorded.containers))await containerProof(service,container.id,context,{cleanupOnly:true});
     for(const [service,container] of Object.entries(recorded.containers).reverse()) {
       await infrastructureProof(context);const proof=await containerProof(service,container.id,context,{cleanupOnly:true});
@@ -662,10 +913,30 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
         const stopped=await containerProof(service,container.id,context,{cleanupOnly:true});if(stopped.state.Running||!['exited','created'].includes(stopped.state.Status))fail();
       }
     }
-    await projectProof(context);if(intents.some(value=>value.status!=='ACKNOWLEDGED'))fail();
-    live=false;status='STOPPED';await ledger(context);if(lock) {await lock.close();lock=null;}return true;
+    if(firstPayment)for(const [service,container] of Object.entries(recorded.containers)) {
+      const proof=await containerProof(service,container.id,context,{cleanupOnly:true});
+      if(proof.state.Running||!['exited','created'].includes(proof.state.Status))fail();
+    }
+    await projectProof(context);if(!ownedStartsOnly&&intents.some(value=>value.status!=='ACKNOWLEDGED'))fail();
+    live=false;status='STOPPED';
+    if(requiredTrial)pending=false; // The stopped topology and every runtime acknowledgement were verified.
+    if(startAckUncertain) {
+      // A rejected ACK write may have renamed the ledger. Preserve whichever bytes remain.
+      const owner=lock;lock=null;await owner.close();return true;
+    }
+    await ledger(context);if(lock) {await lock.close();lock=null;}return true;
   }
 
+  const stopOwned=limits=>operation('STOP',limits,stop,{cleanup:true});
+  const stopTrial=limits=>trialStop??=(async()=>{
+    const closing=activeTrialOperation;
+    if(closing){
+      closing.abort();
+      try{await billingBounded(limits,()=>closing.done,20000);}
+      catch{throw fixed('STOP_PENDING');}
+    }
+    return stopOwned(limits);
+  })();
   const capabilities={
     buildOnly:async limits=>{
       if(terminalBuild||busy||pending||status!=='NEW')throw fixed(busy?'OPERATION_BUSY':'BUILD_PENDING');
@@ -677,12 +948,12 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
     verifyForwardTarget:()=>operation('FORWARD',startup,async context=>{if(status!=='PREPARED'&&!live)fail();await sourceIdentity(context);await topology(context,live,!live);
       if(!live) {await sourceGate(context);if(await io.portAvailable(ports.backend,'127.0.0.1',context)!==true)fail();}return true;}),
     persistWebhookSecret:secret=>operation('PERSIST',startup,context=>persist(secret,context)),
-    start:limits=>operation('START',limits,start),verify:limits=>operation('VERIFY',limits,verify),resources,
-    withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',manualPayment&&childLimits!==undefined?childLimits:startup,async context=>{
+    start:limits=>operation('START',limits,start),verify:failedRenewal?verifyFailedRenewal:limits=>operation('VERIFY',limits,verify),resources,
+    withAdminCredentials:(callback,childLimits=undefined)=>operation('ADMIN',(manualPayment||billing)&&childLimits!==undefined?childLimits:startup,async context=>{
       if(typeof callback!=='function'||!live||status!=='LIVE')fail();await verify(context);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({username:admin.username,password:admin.password}));}),context)!==true)fail();return true;
-    },{adminChild:manualPayment&&childLimits!==undefined}),
-    stop:limits=>operation('STOP',limits,stop,{cleanup:true}),
+    },{adminChild:(manualPayment||billing)&&childLimits!==undefined}),
+    stop:drainBeforeStop?stopTrial:stopOwned,
   };
   if(diagnostic) return Object.freeze({prepare:capabilities.prepare,start:capabilities.start,verify:capabilities.verify,resources,
     withAdminCredentials:capabilities.withAdminCredentials,stop:capabilities.stop,
@@ -691,5 +962,13 @@ async function createBootstrap(options,dependencies,diagnostic,manualPayment=fal
       await sourceIdentity(context);await topology(context,live,!live);
       if(await controlled(Promise.resolve().then(()=>{check(context);return callback(providerKeys);}),context)!==true)fail();return true;
     })});
+  if(billing)capabilities.withDatabaseCredentials=(callback,limits)=>operation('ADMIN',limits,async context=>{
+    if(typeof callback!=='function')fail();await verify(context);
+    if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({host:'127.0.0.1',port:ports.postgres,database:'payment',user:'payment',password:inputs.PAYMENT_DB_PASSWORD}));}),context)!==true)fail();return true;
+  },{adminChild:true});
+  if(firstPayment)capabilities.startupDiagnostic=()=>startupCode;
+  if(isolatedPersistence)capabilities.persistenceDiagnostic=()=>persistenceCode;
+  if(failedRenewal||initial3ds)capabilities.persistRefusedStripeOrigin=persistRefusedStripeOrigin;
+  if(firstPayment)capabilities[optionalTrial?'withOptionalTrialRuntime':failedRenewal?'withFailedRenewalRuntime':firstRenewal?'withFirstRenewalRuntime':'withFirstPaymentRuntime']=(callback,limits)=>operation('ADMIN',limits,async context=>{if(typeof callback!=='function'||!controlCapability)fail();await verify(context);if(await controlled(Promise.resolve().then(()=>{check(context);return callback(Object.freeze({endpoint:'http://127.0.0.1:'+options.controlPort,capability:controlCapability}));}),context)!==true)fail();return true;},{adminChild:true});
   return Object.freeze(capabilities);
 }

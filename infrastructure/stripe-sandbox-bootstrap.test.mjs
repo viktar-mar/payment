@@ -129,7 +129,7 @@ function fixture(overrides={}) {
   const options={runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{...PORTS},approvedBinding:{externalAccountId:'acct_1UPiMpELswAd8tpR',apiVersion:'2026-09-30.endive'},env,...overrides};
   function container(service) {
     const helper=service.startsWith('issuer-'),name=PROJECT+'-'+service;
-    const value={Id:id(++serial),Name:'/'+name,Image:images.get(helper?'backend':service),Labels:cLabels(service),
+    const value={...(service==='backend'&&['initial_missed_reordered','initial_required_trial'].includes(options.selectedCase)?{BillingWorkers:true}:{}),Id:id(++serial),Name:'/'+name,Image:images.get(helper?'backend':service),Labels:cLabels(service),
       State:{Status:'created',Running:false,ExitCode:0,StartedAt:'0001-01-01T00:00:00Z',Health:''},Mounts:mounts(service),
       Networks:helper?{none:{NetworkID:''}}:{[PROJECT+'-network']:{NetworkID:network.Id}},PortBindings:mapping(service),Ports:{},
       User:helper?(service==='issuer-installer'?'0:0':'10001:10001'):(service==='backend'?'payment':service==='demo-site'?'101:101':service==='callback-receiver'?'node':''),
@@ -178,7 +178,7 @@ function fixture(overrides={}) {
         if(a.includes('build')) {images.set('backend',image(1));images.set('demo-site',image(2));}
         if(a.includes('config'))stdout=JSON.stringify({services:Object.fromEntries(SERVICES.map(service=>[service,{
           image:service==='backend'?PROJECT+'-backend:latest':service==='demo-site'?PROJECT+'-demo-site:latest':service==='postgres'?'postgres:18-alpine':service==='mailpit'?'axllent/mailpit:v1.27':'node:24-alpine',
-          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false'}:{},
+          container_name:PROJECT+'-'+service,labels:labels('container'),networks:{default:null},environment:service==='backend'?{PAYMENT_STRIPE_SANDBOX_ENABLED:'false',...(['initial_missed_reordered','initial_required_trial'].includes(options.selectedCase)?{SPRING_APPLICATION_JSON:JSON.stringify({'payment.subscriptions.scheduling-enabled':options.selectedCase==='initial_required_trial','payment.inbox.scheduling-enabled':options.selectedCase==='initial_missed_reordered','payment.callbacks.scheduling-enabled':true})}:{}),...(options.env.PAYMENT_STRIPE_BILLING_ACCEPTANCE==='true'?{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly'}:{})}:{},
           ports:Object.entries(mapping(service)).map(([port,binding])=>({target:Number(port.split('/')[0]),published:binding[0].HostPort,host_ip:binding[0].HostIp,protocol:'tcp',mode:'ingress'})),
           volumes:mounts(service).map(m=>({type:m.Type,source:m.Type==='bind'?m.Source:service==='backend'?'owned-issuer':'payment-postgres',target:m.Destination,read_only:!m.RW})),
         }])),networks:{default:{external:true,name:PROJECT+'-network'}},volumes:{'payment-postgres':{external:true,name:PROJECT+'-postgres'},'owned-issuer':{external:true,name:PROJECT+'-issuer'}}});
@@ -1442,4 +1442,1429 @@ test('both opt-ins precede every configuration and dependency getter',async()=>{
     await assert.rejects(createOwnedSandboxBootstrap(options,dependencies),{message:'stripe_sandbox_bootstrap_OPT_IN_REQUIRED'});
     assert.equal(touched,0);
   }
+});
+
+test('Billing bootstrap is inert and keeps a seventh distinct grant key in owned backend only',async()=>{
+  assert.equal(typeof bootstrapModule.createOwnedBillingBootstrap,'function');const f=fixture();
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();assert.equal(f.events.length,0);
+  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+  const data=Object.fromEntries(f.files.get(DIR+'/app.env').contents.toString().trim().split('\n').map(l=>l.split(/=(.*)/s).slice(0,2)));
+  assert.match(data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1,/^[A-Za-z0-9+/]{43}=$/);
+  assert.equal(Object.values(data).filter(v=>v===data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1).length,1);
+  assert.equal(JSON.stringify(b.resources()).includes(data.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1),false);
+  const yaml=f.files.get(DIR+'/owned.yaml').contents.toString();
+  assert.equal((yaml.match(/PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED/g)||[]).length,1);
+  assert.ok(yaml.indexOf('PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED')>yaml.indexOf('  backend:'));
+  assert.ok(yaml.indexOf('PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1')<yaml.indexOf('  demo-site:'));
+  let credentials;assert.equal(await b.withDatabaseCredentials(async value=>{credentials=value;return true;},limits),true);
+  assert.deepEqual(credentials,{host:'127.0.0.1',port:PORTS.postgres,database:'payment',user:'payment',password:data.PAYMENT_DB_PASSWORD});
+  await b.stop(LIMIT());
+});
+
+for(const [selectedCase,flag] of [
+ ['initial_decline_retry','PAYMENT_STRIPE_BILLING_RETRY_SUBNET'],
+ ['initial_3ds','PAYMENT_STRIPE_BILLING_3DS_SUBNET'],
+ ['initial_cancel_withdraw','PAYMENT_STRIPE_BILLING_CANCELLATION_SUBNET'],
+ ['initial_missed_reordered','PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_SUBNET'],
+])for(const matches of [true,false])test('the owned subnet for '+selectedCase+' must match Docker IPAM: '+matches,async()=>{
+ const subnet='10.254.76.0/28',f=fixture();
+ f.options.selectedCase=selectedCase;
+ f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
+  PAYMENT_STRIPE_BILLING_CASE:selectedCase,[flag]:subnet};
+ const execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  if(args[4]==='network'&&args[5]==='inspect'&&args.some(arg=>arg.includes('.IPAM.Config')))
+   return {...result,stdout:JSON.stringify({Config:[{Subnet:matches?subnet:'10.254.76.16/28'}]})};
+  return result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+ if(matches)assert.equal(await bootstrap.prepare(LIMIT()),true);
+ else await assert.rejects(bootstrap.prepare(LIMIT()),/PREPARE_PENDING/);
+ const commands=f.events.filter(e=>e.type==='process'&&e.args[4]==='network'&&e.args[5]==='create');
+ assert.equal(commands.length,1);
+ assert.equal(commands[0].args[commands[0].args.indexOf('--subnet')+1],subnet);
+ if(!matches){
+  assert.equal(bootstrap.resources().network,null);
+  assert.equal(f.containers.size,0);
+  assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.at(-1).status,'DISPATCHING');
+ }
+});
+
+for(const selectedCase of ['initial_success','initial_cancel_withdraw','initial_decline_retry','initial_3ds','initial_missed_reordered','initial_required_trial']){
+ test('each non-clock case selects its reviewed demo build: '+selectedCase,async()=>{
+  const f=fixture();
+  f.options.selectedCase=selectedCase;
+  f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
+    ...(selectedCase==='initial_success'?{}:{PAYMENT_STRIPE_BILLING_CASE:selectedCase}),...(selectedCase==='initial_required_trial'?{PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc'}:{})};
+  const bootstrap=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  await bootstrap.prepare(LIMIT());
+  const builds=f.events.filter(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet'));
+  assert.equal(builds.length,1);
+  const args=builds[0].args.filter(value=>value.startsWith('PAYMENT_DEMO_BUILD_MODE='));
+  if(['initial_missed_reordered','initial_required_trial'].includes(selectedCase)){
+   const yaml=f.files.get(DIR+'/owned.yaml').contents.toString();
+   assert.ok(yaml.includes('"payment.subscriptions.scheduling-enabled":'+(selectedCase==='initial_required_trial')));
+   assert.ok(yaml.includes('"payment.inbox.scheduling-enabled":'+(selectedCase==='initial_missed_reordered')));
+   assert.match(yaml,/"payment.callbacks.scheduling-enabled":true/);
+  }
+  assert.deepEqual(args,['initial_missed_reordered','initial_cancel_withdraw','initial_required_trial'].includes(selectedCase)?['PAYMENT_DEMO_BUILD_MODE=billing-invoice-webhooks']:selectedCase==='initial_3ds'?['PAYMENT_DEMO_BUILD_MODE=billing-initial-3ds']:selectedCase==='initial_decline_retry'?['PAYMENT_DEMO_BUILD_MODE=billing-decline-retry']:[]);
+  await bootstrap.stop(LIMIT());
+ });
+}
+
+test('Billing grant entropy collision fails before owned service creation',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  let n=0;f.dependencies.randomBytes=size=>Buffer.alloc(size,++n===7?1:n);
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(f.containers.size,0);
+});
+test('Billing bootstrap denies renewal of original deadline and restricts DB callback to live proof',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();await b.prepare(limits);
+  await assert.rejects(b.persistWebhookSecret(SECRET).then(()=>b.start({deadline:limits.deadline+1})));assert.equal(b.resources().status,'PENDING');
+});
+test('Billing generated Compose proof rejects grant configuration escaping the backend',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const execute=f.dependencies.execute;f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args.includes('config')&&args.includes('--format')){const c=JSON.parse(r.stdout);c.services['demo-site'].environment.PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1='buildOnly';return {...r,stdout:JSON.stringify(c)};}return r;};
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()),/PREPARE_PENDING/);
+});
+
+for(const interruption of ['before-callback','root-abort','child-deadline'])test('Billing DB credential callback rejects '+interruption+' and cannot accept a late result',async()=>{
+  const f=fixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';
+  const root=new AbortController(),limits={...LIMIT(),signal:root.signal},b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+  let entered,release,calls=0;const waiting=new Promise(resolveEntered=>{entered=resolveEntered;});
+  if(interruption==='before-callback')root.abort();
+  const result=b.withDatabaseCredentials(()=>{calls++;entered();return new Promise(resolveRelease=>{release=resolveRelease;});},{deadline:limits.deadline-1000});
+  const rejected=assert.rejects(result,/ADMIN_PENDING/);
+  if(interruption!=='before-callback'){await waiting;if(interruption==='root-abort')root.abort();else{assert.equal(f.timers.size,1);[...f.timers.values()][0].callback();}}
+  await rejected;assert.equal(calls,interruption==='before-callback'?0:1);assert.equal(b.resources().status,'PENDING');
+  if(release){release(true);await turn();assert.equal(b.resources().status,'PENDING');}
+  const prior=calls;await assert.rejects(b.withDatabaseCredentials(()=>{calls++;return true;},{deadline:limits.deadline-1000}),/ADMIN_PENDING/);assert.equal(calls,prior);
+  assert.equal(await b.stop({deadline:limits.deadline+1000}),true);
+});
+function firstPaymentFixture(backendConfig={}){const f=fixture({env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'},selectedCase:'initial_success',controlPort:18083,frozenTime:1790000000});const execute=f.dependencies.execute;
+f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args.includes('inspect')){const v=JSON.parse(r.stdout);if(args[4]==='image'&&args.at(-1)===PROJECT+'-backend:latest'){v.RuntimeSource=true;v.Entrypoint=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];v.Cmd=null;}if(args[4]==='container'&&v.Name==='/'+PROJECT+'-backend'){v.RuntimeIdentity=true;v.Entrypoint=['java','-Dloader.path=/app/initial-runtime','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime','-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];v.Cmd=null;v.PortBindings['18083/tcp']=[{HostIp:'127.0.0.1',HostPort:'18083'}];if(v.State.Running)v.Ports['18083/tcp']=v.PortBindings['18083/tcp'];}r.stdout=JSON.stringify(v);}if(args.includes('config')&&args.includes('--format')){const v=JSON.parse(r.stdout),b=v.services.backend;b.build={context:ROOT+'/backend',dockerfile:'Dockerfile.billing-first-payment',args:{PAYMENT_RUNTIME_SOURCE_SHA:'e'.repeat(40)}};Object.assign(b,{entrypoint:null,command:null},backendConfig);Object.assign(b.environment,{PAYMENT_STRIPE_BILLING_ACTIONS_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_VERSIONS:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_ACTIVE_KEY_VERSION:'v1',PAYMENT_STRIPE_BILLING_ACTIONS_KEY_V1:'buildOnly',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_RUN_ID:RUN,PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_SOURCE_SHA:'e'.repeat(40),PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_FROZEN_TIME:'1790000000',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_PORT:'18083',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_BIND:'0.0.0.0',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_KEY:'buildOnly'});b.ports.push({target:18083,published:'18083',host_ip:'127.0.0.1',protocol:'tcp'});r.stdout=JSON.stringify(v);}return r;};return f;}
+test('first-payment bootstrap privately binds dedicated source image entrypoint env and seventh port',async()=>{assert.equal(typeof bootstrapModule.createOwnedBillingFirstPaymentBootstrap,'function');const f=firstPaymentFixture(),b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();assert.equal(f.events.length,0);await b.prepare(l);await b.persistWebhookSecret(SECRET);await b.start(l);assert.equal(b.startupDiagnostic(),null);assert.equal(Object.isFrozen(b),true);let privateRuntime;await b.withFirstPaymentRuntime(v=>{privateRuntime=v;return true;},l);assert.match(privateRuntime.capability,/^[A-Za-z0-9_-]{43}$/);assert.equal(privateRuntime.endpoint,'http://127.0.0.1:18083');assert.equal(JSON.stringify(b.resources()).includes(privateRuntime.capability),false);assert.ok(f.events.some(e=>e.type==='port'&&e.port===18083));const yaml=f.files.get(DIR+'/runtime-build.yaml').contents.toString();assert.match(yaml,/Dockerfile.billing-first-payment/);assert.match(yaml,/PAYMENT_RUNTIME_SOURCE_SHA/);assert.ok(f.events.find(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet')).args.includes('PAYMENT_DEMO_BUILD_MODE=billing-first-payment'));assert.ok(f.events.filter(e=>e.type==='process'&&e.args.includes('build')).every(e=>e.args.includes(DIR+'/runtime-build.yaml')));await b.stop(LIMIT());});
+
+test('optional trial bootstrap refuses ignored inputs at the last boundary before build',async()=>{
+ const f=firstPaymentFixture(),prefix='PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL';
+ delete f.options.frozenTime;
+ Object.assign(f.options,{selectedCase:'optional_trial_pause_resume',env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[prefix]:'true',
+  [prefix+'_CLI_PROFILE_RUN_ID']:'22345678-1234-4234-8234-123456789abc',[prefix+'_SUBNET']:'10.94.40.0/28'}});
+ const execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  return args.includes('--others')?{...result,stdout:'examples/demo-site/src/PRIVATE_CANARY.ts\0'}:result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingOptionalTrialBootstrap(f.options,f.dependencies);
+ await assert.rejects(bootstrap.prepare(LIMIT()),{message:'stripe_sandbox_bootstrap_PREPARE_PENDING'});
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('--others')));
+ assert.ok(!f.events.some(e=>e.type==='process'&&e.args.includes('build')));
+ assert.equal(f.containers.size,0);
+ assert.ok(!f.files.has(DIR+'/runtime.json')||!JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.some(i=>i.action==='BUILD'));
+ assert.ok(!JSON.stringify(bootstrap.resources()).includes('PRIVATE_CANARY'));
+});
+
+test('optional trial bootstrap proves its source, topology, runtime worker isolation and exact cleanup',async()=>{
+ const f=firstPaymentFixture(),subnet='10.94.40.0/28',prefix='PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL';
+ delete f.options.frozenTime;
+ Object.assign(f.options,{selectedCase:'optional_trial_pause_resume',env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',[prefix]:'true',
+  [prefix+'_CLI_PROFILE_RUN_ID']:'22345678-1234-4234-8234-123456789abc',[prefix+'_SUBNET']:subnet}});
+ const entry=['java','-Dloader.path=/app/optional-trial-runtime,/app/optional-trial-libs','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingOptionalTrialRuntime',
+  '-cp','/app/app.jar','org.springframework.boot.loader.launch.PropertiesLauncher'];
+ const execute=f.dependencies.execute,workers='{"payment.subscriptions.scheduling-enabled":false,"payment.inbox.scheduling-enabled":false,"payment.callbacks.scheduling-enabled":true}';
+ let hold=false,entered,release;
+ const blocked=new Promise(resolve=>{entered=resolve;});
+ f.dependencies.execute=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  if(hold&&args[5]==='inspect'){
+   hold=false;
+   await new Promise(resolve=>{release=resolve;entered();});
+   assert.equal(settings.signal.aborted,true);
+  }
+  if(args[4]==='network'&&args[5]==='inspect'&&args.some(arg=>arg.includes('.IPAM.Config')))return {...result,stdout:JSON.stringify({Config:[{Subnet:subnet}]})};
+  if(args[5]==='inspect'&&['container','image'].includes(args[4])){
+   const value=JSON.parse(result.stdout);
+   if(value.Entrypoint)value.Entrypoint=entry;
+   return {...result,stdout:JSON.stringify(value)};
+  }
+  if(args.includes('config')&&args.includes('--format')){
+   const value=JSON.parse(result.stdout),backend=value.services.backend;
+   backend.build.dockerfile='Dockerfile.billing-optional-trial';
+   for(const [key,setting] of Object.entries(backend.environment))if(key.startsWith('PAYMENT_STRIPE_BILLING_FIRST_PAYMENT')){
+    delete backend.environment[key];
+    if(!key.endsWith('_FROZEN_TIME'))backend.environment[key.replace('PAYMENT_STRIPE_BILLING_FIRST_PAYMENT',prefix)]=setting;
+   }
+   backend.environment.SPRING_APPLICATION_JSON=workers;
+   return {...result,stdout:JSON.stringify(value)};
+  }
+  return result;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingOptionalTrialBootstrap(f.options,f.dependencies),limits=LIMIT();
+ const previous=Buffer.from(USERBYTES.toString().replace('WEBHOOK_SECRET=', 'WEBHOOK_SECRET=whsec_prior_A001122334455'));
+ f.files.get(USERFILE).contents=previous;
+ await bootstrap.prepare(limits);await bootstrap.persistWebhookSecret(SECRET);await bootstrap.start(limits);
+ assert.deepEqual(f.files.get(USERFILE).contents,previous);
+ assert.match(f.files.get(DIR+'/runtime-build.yaml').contents.toString(),/Dockerfile.billing-optional-trial/);
+ assert.match(f.files.get(DIR+'/owned.yaml').contents.toString(),/127\.0\.0\.1:18083:18083/);
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('PAYMENT_DEMO_BUILD_MODE=billing-optional-trial')));
+ assert.ok(f.events.some(e=>e.type==='process'&&e.args.includes('--subnet')&&e.args.includes(subnet)));
+ assert.ok(f.events.some(e=>e.type==='health'&&e.url==='http://127.0.0.1:18081/healthz'));
+ assert.ok(!f.events.some(e=>e.type==='health'&&e.url==='http://127.0.0.1:18081/health'));
+ assert.ok(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect')
+  .some(e=>e.args.some(arg=>arg.includes(JSON.stringify('SPRING_APPLICATION_JSON='+workers)))));
+ assert.ok(f.events.filter(e=>e.type==='preflight').every(e=>!Object.hasOwn(e.input,'frozenTime')&&e.input.controlPort===18083));
+ const env=f.files.get(DIR+'/final.env').contents.toString();
+ assert.doesNotMatch(env,/PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_(FROZEN_TIME|ACCOUNT_ID)/);
+ assert.match(env,new RegExp('PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+SECRET));
+ let control;
+ await bootstrap.withOptionalTrialRuntime(v=>{control=v;return true;},limits);
+ assert.equal(control.endpoint,'http://127.0.0.1:18083');
+ assert.match(control.capability,/^[A-Za-z0-9_-]{43}$/);
+ assert.equal(JSON.stringify(bootstrap.resources()).includes(control.capability),false);
+ hold=true;
+ const read=assert.rejects(bootstrap.withDatabaseCredentials(()=>assert.fail('no credentials after abort'),limits),/ADMIN_PENDING/);
+ await blocked;
+ const stopping=bootstrap.stop(limits);
+ await turn();
+ assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop').length,0);
+ release();await read;
+ assert.equal(await stopping,true);
+ assert.ok(Object.values(bootstrap.resources().containers).every(container=>container.status==='exited'));
+});
+for(const drift of ['source','entrypoint','environment','port'])test('first-payment bootstrap rejects '+drift+' drift before start',async()=>{assert.equal(typeof bootstrapModule.createOwnedBillingFirstPaymentBootstrap,'function');const f=firstPaymentFixture(),execute=f.dependencies.execute;f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args[4]==='image'&&args[5]==='inspect'&&args.at(-1)===PROJECT+'-backend:latest'){const v=JSON.parse(r.stdout);if(drift==='source')v.RuntimeSource=false;if(drift==='entrypoint')v.Entrypoint=['java','-jar','app.jar'];r.stdout=JSON.stringify(v);}if(args[4]==='container'&&args[5]==='inspect'){const v=JSON.parse(r.stdout);if(v.Name==='/'+PROJECT+'-backend'){if(drift==='environment')v.RuntimeIdentity=false;if(drift==='port')v.PortBindings['18083/tcp'][0].HostIp='0.0.0.0';}r.stdout=JSON.stringify(v);}return r;};const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(f.events.some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start'&&e.args.at(-1)===b.resources().containers.backend?.id),false);});
+
+// Break: inherited null or absent command fields are mistaken for explicit overrides.
+for(const [entrypointName,entrypoint] of [['null',null],['absent',undefined]])for(const [commandName,command] of [['null',null],['absent',undefined]])
+test('first-payment bootstrap prepares inherited '+entrypointName+' entrypoint and '+commandName+' command',async()=>{
+  const f=firstPaymentFixture({entrypoint,command}),b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);
+  assert.equal(await b.prepare(LIMIT()),true);assert.equal(b.resources().status,'PREPARED');
+  assert.equal(f.events.filter(stoppedCompose).length,1);
+  assert.ok(SERVICES.every(service=>b.resources().containers[service]?.status==='created'));
+  const ledger=JSON.parse(f.files.get(DIR+'/runtime.json').contents);
+  assert.equal(ledger.intents.find(intent=>intent.action==='CREATE_STOPPED')?.status,'ACKNOWLEDGED');
+});
+
+// Break: a falsy check or command allowlist admits an explicit override before creation.
+for(const field of ['entrypoint','command'])for(const [name,value] of [
+  ['empty string',''],['nonempty string','java'],['empty array',[]],['nonempty array',['java']],['false',false],['zero',0],['object',{}],
+])test('first-payment bootstrap rejects explicit '+field+' '+name+' before stopped creation',async()=>{
+  const f=firstPaymentFixture({[field]:value}),b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);
+  await rejects(b.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(b.resources().status,'PENDING');
+  assert.equal(f.events.filter(stoppedCompose).length,0);
+  assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.some(intent=>intent.action==='CREATE_STOPPED'),false);
+});
+
+// Break: allowing inherited commands accidentally weakens the exact source/build proof.
+for(const [name,mutate] of [
+  ['context',build=>{build.context=ROOT;}],['Dockerfile',build=>{build.dockerfile='Dockerfile';}],
+  ['source argument',build=>{build.args.PAYMENT_RUNTIME_SOURCE_SHA='f'.repeat(40);}],['extra argument',build=>{build.args.EXTRA='unexpected';}],
+])test('first-payment bootstrap rejects build '+name+' drift before stopped creation',async()=>{
+  const f=firstPaymentFixture(),execute=f.dependencies.execute;
+  f.dependencies.execute=async(...args)=>{const result=await execute(...args);if(args[1].includes('config')&&args[1].includes('--format')){
+    const config=JSON.parse(result.stdout);mutate(config.services.backend.build);result.stdout=JSON.stringify(config);
+  }return result;};
+  const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);
+  await rejects(b.prepare(LIMIT()),'PREPARE_PENDING');assert.equal(f.events.filter(stoppedCompose).length,0);
+  assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents.some(intent=>intent.action==='CREATE_STOPPED'),false);
+});
+
+const stopCalls=f=>f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop');
+async function firstPaymentFailedStart(state='unhealthy',configure=()=>{}){
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{const result=await execute(file,args,settings);if(args[4]==='container'&&args[5]==='start'){
+  const container=f.containers.get(args.at(-1));if(container.Name==='/'+PROJECT+'-backend')container.State=state==='exited'?{...container.State,Status:'exited',Running:false,ExitCode:1,Health:''}:{...container.State,Health:'unhealthy'};
+ }return result;};
+ configure(f);f.adapter=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);await f.adapter.persistWebhookSecret(SECRET);await rejects(f.adapter.start(f.limits),'START_PENDING');return f;
+}
+// Break: historical START uncertainty must remain, but cannot negate fresh stopped proof.
+for(const state of ['unhealthy','exited'])test('first-payment '+state+' startup stops exact owned IDs and retains original pending START',async()=>{
+ const f=await firstPaymentFailedStart(state),before=f.adapter.resources(),original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+ assert.deepEqual(original.at(-1),{action:'START_SERVICE',name:before.containers.backend.id,status:'DISPATCHING'});
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);
+ assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);assert.equal(JSON.parse(f.files.get(DIR+'/runtime.json').contents).status,'PENDING');assert.equal(f.adapter.resources().status,'PENDING');
+ const expected=['mailpit','postgres',...(state==='unhealthy'?['backend']:[])].map(s=>before.containers[s].id).sort();assert.deepEqual(stopCalls(f).map(e=>e.args.at(-1)).sort(),expected);
+ assert.equal(new Set(stopCalls(f).map(e=>e.args.at(-1))).size,expected.length);assert.ok([...f.containers.values()].every(c=>c.State.Running===false));
+ const n=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.verify(f.limits),'VERIFY_PENDING');assert.equal(f.events.length,n);
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(stopCalls(f).length,expected.length);assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);
+});
+for(const [name,mutate]of [
+ ['foreign identity',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Labels['payment.sandbox.run']='foreign';}],
+ ['replacement ID',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Id=id(999);}],
+ ['image drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Image=image(999);}],
+ ['network drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Networks[PROJECT+'-network'].NetworkID=id(999);}],
+ ['extra resource',f=>{f.containers.set(id(999),{Id:id(999)});}],
+])test('first-payment pending START refuses '+name+' before stopping anything',async()=>{
+ const f=await firstPaymentFailedStart();mutate(f);await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(stopCalls(f).length,0);
+});
+test('first-payment stop ignores bounded unexpected stdout without duplicate dispatch',async()=>{
+ const f=await firstPaymentFailedStart('unhealthy',f=>{const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return args[1][5]==='stop'?{stdout:'unexpected bounded acknowledgement',stderr:''}:r;};});
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(stopCalls(f).length,3);assert.equal(new Set(stopCalls(f).map(e=>e.args.at(-1))).size,3);
+});
+test('first-payment successful stop stdout cannot replace actual nonrunning proof',async()=>{
+ const f=await firstPaymentFailedStart('unhealthy',f=>{const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='stop'){const c=f.containers.get(args[1].at(-1));c.State={...c.State,Running:true,Status:'running'};return {stdout:c.Id,stderr:''};}return r;};});
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(stopCalls(f).length,1);
+});
+for(const phase of ['initial','replacement'])for(const dispatched of [false,true])test('first-payment uncertain '+phase+' creation '+dispatched+' stops nothing and never adopts',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{if(stoppedCompose({type:'process',args})&&args.includes(DIR+(phase==='initial'?'/app.env':'/final.env'))){if(dispatched)await execute(file,args,settings);else f.events.push({type:'process',file,args,settings});throw null;}return execute(file,args,settings);};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();
+ if(phase==='initial')await rejects(b.prepare(l),'PREPARE_PENDING');else{await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');}
+ const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+ assert.equal(original.at(-1).action,phase==='initial'?'CREATE_STOPPED':'CREATE_FINAL_BACKEND');assert.equal(original.at(-1).status,'DISPATCHING');
+ await rejects(b.stop({deadline:l.deadline+120000}),'STOP_PENDING');assert.equal(stopCalls(f).length,0);assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);
+ const n=f.events.length;await rejects(b.start(l),'START_PENDING');await rejects(b.verify(l),'VERIFY_PENDING');assert.equal(f.events.length,n);
+});
+test('first-payment final proof refuses a previously stopped container running again',async()=>{
+ const f=await firstPaymentFailedStart('unhealthy',f=>{const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='stop'&&f.containers.get(args[1].at(-1)).Name==='/'+PROJECT+'-postgres'){
+  const backend=[...f.containers.values()].find(c=>c.Name==='/'+PROJECT+'-backend');backend.State={...backend.State,Running:true,Status:'running'};
+ }return r;};});
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(stopCalls(f).length,3);assert.equal(f.adapter.resources().status,'PENDING');
+});
+for(const mode of ['sandbox','billing','manual','diagnostic'])test(mode+' startup uncertainty retains previous cleanup refusal',async()=>{
+ const f=fixture();let create=bootstrapModule.createOwnedSandboxBootstrap;
+ if(mode==='billing'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';create=bootstrapModule.createOwnedBillingBootstrap;}
+ if(mode==='manual'){f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;create=bootstrapModule.createOwnedManualPaymentBootstrap;}
+ if(mode==='diagnostic'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};delete f.options.approvedBinding;create=bootstrapModule.createOwnedFormDiagnosticBootstrap;}
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c.Name==='/'+PROJECT+'-backend'){c.State.Health='unhealthy';c.BackendHealthFailure='HTTP_UNAVAILABLE';}}return r;};
+ const b=await create(f.options,f.dependencies),l=LIMIT();assert.equal(b.startupDiagnostic,undefined);await b.prepare(l);if(mode!=='diagnostic')await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
+ const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;await rejects(b.stop({deadline:l.deadline+120000}),'STOP_PENDING');assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);assert.equal(b.resources().status,'PENDING');
+});
+
+// Task3 mutation target: losing the first trusted START boundary through operation/cleanup.
+const firstPaymentStarts=f=>f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='start'&&SERVICES.some(s=>f.containers.get(e.args.at(-1))?.Name==='/'+PROJECT+'-'+s));
+for(const [kind,expected]of [
+ ['foreign','START_BACKEND_COMMAND_REJECTED'],['nonzero','START_BACKEND_COMMAND_NONZERO_EXIT'],['output','START_BACKEND_COMMAND_OUTPUT_LIMIT'],['spawn','START_BACKEND_COMMAND_SPAWN_FAILURE'],
+ ['unhealthy','START_BACKEND_HEALTH_UNHEALTHY'],['exited','START_BACKEND_HEALTH_NOT_RUNNING'],['detached','START_BACKEND_HEALTH_PROOF_REJECTED'],['ownership','START_BACKEND_HEALTH_PROOF_REJECTED'],
+ ['public','START_BACKEND_PUBLIC_HEALTH_REJECTED'],['deadline','START_BACKEND_COMMAND_TIMEOUT'],['abort','START_BACKEND_COMMAND_ABORT'],
+])test('startup diagnostic real bootstrap '+kind,async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,controller=new AbortController();let reads=0,time=1000;
+ f.dependencies.now=()=>time;
+ const inject=async(file,args,settings)=>{
+  const result=await execute(file,args,settings);
+  const c=f.containers.get(args.at(-1)),backend=args[4]==='container'&&args[5]==='start'&&c?.Name==='/'+PROJECT+'-backend';
+  if(backend){
+   if(kind==='foreign')throw new Proxy({category:'NONZERO_EXIT',code:137},{get(){reads++;throw null;},getPrototypeOf(){reads++;throw null;}});
+   if(kind==='output')return {stdout:'x'.repeat(65537),stderr:''};
+   if(kind==='unhealthy')c.State.Health='unhealthy';
+   if(kind==='exited'||kind==='detached'){c.State={...c.State,Running:false,Status:'exited',Health:'',ExitCode:137};if(kind==='detached')c.Networks[PROJECT+'-network'].NetworkID='';}
+   if(kind==='ownership')c.Labels['payment.sandbox.run']='foreign';
+   if(kind==='deadline')time=121000;
+   if(kind==='abort')controller.abort();
+  }
+  return result;
+ };
+ if(['nonzero','spawn'].includes(kind)){
+  delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,settings,done)=>{
+   const c=f.containers.get(args.at(-1)),backend=args[4]==='container'&&args[5]==='start'&&c?.Name==='/'+PROJECT+'-backend';
+   if(backend&&kind==='spawn')throw {code:'ENOENT'};
+   const child=new EventEmitter();queueMicrotask(async()=>{try{const result=await inject(file,args,settings);done(backend?{code:137}:null,result.stdout,result.stderr);child.emit('close',backend?137:0,null);}catch(error){done(error,'','');child.emit('close',1,null);}});return child;
+  };
+ }else f.dependencies.execute=inject;
+ if(kind==='public')f.dependencies.health=async url=>!url.includes(':18080/');
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l={deadline:121000,signal:controller.signal};
+ await b.prepare(l);await b.persistWebhookSecret(SECRET);
+ if(typeof b.startupDiagnostic==='function')assert.equal(b.startupDiagnostic(),null);
+ await rejects(b.start(l),'START_PENDING');assert.equal(b.startupDiagnostic?.(),expected);assert.equal(reads,0);
+ const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+ assert.equal(original.at(-1).status,kind==='public'?'ACKNOWLEDGED':'DISPATCHING');
+ if(kind!=='public')assert.ok(!firstPaymentStarts(f).some(e=>['demo-site','callback-receiver'].some(s=>f.containers.get(e.args.at(-1))?.Name==='/'+PROJECT+'-'+s)));
+ const n=f.events.length;await rejects(b.start(l),'START_PENDING');await rejects(b.verify(l),'VERIFY_PENDING');assert.equal(f.events.length,n);assert.equal(b.startupDiagnostic(),expected);
+ try{await b.stop({deadline:241000});}catch{}
+ assert.equal(b.startupDiagnostic(),expected);assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);
+ assert.equal(b.resources().status,'PENDING');
+});
+test('startup diagnostic reaches real owner terminal formatter before actual cleanup',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;let listenerStops=0,late=0;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend')c.State.Health='unhealthy';}return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFirstPayment,formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const owner=await createOwnedBillingFirstPayment(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{listenerStops++;assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_UNHEALTHY');return true;}}),login:async()=>true,createRuntime:async()=>{late++;throw null;},createFixture:async()=>{late++;throw null;}});
+ await assert.rejects(owner.run(async()=>{late++;},LIMIT()));const r=await owner.close();
+ assert.equal(r.phase,'START');assert.equal(r.code,'START');assert.equal(r.diagnostic,'START_BACKEND_HEALTH_UNHEALTHY');assert.equal(r.cleanupConfirmed,true);assert.equal(r.initialAccepted,false);assert.equal(late,0);assert.equal(listenerStops,1);
+ const line=formatBillingFirstPaymentDiagnostic(r);assert.equal(line,'owned_initial_payment_diagnostic code=START_BACKEND_HEALTH_UNHEALTHY cleanup=CONFIRMED');assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);
+});
+
+// Break: sleep rejects an opaque null, so only the controlled signal can identify abort.
+test('startup diagnostic health wait abort keeps controlled boundary',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,controller=new AbortController(),schedule=f.dependencies.setTimeout;
+ f.dependencies.now=()=>1000;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend')c.State.Health='starting';}return r;};
+ f.dependencies.setTimeout=(callback,ms)=>{const id=schedule(callback,ms);if(ms===1000)queueMicrotask(()=>controller.abort());return id;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l={deadline:121000,signal:controller.signal};await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
+ assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_WAIT_ABORT');assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1)).Name.endsWith('-demo-site')));
+ await b.stop({deadline:241000});assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_WAIT_ABORT');
+});
+
+for(const kind of ['clock','timer'])test('startup diagnostic health wait '+kind+' deadline uses controlled time',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout;let time=1000;
+ f.dependencies.now=()=>time;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend')c.State.Health='starting';}return r;};
+ f.dependencies.setTimeout=(callback,ms)=>{const id=schedule(callback,ms);if(ms===1000)queueMicrotask(()=>{time=121000;if(kind==='clock')callback();else [...f.timers.values()].find(timer=>timer.ms===120000).callback();});return id;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l={deadline:121000};await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
+ assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_WAIT_TIMEOUT');await b.stop({deadline:241000});assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_WAIT_TIMEOUT');
+});
+for(const service of ['postgres','mailpit','demo-site','callback-receiver'])test('startup diagnostic fixed service '+service+' from owned projection',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-'+service){c.State.Health='unhealthy';c.BackendHealthFailure='HTTP_UNAVAILABLE';}}return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');
+ const code='START_'+service.toUpperCase().replaceAll('-','_')+'_HEALTH_UNHEALTHY';assert.equal(b.startupDiagnostic(),code);
+ const {formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');const line=formatBillingFirstPaymentDiagnostic({status:'CLOSED',initialAccepted:false,code:'START',diagnostic:code,cleanupConfirmed:false});assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.includes(code));
+ await b.stop({deadline:l.deadline+120000});assert.equal(b.startupDiagnostic(),code);
+});
+
+test('startup diagnostic unknown health data never becomes known UNHEALTHY',async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend')c.State.Health='private-sentinel';}return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();await b.prepare(l);await b.persistWebhookSecret(SECRET);await rejects(b.start(l),'START_PENDING');assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_REJECTED');
+ await b.stop({deadline:l.deadline+120000});assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_REJECTED');
+});
+
+// Fix1 break: the owner's stopped race can win before the actual bootstrap catch.
+for(const kind of ['external-health','deadline-health','timer-health','external-command'])test('startup diagnostic actual owner control interruption '+kind,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout,controller=new AbortController();let entered,release,late=0,atCleanup=null,errorReads=0;
+ const entry=new Promise(r=>entered=r);f.dependencies.now=()=>Date.now();
+ f.dependencies.execute=async(...args)=>{
+  const result=await execute(...args);
+  if(args[1][5]==='start'){const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend'){
+   if(kind==='external-command'){entered();return new Promise((_resolve,reject)=>release=()=>reject(new Proxy({category:'NONZERO_EXIT'},{get(){errorReads++;throw null;}})));}
+   c.State.Health='starting';
+  }}return result;
+ };
+ f.dependencies.setTimeout=(callback,ms)=>{const id=schedule(callback,ms);if(ms===1000)entered();return id;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFirstPayment,formatBillingFirstPaymentDiagnostic,parseBillingFirstPaymentDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const owner=await createOwnedBillingFirstPayment(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{atCleanup=b.startupDiagnostic();return true;}}),login:async()=>true,createRuntime:async()=>{late++;throw null;},createFixture:async()=>{late++;throw null;}});
+ const running=owner.run(async()=>{late++;},{deadline:121000,signal:controller.signal}),rejected=assert.rejects(running);
+ await entry;const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+ assert.equal(original.at(-1).action,'START_SERVICE');assert.equal(original.at(-1).status,'DISPATCHING');
+ if(kind==='deadline-health')t.mock.timers.tick(120000);
+ else if(kind==='timer-health')[...f.timers.values()].find(timer=>timer.ms===120000).callback();
+ else controller.abort();
+ if(release){
+  await turn();const beforeRelease={status:owner.resources().status,stops:stopCalls(f).length};
+  t.mock.timers.tick(1000);release();await rejected;
+  assert.deepEqual(beforeRelease,{status:'RUNNING',stops:0});assert.equal(owner.resources().cleanupConfirmed,true);
+ }else await rejected;
+ const checkpoint=kind==='external-command'?'COMMAND':'HEALTH_WAIT',category=kind==='timer-health'?'TIMEOUT':'ABORT',code='START_BACKEND_'+checkpoint+'_'+category;
+ const first=owner.resources(),firstDiagnostic=first.diagnostic;
+ await turn();await turn();
+ assert.equal(b.startupDiagnostic(),code);assert.equal(b.resources().status,'PENDING');
+ assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);
+ const final=await owner.close();assert.equal(final.code,kind==='timer-health'?'START':'ABORTED');assert.equal(final.phase,'START');assert.equal(final.initialAccepted,false);assert.equal(final.diagnostic,firstDiagnostic);assert.equal(late,0);assert.equal(errorReads,0);
+ assert.ok(!firstPaymentStarts(f).some(e=>['demo-site','callback-receiver'].some(s=>f.containers.get(e.args.at(-1))?.Name==='/'+PROJECT+'-'+s)));
+ const n=f.events.length;await rejects(b.start({deadline:121000}),'START_PENDING');await rejects(b.verify({deadline:121000}),'VERIFY_PENDING');assert.equal(f.events.length,n);
+ assert.equal(atCleanup,code);assert.equal(firstDiagnostic,code);
+ const line=formatBillingFirstPaymentDiagnostic(final);assert.equal(line,'owned_initial_payment_diagnostic code='+code+' cleanup='+(final.cleanupConfirmed?'CONFIRMED':'UNCONFIRMED'));assert.equal(parseBillingFirstPaymentDiagnosticLine(line),line);assert.ok(line.length<=160);
+});
+
+function firstRenewalFixture(){
+ const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'};f.options.selectedCase='initial_and_first_renewal';
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FIRST_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFirstRenewalRuntime').replaceAll('/app/initial-runtime','/app/renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-first-renewal')};};return f;
+}
+
+// Break: local timer cancellation loses TIMEOUT or releases START before native close.
+for(const renewal of [false,true])for(const checkpoint of ['health-wait','native-command'])test('dedicated startup local timer owner '+(renewal?'renewal ':'payment ')+checkpoint,async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout,external=new AbortController();
+ let entered,releaseClose,childSignal,childCallback,late=0,listenerStops=0,completed=false;
+ const entry=new Promise(resolve=>entered=resolve);f.dependencies.now=()=>Date.now();
+ f.dependencies.setTimeout=(callback,ms)=>{const key=schedule(callback,ms);if(ms===300000)childCallback=callback;if(ms===1000)entered();return key;};
+ delete f.dependencies.execute;
+ f.dependencies.execFile=(file,args,settings,done)=>{
+  const child=new EventEmitter();queueMicrotask(async()=>{
+   try{
+    const result=await execute(file,args,settings);
+    if(args[4]==='container'&&args[5]==='start'&&f.containers.get(args.at(-1))?.Name==='/'+PROJECT+'-backend'){
+     childSignal=settings.signal;
+     if(checkpoint==='native-command'){
+      settings.signal.addEventListener('abort',()=>{done({code:'ABORT_ERR'},'','');releaseClose=()=>child.emit('close',null,'SIGTERM');},{once:true});entered();return;
+     }
+     f.containers.get(args.at(-1)).State.Health='starting';
+    }
+    done(null,result.stdout,result.stderr);child.emit('close',0,null);
+   }catch(error){done(error,'','');child.emit('close',1,null);}
+  });return child;
+ };
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies),api=await import('./stripe-billing-first-payment.mjs');
+ const code='START_BACKEND_'+(checkpoint==='health-wait'?'HEALTH_WAIT':'COMMAND')+'_TIMEOUT';
+ const owner=await (renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment)(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{listenerStops++;assert.equal(b.startupDiagnostic(),code);return true;}}),login:async()=>true,createRuntime:()=>{late++;throw null;},createFixture:()=>{late++;throw null;}});
+ const running=owner.run(()=>{late++;},{deadline:601000,signal:external.signal});running.then(()=>{completed=true;},()=>{completed=true;});const rejected=assert.rejects(running);
+ await entry;
+ // A broken implementation still terminates deterministically through parent abort.
+ const hadLocalTimer=typeof childCallback==='function';if(hadLocalTimer)childCallback();else external.abort();
+ if(checkpoint==='native-command'){
+  await turn();const beforeClose={completed,listenerStops,stops:stopCalls(f).length,status:owner.resources().status};
+  assert.deepEqual(beforeClose,{completed:false,listenerStops:0,stops:0,status:'RUNNING'});
+  external.abort();releaseClose();
+ }
+ await rejected;const result=await owner.close();
+ assert.equal(hadLocalTimer,true);assert.equal(childSignal.aborted,true);assert.equal(result.diagnostic,code);assert.equal(result.phase,'START');assert.equal(result.initialAccepted,false);assert.equal(result.cleanupConfirmed,true);assert.equal(listenerStops,1);assert.equal(late,0);
+ assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1))?.Name.endsWith('-demo-site')));
+ assert.equal(f.timers.size,0);const count=f.events.length;childCallback();assert.equal(f.events.length,count);assert.equal(b.startupDiagnostic(),code);assert.equal(f.timers.size,0);
+});
+
+// Break: leaked/stale child authority affects subsequent services or overwrites failure.
+for(const boundary of ['success','setup','command','health-proof','final-live-proof'])test('dedicated startup scope cleanup '+boundary,async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout,signals=new Map();let saved,backendStarted=false,backendInspects=0;
+ f.dependencies.now=()=>1000;
+ f.dependencies.setTimeout=(callback,ms)=>{if(ms===300000){saved=callback;if(boundary==='setup')throw null;}return schedule(callback,ms);};
+ f.dependencies.execute=async(...args)=>{
+  const r=await execute(...args),c=f.containers.get(args[1].at(-1));
+  if(args[1][4]==='container'&&args[1][5]==='start'){
+   const service=SERVICES.find(service=>c?.Name==='/'+PROJECT+'-'+service);if(service)signals.set(service,args[2].signal);
+   if(service==='backend'){backendStarted=true;if(boundary==='command')throw null;}
+  }
+  if(backendStarted&&args[1][4]==='container'&&args[1][5]==='inspect'){
+   const value=JSON.parse(r.stdout);
+   if(value.Name==='/'+PROJECT+'-backend'){
+    backendInspects++;
+    if(boundary==='health-proof'&&backendInspects===1||boundary==='final-live-proof'&&backendInspects===2){value.RuntimeIdentity=false;r.stdout=JSON.stringify(value);}
+   }
+  }return r;
+ };
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),limits={deadline:601000};await b.prepare(limits);await b.persistWebhookSecret(SECRET);
+ if(boundary==='success'){
+  await b.start(limits);assert.notEqual(signals.get('backend'),signals.get('postgres'));assert.equal(signals.get('demo-site'),signals.get('postgres'));
+ }else await rejects(b.start(limits),'START_PENDING');
+ const diagnostic=b.startupDiagnostic(),events=f.events.length;assert.equal(f.timers.size,0);saved();
+ assert.equal(f.events.length,events);assert.equal(f.timers.size,0);assert.equal(b.startupDiagnostic(),diagnostic);assert.equal(signals.get('backend')?.aborted??false,false);
+ if(boundary==='success'){assert.equal(diagnostic,null);assert.equal(await b.verify(limits),true);}
+ await b.stop({deadline:721000});assert.equal(f.timers.size,0);
+});
+
+// Break: applying the new dedicated policy to unrelated bootstrap modes.
+for(const mode of ['generic','diagnostic','manual','billing'])test('dedicated startup budget isolation '+mode,async()=>{
+ const f=fixture(),schedule=f.dependencies.setTimeout;let childTimers=0,create=createOwnedSandboxBootstrap;
+ f.dependencies.now=()=>1000;f.dependencies.setTimeout=(callback,ms)=>{if(ms===300000)childTimers++;return schedule(callback,ms);};
+ if(mode==='diagnostic'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_SANDBOX_FORM_DIAGNOSTIC:'true',PAYMENT_STRIPE_SANDBOX_ALLOW_PREPARE_ONLY:'true'};create=bootstrapModule.createOwnedFormDiagnosticBootstrap;}
+ if(mode==='manual'){f.options.env.PAYMENT_STRIPE_SANDBOX_MANUAL_PAYMENT='true';f.options.manualPort=18083;delete f.options.approvedBinding;create=bootstrapModule.createOwnedManualPaymentBootstrap;}
+ if(mode==='billing'){f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'};f.options.selectedCase='initial_success';create=bootstrapModule.createOwnedBillingBootstrap;}
+ const b=await create(f.options,f.dependencies),limits={deadline:601000};await b.prepare(limits);
+ if(mode!=='diagnostic')await b.persistWebhookSecret(SECRET);
+ assert.equal(await b.start(limits),true);assert.equal(childTimers,0);assert.equal(f.timers.size,0);await b.stop({deadline:721000});
+});
+
+// Break: missing, renewed, or command-exclusive dedicated startup authority.
+for(const renewal of [false,true])for(const scenario of ['slow-ready','always-starting','short-parent','command-consumes-budget','late-healthy'])test('dedicated startup budget '+(renewal?'renewal ':'payment ')+scenario,async()=>{
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute,schedule=f.dependencies.setTimeout;
+ let time=1000,backendStarted=false,startTime,backendSignal;
+ const parentDeadline=scenario==='short-parent'?121000:601000;
+ f.dependencies.now=()=>time;
+ f.dependencies.execute=async(...args)=>{
+  const result=await execute(...args),c=f.containers.get(args[1].at(-1));
+  if(args[1][4]==='container'&&args[1][5]==='start'&&c?.Name==='/'+PROJECT+'-backend'){
+   backendStarted=true;startTime=time;backendSignal=args[2].signal;c.State.Health='starting';
+   if(scenario==='command-consumes-budget')time+=240000;
+  }
+  if(backendStarted&&args[1][4]==='container'&&args[1][5]==='inspect'){
+   const value=JSON.parse(result.stdout);
+   if(value.Name==='/'+PROJECT+'-backend'&&scenario==='late-healthy'&&time>=241000){time=301000;value.State.Health='healthy';result.stdout=JSON.stringify(value);}
+  }
+  return result;
+ };
+ f.dependencies.setTimeout=(callback,ms)=>{
+  const key=schedule(callback,ms);
+  if(ms===1000)queueMicrotask(()=>{
+   f.timers.delete(key);time+=60000;
+   const c=[...f.containers.values()].find(c=>c.Name==='/'+PROJECT+'-backend');
+   if(scenario==='slow-ready'&&time>=241000)c.State.Health='healthy';
+   // Give a broken unbounded implementation a finite synthetic escape.
+   if(time>=361000)c.State.Health='healthy';
+   callback();
+  });return key;
+ };
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies),limits={deadline:parentDeadline};
+ await b.prepare(limits);await b.persistWebhookSecret(SECRET);
+ if(scenario==='slow-ready'){
+  assert.equal(await b.start(limits),true);assert.equal(time-startTime,240000);assert.equal(b.resources().status,'LIVE');assert.equal(b.startupDiagnostic(),null);
+  assert.equal(f.events.filter(e=>e.type==='health').length,3);
+ }else{
+  await rejects(b.start(limits),'START_PENDING');assert.match(b.startupDiagnostic(),/^START_BACKEND_.*_TIMEOUT$/);
+  assert.equal(time,scenario==='short-parent'?121000:301000);
+  assert.equal(f.events.filter(e=>e.type==='health').length,0);
+  assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1))?.Name.endsWith('-demo-site')));
+  const n=f.events.length;await rejects(b.start(limits),'START_PENDING');await rejects(b.verify(limits),'VERIFY_PENDING');assert.equal(f.events.length,n);
+ }
+ assert.equal(f.timers.size,0);await b.stop({deadline:parentDeadline+120000});assert.equal(f.timers.size,0);
+ assert.equal(backendSignal.aborted,false,'clock expiry alone does not fabricate a timer callback');
+});
+// Break: proved dedicated failure hints are lost before the real owner closes.
+for(const renewal of [false,true])for(const [hint,suffix] of [
+ ['HTTP_UNAVAILABLE','_HTTP_UNAVAILABLE'],['HTTP_REJECTED','_HTTP_REJECTED'],['HTTP_ERROR','_HTTP_ERROR'],
+ ['CONNECTION_FAILED','_CONNECTION_FAILED'],['PROBE_TIMEOUT','_PROBE_TIMEOUT'],['UNAVAILABLE',''],
+ [undefined,''],['HTTP_503',''],['private-health-sentinel',''],[{Output:'private-health-sentinel'},''],
+])test('dedicated backend unhealthy owner '+(renewal?'renewal ':'payment ')+String(hint),async()=>{
+ const f=renewal?firstRenewalFixture():firstPaymentFixture(),execute=f.dependencies.execute;let startedAt,late=0;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){
+  const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend'){c.State.Health='unhealthy';c.BackendHealthFailure=hint;startedAt=f.events.length;}
+ }return r;};
+ const b=await (renewal?bootstrapModule.createOwnedBillingFirstRenewalBootstrap:bootstrapModule.createOwnedBillingFirstPaymentBootstrap)(f.options,f.dependencies);
+ const api=await import('./stripe-billing-first-payment.mjs'),code='START_BACKEND_HEALTH_UNHEALTHY'+suffix;
+ const owner=await (renewal?api.createOwnedBillingFirstRenewal:api.createOwnedBillingFirstPayment)(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{
+  assert.equal(b.startupDiagnostic(),code);
+  assert.equal(f.events.slice(startedAt).filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect').length,1,'no new inspect request for diagnostic');return true;
+ }}),login:async()=>true,createRuntime:async()=>{late++;throw null;},createFixture:async()=>{late++;throw null;}});
+ await assert.rejects(owner.run(async()=>{late++;},LIMIT()));const r=await owner.close();
+ assert.equal(r.phase,'START');assert.equal(r.code,'START');assert.equal(r.diagnostic,code);assert.equal(r.cleanupConfirmed,true);assert.equal(r.initialAccepted,false);assert.equal(r.full5bAccepted,false);if(renewal)assert.equal(r.renewalAccepted,false);assert.equal(late,0);
+ const format=renewal?api.formatBillingFirstRenewalDiagnostic:api.formatBillingFirstPaymentDiagnostic,parse=renewal?api.parseBillingFirstRenewalDiagnosticLine:api.parseBillingFirstPaymentDiagnosticLine;
+ const line=format(r);assert.equal(line,(renewal?'owned_initial_and_first_renewal_diagnostic':'owned_initial_payment_diagnostic')+' code='+code+' cleanup=CONFIRMED');assert.equal(parse(line),line);assert.ok(line.length<=160);assert.equal(line.includes('private-health-sentinel'),false);
+});
+// Break: unproved hints override ownership/runtime rejection or healthy acceptance.
+for(const kind of ['ownership','runtime','healthy'])test('backend hint cannot override '+kind,async()=>{
+ const f=firstPaymentFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(...args)=>{const r=await execute(...args);if(args[1][5]==='start'){
+  const c=f.containers.get(args[1].at(-1));if(c?.Name==='/'+PROJECT+'-backend'){c.BackendHealthFailure='HTTP_UNAVAILABLE';if(kind!=='healthy')c.State.Health='unhealthy';if(kind==='ownership')c.Labels['payment.sandbox.run']='foreign';}
+ }if(kind==='runtime'&&args[1][4]==='container'&&args[1][5]==='inspect'){
+  const c=JSON.parse(r.stdout);if(c.Name==='/'+PROJECT+'-backend'&&c.State.Running){c.RuntimeIdentity=false;r.stdout=JSON.stringify(c);}
+ }return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,f.dependencies),l=LIMIT();await b.prepare(l);await b.persistWebhookSecret(SECRET);
+ if(kind==='healthy'){assert.equal(await b.start(l),true);assert.equal(b.startupDiagnostic(),null);await b.stop(LIMIT());}
+ else{await rejects(b.start(l),'START_PENDING');assert.equal(b.startupDiagnostic(),'START_BACKEND_HEALTH_PROOF_REJECTED');}
+});
+test('backend terminal diagnostics reject arbitrary and inconsistent suffixes',async()=>{
+ const api=await import('./stripe-billing-first-payment.mjs');
+ for(const suffix of ['HTTP_503','HTTP_UNAVAILABLE_private','UNAVAILABLE','503','HTTP_ERROR\n','CONNECTION_FAILED body'])for(const renewal of [false,true]){
+  const code='START_BACKEND_HEALTH_UNHEALTHY_'+suffix,prefix=renewal?'owned_initial_and_first_renewal_diagnostic':'owned_initial_payment_diagnostic';
+  assert.equal((renewal?api.parseBillingFirstRenewalDiagnosticLine:api.parseBillingFirstPaymentDiagnosticLine)(prefix+' code='+code+' cleanup=CONFIRMED'),null);
+  assert.equal((renewal?api.formatBillingFirstRenewalDiagnostic:api.formatBillingFirstPaymentDiagnostic)({status:'CLOSED',code:'START',initialAccepted:false,diagnostic:code,cleanupConfirmed:true}),null);
+ }
+});
+for(const drift of [false,true])test('demo-site HEALTH_PROOF native inspect timeout waits for close and '+(drift?'refuses ownership drift':'stops only exact owned IDs'),async t=>{
+ t.mock.timers.enable({apis:['Date','setTimeout'],now:1000});
+ const f=firstRenewalFixture(),execute=f.dependencies.execute;let demoStarted=false,injected=false,releaseClose,callbackReached,listenerStops=0,late=0,completed=false;
+ const callback=new Promise(r=>callbackReached=r);f.dependencies.now=()=>Date.now();delete f.dependencies.execute;
+ f.dependencies.execFile=(file,args,settings,done)=>{
+  const child=new EventEmitter();
+  if(demoStarted&&!injected&&args[4]==='network'&&args[5]==='inspect'){
+   injected=true;
+   queueMicrotask(()=>{
+    assert.equal(settings.timeout,10000);assert.equal(settings.signal.aborted,false);assert.ok(Date.now()<121000);
+    done({killed:true,signal:'SIGTERM'},'','');releaseClose=()=>child.emit('close',null,'SIGTERM');callbackReached();
+   });
+  }else queueMicrotask(async()=>{
+   try{
+    const result=await execute(file,args,settings);
+    if(args[4]==='container'&&args[5]==='start'&&f.containers.get(args.at(-1))?.Name==='/'+PROJECT+'-demo-site')demoStarted=true;
+    done(null,result.stdout,result.stderr);child.emit('close',0,null);
+   }catch(error){done(error,'','');child.emit('close',1,null);}
+  });
+  return child;
+ };
+ const b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFirstRenewal,formatBillingFirstRenewalDiagnostic}=await import('./stripe-billing-first-payment.mjs');
+ const owner=await createOwnedBillingFirstRenewal(f.options,{preflight:async()=>true,createBootstrap:async()=>b,createCli:async()=>({validateBinding:async()=>true,startListener:async()=>{await b.persistWebhookSecret(SECRET);return true;},stopListener:async()=>{listenerStops++;return true;}}),login:async()=>true,createRuntime:()=>{late++;throw null;},createFixture:()=>{late++;throw null;}});
+ const running=owner.run(()=>{late++;},{deadline:121000});running.then(()=>{completed=true;},()=>{completed=true;});const rejected=assert.rejects(running,/billing_START/);
+ await callback;await turn();
+ const original=JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,owned=Object.values(b.resources().containers).map(c=>c.id),started=firstPaymentStarts(f).map(e=>e.args.at(-1));
+ assert.equal(original.at(-1).action,'START_SERVICE');assert.equal(original.at(-1).status,'DISPATCHING');
+ assert.equal(started.length,4);assert.ok(!firstPaymentStarts(f).some(e=>f.containers.get(e.args.at(-1)).Name.endsWith('-callback-receiver')));
+ const beforeClose={completed,listenerStops,stops:stopCalls(f).length,status:owner.resources().status};
+ if(drift)[...f.containers.values()].find(c=>c.Name==='/'+PROJECT+'-demo-site').Labels['payment.sandbox.run']='foreign';
+ releaseClose();await rejected;
+ assert.deepEqual(beforeClose,{completed:false,listenerStops:0,stops:0,status:'RUNNING'});
+ const result=await owner.close();assert.equal(result.code,'START');assert.equal(result.phase,'START');assert.equal(result.diagnostic,'START_DEMO_SITE_HEALTH_PROOF_TIMEOUT');assert.equal(result.cleanupConfirmed,!drift);assert.equal(result.initialAccepted,false);assert.equal(result.renewalAccepted,false);assert.equal(result.full5bAccepted,false);assert.equal(late,0);assert.equal(listenerStops,1);
+ assert.equal(formatBillingFirstRenewalDiagnostic(result),'owned_initial_and_first_renewal_diagnostic code=START_DEMO_SITE_HEALTH_PROOF_TIMEOUT cleanup='+(drift?'UNCONFIRMED':'CONFIRMED'));
+ const stopped=stopCalls(f).map(e=>e.args.at(-1));assert.ok(stopped.every(id=>owned.includes(id)));assert.equal(new Set(stopped).size,stopped.length);assert.deepEqual(stopped.slice().sort(),drift?[]:started.slice().sort());
+ if(!drift)assert.ok([...f.containers.values()].every(c=>!c.State.Running));
+ assert.deepEqual(JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents,original);assert.equal(b.startupDiagnostic(),'START_DEMO_SITE_HEALTH_PROOF_TIMEOUT');assert.equal(b.resources().status,'PENDING');
+ const count=f.events.length;await rejects(b.start({deadline:121000}),'START_PENDING');await rejects(b.verify({deadline:121000}),'VERIFY_PENDING');assert.equal(f.events.length,count);await assert.rejects(owner.run(()=>{late++;},{deadline:121000}),/SINGLE_USE/);assert.deepEqual(await owner.close(),result);assert.equal(late,0);
+});
+test('first-renewal bootstrap privately binds dedicated source entrypoint env and reuses browser build mode',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');const f=firstRenewalFixture(),b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies),l=LIMIT();
+ assert.equal(f.events.length,0);assert.equal(b.withFirstPaymentRuntime,undefined);await b.prepare(l);await b.persistWebhookSecret(SECRET);await b.start(l);
+ let privateRuntime;await b.withFirstRenewalRuntime(v=>{privateRuntime=v;return true;},l);assert.match(privateRuntime.capability,/^[A-Za-z0-9_-]{43}$/);assert.equal(privateRuntime.endpoint,'http://127.0.0.1:18083');assert.equal(JSON.stringify(b.resources()).includes(privateRuntime.capability),false);
+ assert.match(f.files.get(DIR+'/runtime-build.yaml').contents.toString(),/Dockerfile.billing-first-renewal/);assert.ok(f.events.find(e=>e.type==='process'&&e.args.includes('build')&&e.args.includes('--quiet')).args.includes('PAYMENT_DEMO_BUILD_MODE=billing-first-payment'));
+ await b.stop(LIMIT());
+});
+for(const drift of ['source','entrypoint','environment','port'])test('first-renewal bootstrap rejects '+drift+' before backend start',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');const f=firstRenewalFixture(),execute=f.dependencies.execute;
+ f.dependencies.execute=async(file,args,settings)=>{const r=await execute(file,args,settings);if(args[5]==='inspect'){const v=JSON.parse(r.stdout);if(args[4]==='image'&&args.at(-1)===PROJECT+'-backend:latest'){if(drift==='source')v.RuntimeSource=false;if(drift==='entrypoint')v.Entrypoint=['java','-Dloader.main=dev.genericpayments.acceptance.runtime.OwnedBillingFirstPaymentRuntime'];}if(args[4]==='container'&&v.Name==='/'+PROJECT+'-backend'){if(drift==='environment')v.RuntimeIdentity=false;if(drift==='port')v.PortBindings['18083/tcp'][0].HostIp='0.0.0.0';}r.stdout=JSON.stringify(v);}return r;};
+ const b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies);await assert.rejects(b.prepare(LIMIT()));assert.equal(firstPaymentStarts(f).length,0);
+});
+test('first-renewal bootstrap mode rejection precedes all dependency access',async()=>{
+ assert.equal(typeof bootstrapModule.createOwnedBillingFirstRenewalBootstrap,'function');let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}}),f=firstRenewalFixture();
+ await assert.rejects(bootstrapModule.createOwnedBillingFirstPaymentBootstrap(f.options,trap),/OPT_IN_REQUIRED/);f.options.env.PAYMENT_STRIPE_BILLING_FIRST_PAYMENT='true';await assert.rejects(bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,trap),/OPT_IN_REQUIRED/);assert.equal(reads,0);
+});
+
+// Break: failed-renewal persistence inherits the global writer and stale verifier policy.
+function failedRenewalPersistenceFixture(){
+ const f=firstPaymentFixture();f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'};f.options.selectedCase='initial_failed_renewal_grace_recovery';
+ const execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{const r=await execute(...args);return {...r,stdout:r.stdout.replaceAll('FIRST_PAYMENT','FAILED_RENEWAL').replaceAll('OwnedBillingFirstPaymentRuntime','OwnedBillingFailedRenewalRuntime').replaceAll('/app/initial-runtime','/app/failed-renewal-runtime').replaceAll('Dockerfile.billing-first-payment','Dockerfile.billing-failed-renewal')};};return f;
+}
+for(const [fault,checkpoint] of [
+ ['intent','INTENT_REJECTED'],
+ ['command','COMMAND_REJECTED'],
+ ['command abort','COMMAND_ABORT'],
+ ['command timeout','COMMAND_TIMEOUT'],
+ ['output','OUTPUT_REJECTED'],
+ ['proof','PROOF_REJECTED'],
+ ['ack','ACK_REJECTED'],
+])test('failed-renewal issuer helper create retains '+checkpoint+' without continuation',async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute,open=f.dependencies.open;
+ const installer=PROJECT+'-issuer-installer',abort=new AbortController();
+ const lateCreate=fault==='command abort'?Promise.withResolvers():null;
+ let createdId,reads=0,privateReads=0;
+ const privateError=new Proxy({},{get(){privateReads++;throw Error('private fault');}});
+ f.dependencies.execute=async(...args)=>{
+  const result=await execute(...args),a=args[1];
+  if(a[4]==='container'&&a[5]==='create'&&a.includes(installer)){
+   createdId=result.stdout.trim();
+   if(fault==='command')throw privateError;
+   if(lateCreate){abort.abort();await lateCreate.promise;}
+   if(fault==='output')return {...result,stdout:'PRIVATE_OUTPUT'};
+  }
+  if(fault==='proof'&&createdId&&a[4]==='container'&&a[5]==='inspect'&&a.at(-1)===createdId){
+   const row=JSON.parse(result.stdout);
+   row.ReadonlyRootfs=false;
+   return {...result,stdout:JSON.stringify(row)};
+  }
+  return result;
+ };
+ if(fault==='command timeout'){
+  const fake=f.dependencies.execute;
+  delete f.dependencies.execute;
+  f.dependencies.execFile=(file,args,settings,done)=>{
+   const child=new EventEmitter();
+   queueMicrotask(async()=>{
+    try{
+     const result=await fake(file,args,settings);
+     if(args[4]==='container'&&args[5]==='create'&&args.includes(installer)){
+      done({killed:true,signal:'SIGTERM'},'','PRIVATE_COMMAND_OUTPUT');
+      child.emit('close',null,'SIGTERM');return;
+     }
+     done(null,result.stdout,result.stderr);
+     child.emit('close',0,null);
+    }catch(error){done(error,'','');child.emit('close',1,null);}
+   });
+   return child;
+  };
+ }
+ f.dependencies.open=async(...args)=>{
+  const file=await open(...args);
+  if(!args[0].startsWith(DIR+'/runtime.json.tmp-'))return file;
+  return {...file,writeFile:async bytes=>{
+   const last=JSON.parse(String(bytes)).intents.at(-1);
+   if(last?.name===installer&&last.action==='CREATE_HELPER'&&(
+    fault==='intent'&&last.status==='DISPATCHING'||fault==='ack'&&last.status==='ACKNOWLEDGED'
+   ))throw privateError;
+   return file.writeFile(bytes);
+  }};
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic,parseBillingFailedRenewalDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const unreachable=async()=>{reads++;throw Error('ran after a refused helper');};
+ const owner=await createOwnedBillingFailedRenewal(f.options,{preflight:async()=>true,createBootstrap:async()=>bootstrap,createCli:unreachable,login:unreachable});
+ const journey={initial:unreachable,method:unreachable,close:async()=>true},limits={...LIMIT(),signal:abort.signal};
+ await assert.rejects(owner.run(journey,limits));
+ const result=await owner.close(),code='PREPARE_ISSUER_INSTALLER_CREATE_'+checkpoint;
+ const line='owned_failed_renewal_diagnostic stage=PREPARE checkpoint='+code+' cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP';
+ assert.equal(formatBillingFailedRenewalDiagnostic(result),line);
+ if(lateCreate){
+  const before=f.events.length;
+  lateCreate.resolve();
+  await turn();
+  assert.equal(f.events.length,before);
+  assert.equal(formatBillingFailedRenewalDiagnostic(owner.resources()),line);
+ }
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line.replace('stage=PREPARE','stage=START')),null);
+ assert.equal(parseBillingFailedRenewalDiagnosticLine(line.replace(checkpoint,'PRIVATE_OUTPUT')),null);
+ assert.equal(result.initialAccepted,false);
+ assert.equal(result.failedRenewalAccepted,false);
+ assert.equal(reads,0);
+ assert.equal(privateReads,0);
+ assert.equal(f.containers.size,fault==='intent'?0:1);
+ const record=persistenceIntents(f).at(-1);
+ if(fault==='intent')assert.equal(record.action,'CREATE_VOLUME');
+ else assert.deepEqual(record,{action:'CREATE_HELPER',name:installer,status:'DISPATCHING'});
+ assert.equal(f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='create').length,fault==='intent'?0:1);
+ assert.equal(f.events.some(e=>e.type==='process'&&e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])),false);
+ const count=f.events.length;
+ await rejects(bootstrap.prepare(limits),'PREPARE_PENDING');
+ await assert.rejects(owner.run(journey,limits),/SINGLE_USE/);
+ assert.equal(f.events.length,count);
+ assert.deepEqual(await owner.close(),result);
+});
+for (const valid of [true,false]) test('failed-renewal bootstrap rechecks '+(valid?'valid':'malformed')+' source keys before the socket', async () => {
+  const f = failedRenewalPersistenceFixture();
+  delete f.dependencies.preflight;
+  if (!valid) f.files.get(USERFILE).contents = Buffer.from('PRIVATE_CANARY');
+  const bootstrap = await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options, f.dependencies);
+  // The fixture has no socket. A valid input must reach this next gate.
+  await rejects(bootstrap.prepare(LIMIT()), 'PREPARE_PENDING');
+  assert.equal(f.events.some(e => e.type === 'close' && e.path === USERFILE), true);
+  assert.equal(f.events.some(e => e.type === 'lstat' && e.path === '/Users/test/docker.sock'), valid);
+  assert.equal(f.events.some(e => e.type === 'process' && e.file !== '/usr/bin/git'), false);
+  assert.equal(f.files.has(DIR), false);
+});
+test('cancelled bootstrap admission never opens the input after a delayed file stat', async () => {
+  const f = failedRenewalPersistenceFixture(), stat = f.dependencies.lstat;
+  delete f.dependencies.preflight;
+  // Exercise the bootstrap's injected clock, independently of the process clock.
+  f.dependencies.now = () => 1000;
+  let entered, resume;
+  const inspecting = new Promise(resolve => { entered = resolve; });
+  const released = new Promise(resolve => { resume = resolve; });
+  f.dependencies.lstat = async path => {
+    if (path === USERFILE) { entered(); await released; }
+    return stat(path);
+  };
+  const controller = new AbortController();
+  const bootstrap = await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options, f.dependencies);
+  const refusal = rejects(bootstrap.prepare({deadline:121000,signal:controller.signal}), 'PREPARE_PENDING');
+  await inspecting;
+  controller.abort();
+  resume();
+  await refusal;
+  await turn();
+  assert.equal(f.events.some(e => e.type === 'open' && e.path === USERFILE), false);
+  assert.equal(f.events.some(e => e.type === 'process' && e.file !== '/usr/bin/git'), false);
+  assert.equal(f.files.has(DIR), false);
+});
+async function failedRenewalPersistencePrepared(configure=()=>{}){
+ const f=failedRenewalPersistenceFixture();configure(f);f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits=LIMIT();await f.adapter.prepare(f.limits);return f;
+}
+const refusedOriginPath=DIR+'/refused-provider-origin.private.json';
+const refusedWitness=()=>({runId:RUN,expectedSource:'e'.repeat(40),origin:'https://evidence-only.stripe.com'});
+const otherRefusedWitness=()=>({...refusedWitness(),origin:'https://evidence-only.example',checkpoint:'BROWSER_PROVIDER_ORIGIN_OTHER'});
+async function failedRenewalOriginLive(configure=()=>{}){
+ const f=await failedRenewalPersistencePrepared(configure);await f.adapter.persistWebhookSecret(SECRET);await f.adapter.start(f.limits);return f;
+}
+
+const {billingFailedRenewalVerificationCheckpoint: verificationCheckpoint}=bootstrapModule;
+test('publish reports its own genuine source verification refusal without dispatching HTTP',async()=>{
+ const {createBillingFailedRenewalFixture,billingFailedRenewalProvisionCheckpoint}=await import('./stripe-billing-provision.mjs');
+ const {provisionHarness}=await import('./fixtures/failed-renewal-provision-harness.mjs');
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   return refuse&&file==='/usr/bin/git'&&args.includes('status')?{...result,stdout:'private source evidence'}:result;
+  };
+ });
+ const {fixture,requests,writes}=await provisionHarness({
+  configuration:f.options,
+  factory:(options,dependencies)=>createBillingFailedRenewalFixture({...options,bootstrap:f.adapter},dependencies),
+  onWrite(name){if(name.endsWith('-publish-dispatch.json'))refuse=true;},
+ });
+ const limits={deadline:Math.min(f.limits.deadline,Date.now()+10000)};
+ await assert.rejects(fixture.provision(limits),/VERIFY_PENDING/);
+ const code=billingFailedRenewalProvisionCheckpoint(fixture,limits,f.options.runId,f.options.expectedSource);
+ assert.equal(code,'PROVISION_PUBLISH_VERIFY_SOURCE');
+ assert.equal(writes.at(-1).name,'billing-012-publish-dispatch.json');
+ assert.ok(!requests.some(request=>request.path.endsWith('/publish')));
+ assert.equal(f.adapter.resources().status,'PENDING');
+ refuse=false;
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);
+});
+
+for(const stage of ['ADMISSION','SOURCE','TOPOLOGY','HEALTH'])test('failed-renewal VERIFY retains only the '+stage+' checkpoint',async()=>{
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const execute=f.dependencies.execute,health=f.dependencies.health;
+  f.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   if(refuse&&((stage==='SOURCE'&&file==='/usr/bin/git'&&args.includes('status'))||(stage==='TOPOLOGY'&&args[4]==='ps')))return {...result,stdout:'private process evidence'};
+   return result;
+  };
+  f.dependencies.health=async(...args)=>{
+   if(refuse&&stage==='HEALTH')throw new Error('private readiness evidence');
+   return health(...args);
+  };
+ });
+ refuse=true;
+ const b=f.adapter,limits={deadline:stage==='ADMISSION'?0:f.limits.deadline};
+ await rejects(b.verify(limits),'VERIFY_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),stage);
+ assert.equal(verificationCheckpoint(b,{...limits}),null);
+ assert.equal(verificationCheckpoint({verify:b.verify},limits),null);
+ const other=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ assert.equal(verificationCheckpoint(other,limits),null);
+ assert.equal(b.resources().status,'PENDING');
+ refuse=false;
+ await b.stop({deadline:f.limits.deadline+120000});
+ assert.equal(verificationCheckpoint(b,limits),stage);
+ const next={...limits},before=f.events.length;
+ await rejects(b.verify(next),'VERIFY_PENDING');
+ assert.equal(f.events.length,before);
+ assert.equal(verificationCheckpoint(b,limits),null);
+ assert.equal(verificationCheckpoint(b,next),'ADMISSION');
+});
+
+test('failed-renewal VERIFY clears successful evidence and does not use credential checks',async()=>{
+ let refuse=false;
+ const f=await failedRenewalOriginLive(f=>{
+  const health=f.dependencies.health;
+  f.dependencies.health=(...args)=>refuse?false:health(...args);
+ });
+ const b=f.adapter,limits={...f.limits};
+ assert.equal(await b.verify(limits),true);
+ assert.equal(verificationCheckpoint(b,limits),null);
+ refuse=true;
+ await rejects(b.withAdminCredentials(()=>assert.fail('credentials exposed'),limits),'ADMIN_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),null);
+ await b.stop({deadline:f.limits.deadline+120000});
+});
+
+test('first-renewal VERIFY cannot supply the failed-renewal checkpoint',async()=>{
+ const f=firstRenewalFixture(),b=await bootstrapModule.createOwnedBillingFirstRenewalBootstrap(f.options,f.dependencies),limits=LIMIT();
+ await rejects(b.verify(limits),'VERIFY_PENDING');
+ assert.equal(verificationCheckpoint(b,limits),null);
+});
+
+for(const interrupt of ['abort','timeout'])test('failed-renewal VERIFY keeps SOURCE at '+interrupt+' while the process settles',async()=>{
+ let hold=false,settings,now=Date.now();
+ const entered=Promise.withResolvers(),release=Promise.withResolvers();
+ const f=await failedRenewalOriginLive(f=>{
+  f.dependencies.now=()=>now;
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,options)=>{
+   if(hold&&file==='/usr/bin/git'){
+    hold=false;settings=options;entered.resolve();
+    await release.promise;
+   }
+   return execute(file,args,options);
+  };
+ });
+ const b=f.adapter,controller=new AbortController(),limits={deadline:now+10000,signal:controller.signal};
+ let settled=false;
+ hold=true;
+ const refused=rejects(b.verify(limits).finally(()=>{settled=true;}),'VERIFY_PENDING');
+ await entered.promise;
+ if(interrupt==='abort')controller.abort();
+ else {
+  now=limits.deadline;
+  [...f.timers.values()].find(timer=>timer.ms===10000).callback();
+ }
+ let checkpoint,stillSettling;
+ try{
+  const overlappingLimits={...limits};
+  await rejects(b.verify(overlappingLimits),'OPERATION_BUSY');
+  assert.equal(verificationCheckpoint(b,overlappingLimits),null);
+  checkpoint=verificationCheckpoint(b,limits);stillSettling=!settled;
+  await rejects(b.stop({deadline:f.limits.deadline+120000}),'OPERATION_BUSY');
+ }finally{release.resolve();await refused;}
+ assert.equal(settings.signal.aborted,true);
+ assert.equal(stillSettling,true);
+ assert.equal(checkpoint,'SOURCE');
+ assert.equal(verificationCheckpoint(b,limits),'SOURCE');
+ assert.equal(b.resources().status,'PENDING');
+ assert.equal(await b.stop({deadline:f.limits.deadline+120000}),true);
+});
+
+// Break: private evidence becomes a ledger operation, caller-controlled path, retry, or public payload.
+for(const selectedCase of ['initial_3ds','initial_decline_retry'])test('only the 3DS bootstrap can retain its exact private refusal: '+selectedCase,async()=>{
+ const f=fixture();
+ f.options.selectedCase=selectedCase;
+ f.options.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:selectedCase};
+ const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies),limits=LIMIT();
+ await b.prepare(limits);await b.persistWebhookSecret(SECRET);await b.start(limits);
+ try{
+  if(selectedCase!=='initial_3ds'){assert.equal(b.persistRefusedStripeOrigin,undefined);return;}
+  const checkpoint='BROWSER_PROVIDER_ORIGIN_STRIPE_COM',witness={...refusedWitness(),checkpoint,issuerRelation:'ISSUER_TRANSACTION_MATCH'};
+  const before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents);
+  assert.equal(await b.persistRefusedStripeOrigin(witness,limits),true);
+  const entry=f.files.get(refusedOriginPath);
+  assert.deepEqual(JSON.parse(entry.contents),witness);assert.equal(entry.mode&0o7777,0o600);
+  assert.deepEqual(b.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+  assert.equal(await b.persistRefusedStripeOrigin(witness,limits),false);
+ }finally{await b.stop(LIMIT());}
+});
+
+for(const [name,witness,checkpoint] of [
+ ['Stripe family',refusedWitness,'BROWSER_PROVIDER_ORIGIN_STRIPE_COM_OTHER'],
+ ['other origin',otherRefusedWitness,'BROWSER_PROVIDER_ORIGIN_OTHER'],
+ ['Stripe network',()=>({...refusedWitness(),origin:'https://evidence-only.stripe.network',checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'}),'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'],
+])test('refused origin writes only one fixed private bounded file for the original LIVE owner: '+name,async()=>{
+ const f=await failedRenewalOriginLive(),b=f.adapter,before=b.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
+ assert.equal(typeof b.persistRefusedStripeOrigin,'function');
+ assert.equal(await b.persistRefusedStripeOrigin(witness(),f.limits),true);
+ const entry=f.files.get(refusedOriginPath),events=f.events.slice(offset);
+ assert.deepEqual(JSON.parse(entry.contents),{runId:RUN,expectedSource:'e'.repeat(40),checkpoint,origin:witness().origin});
+ assert.ok(entry.contents.length<=1024);assert.equal(entry.mode&0o7777,0o600);assert.equal(f.files.get(DIR).mode&0o7777,0o700);
+ const opened=events.find(e=>e.type==='open'&&e.path===refusedOriginPath);assert.ok(opened.flags&constants.O_EXCL);assert.ok(opened.flags&constants.O_NOFOLLOW);assert.equal(opened.mode,0o600);
+ assert.deepEqual(b.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+ assert.equal(events.some(e=>['write','rename','unlink'].includes(e.type)&&e.path!==refusedOriginPath),false);
+ assert.equal(events.some(e=>['preflight','port','random','crypto','health'].includes(e.type)),false);
+ assert.equal(events.some(e=>e.type==='process'),false);
+ const count=f.events.length;assert.equal(await b.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,count);
+ assert.equal(JSON.stringify(before).includes('evidence-only'),false);assert.equal(b.persistenceDiagnostic(),null);
+ await b.stop({deadline:f.limits.deadline+120000});
+});
+for(const [name,change] of [
+ ['historical run',w=>{w.runId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';}],['foreign source',w=>{w.expectedSource='a'.repeat(40);}],
+ ['raw URL',w=>{w.origin+='/?sensitive=canary#private';}],['permitted host',w=>{w.origin='https://api.stripe.com';}],
+ ['merchant network host',w=>{w.origin='https://merchant-ui-api.stripe.com';}],
+ ['other label with Stripe family origin',w=>{w.checkpoint='BROWSER_PROVIDER_ORIGIN_OTHER';}],
+ ['other origin without explicit label',w=>{w.origin='https://evidence-only.example';}],
+ ['other origin with wrong label',w=>Object.assign(w,otherRefusedWitness(),{checkpoint:'BROWSER_PROVIDER_ORIGIN_STRIPE_NETWORK'})],
+ ['other origin with query',w=>Object.assign(w,otherRefusedWitness(),{origin:'https://evidence-only.example/?key=canary'})],
+ ['other origin with checkpoint accessor',(w,touch)=>{Object.assign(w,otherRefusedWitness());Object.defineProperty(w,'checkpoint',{enumerable:true,get(){touch();return 'BROWSER_PROVIDER_ORIGIN_OTHER';}});}],
+ ['extra field',w=>{w.path='/tmp/private-canary';}],['inherited',w=>Object.setPrototypeOf(w,{canary:true})],
+ ['accessor',(w,touch)=>Object.defineProperty(w,'origin',{enumerable:true,get(){touch();return 'https://evidence-only.stripe.com';}})]
+])test('refused origin consumes '+name+' without file IO or caller getter evaluation',async()=>{
+ const f=await failedRenewalOriginLive(),w=refusedWitness();let reads=0;change(w,()=>{reads++;});
+ if(name==='merchant network host')f.files.set(refusedOriginPath,{...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('retained historical canary'),ino:999999});
+ const retained=f.files.get(refusedOriginPath)?.contents,before=f.adapter.resources(),ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),offset=f.events.length;
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),false);
+ assert.equal(reads,0);assert.equal(f.events.length,offset);assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,offset);
+ assert.deepEqual(f.adapter.resources(),before);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,ledger);
+ if(retained)assert.deepEqual(f.files.get(refusedOriginPath).contents,retained);else assert.equal(f.files.has(refusedOriginPath),false);
+ assert.equal(f.adapter.persistenceDiagnostic(),null);assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
+});
+test('refused origin uses each own descriptor snapshot once and never ordinary foreign property reads',async()=>{
+ const f=await failedRenewalOriginLive(),captures=new Map();let gets=0;
+ const w=new Proxy(refusedWitness(),{get(){gets++;throw null;},getOwnPropertyDescriptor(target,key){captures.set(key,(captures.get(key)??0)+1);const d=Reflect.getOwnPropertyDescriptor(target,key);return captures.get(key)===1?d:{...d,value:'https://substituted.invalid'};}});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(w,f.limits),true);
+ assert.equal(gets,0);assert.deepEqual([...captures.values()],[1,1,1]);assert.equal(JSON.parse(f.files.get(refusedOriginPath).contents).origin,'https://evidence-only.stripe.com');
+ await f.adapter.stop({deadline:f.limits.deadline+120000});
+});
+test('refused other origin preserves an existing private report and consumes the offer',async()=>{
+ const f=await failedRenewalOriginLive();
+ const original={...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('original closed report'),ino:999999};
+ f.files.set(refusedOriginPath,original);
+ const offset=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(otherRefusedWitness(),f.limits),false);
+ const attempted=f.events.slice(offset).find(event=>event.type==='open'&&event.path===refusedOriginPath);
+ assert.ok(attempted?.flags&constants.O_EXCL);
+ assert.equal(f.files.get(refusedOriginPath),original);
+ assert.equal(original.contents.toString(),'original closed report');
+ assert.equal(f.events.slice(offset).some(event=>['write','rename','unlink'].includes(event.type)),false);
+ const after=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
+ assert.equal(f.events.length,after);
+ await f.adapter.stop({deadline:f.limits.deadline+120000});
+});
+for(const drift of ['directory inode','directory mode','lock inode','lock mode','lock hardlink','lock symlink','existing','symlink','hardlink'])test('refused origin refuses '+drift+' without overwrite unlink retry or pending fence',async()=>{
+ const f=await failedRenewalOriginLive(),before=f.adapter.resources();
+ if(drift.startsWith('directory')){const e=f.files.get(DIR);if(drift.endsWith('inode'))e.ino+=1000;else e.mode=0o40755;}
+ else if(drift.startsWith('lock')){const original=f.files.get(DIR+'/owner.lock'),e={...original};f.files.set(DIR+'/owner.lock',e);if(drift.endsWith('inode'))e.ino+=1000;else if(drift.endsWith('mode'))e.mode=0o100644;else if(drift.endsWith('hardlink'))e.nlink=2;else e.symlink=true;}
+ else f.files.set(refusedOriginPath,{...f.files.get(DIR+'/owner.lock'),contents:Buffer.from('retained canary'),ino:999999,symlink:drift==='symlink',nlink:drift==='hardlink'?2:1});
+ const original=f.files.get(refusedOriginPath)?.contents,offset=f.events.length;
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);
+ assert.deepEqual(f.adapter.resources(),before);if(original)assert.deepEqual(f.files.get(refusedOriginPath).contents,original);else assert.equal(f.files.has(refusedOriginPath),false);
+ assert.equal(f.events.slice(offset).some(e=>e.type==='unlink'||e.type==='rename'||e.type==='write'),false);
+ const count=f.events.length;assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.equal(f.events.length,count);
+});
+for(const state of ['NEW','PREPARED','STOPPED','busy','pending','expired'])test('refused origin refuses '+state+' independently of operation admission',async()=>{
+ const f=state==='NEW'?failedRenewalPersistenceFixture():state==='PREPARED'?await failedRenewalPersistencePrepared():await failedRenewalOriginLive();
+ if(state==='NEW')f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');let release,operation;
+ if(state==='STOPPED')await f.adapter.stop({deadline:f.limits.deadline+120000});
+ if(state==='busy')operation=f.adapter.withAdminCredentials(()=>new Promise(resolve=>{release=resolve;}),f.limits);
+ if(state==='busy')for(let i=0;i<100&&!release;i++)await turn();
+ if(state==='pending')await assert.rejects(f.adapter.verify({deadline:0}));
+ const before=f.adapter.resources(),offset=f.events.length;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),state==='expired'?{deadline:Date.now()-1}:f.limits??LIMIT()),false);
+ assert.deepEqual(f.adapter.resources(),before);assert.equal(f.events.length,offset);assert.equal(f.files.has(refusedOriginPath),false);
+ if(release){release(true);await operation;await f.adapter.stop({deadline:f.limits.deadline+120000});}
+});
+for(const refusal of ['throw','hostile rejection','partial','stall'])test('refused origin '+refusal+' cannot poison STOP or allow a second offer',async()=>{
+ let release,entered;const entry=new Promise(r=>{entered=r;});
+ const f=await failedRenewalOriginLive(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{if(args[0]!==refusedOriginPath)return open(...args);if(refusal!=='stall')entered();if(refusal==='throw')throw null;if(refusal==='hostile rejection')throw new Proxy({},{get(){throw Error('must not inspect sink rejection');}});const file=await open(...args);return {...file,writeFile:async bytes=>{if(refusal==='partial'){await file.writeFile(String(bytes).slice(0,7));throw null;}return new Promise(r=>{release=r;entered();});}};};});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');const before=f.adapter.resources(),writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits);await entry;
+ assert.equal(await f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits),false);assert.deepEqual(f.adapter.resources(),before);
+ if(refusal==='stall'){assert.equal(typeof release,'function');const timer=[...f.timers.values()].find(t=>t.ms<=2000);assert.ok(timer);timer.callback();}
+ assert.equal(await writing,false);assert.deepEqual(f.adapter.resources(),before);
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
+ if(release){release();await turn();}assert.equal(f.events.some(e=>e.type==='unlink'&&e.path===refusedOriginPath),false);
+});
+for(const remaining of [20000,500,0])test('refused origin independent timer clips to two seconds and original cleanup ceiling '+remaining,async()=>{
+ let clock=Date.now(),entered,release;const entry=new Promise(r=>{entered=r;});
+ const f=await failedRenewalOriginLive(h=>{h.dependencies.now=()=>clock;const open=h.dependencies.open;h.dependencies.open=async(...args)=>{if(args[0]!==refusedOriginPath)return open(...args);entered();return new Promise(r=>{release=()=>open(...args).then(r);});};});
+ assert.equal(typeof f.adapter.persistRefusedStripeOrigin,'function');clock=f.limits.deadline+120000-remaining;
+ const before=f.adapter.resources(),writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),{deadline:clock+60000});
+ if(remaining){await entry;const timers=[...f.timers.values()];assert.equal(timers.length,1);assert.equal(timers[0].ms,Math.min(2000,remaining));timers[0].callback();}
+ assert.equal(await writing,false);assert.deepEqual(f.adapter.resources(),before);assert.equal(f.files.has(refusedOriginPath),false);
+ if(release){release();await turn();}assert.equal(f.adapter.persistenceDiagnostic(),null);
+});
+// Break: an evidence call that was already dispatched before STOP authorizes a
+// new payload write or synchronization after STOP has released the owner lock.
+for(const boundary of ['initial stat','write','file sync'])test('refused origin resumed after STOP dispatches no new mutation from '+boundary,async()=>{
+ let entered,release;const paused=new Promise(resolve=>{entered=resolve;});
+ const f=await failedRenewalOriginLive(h=>{
+  const open=h.dependencies.open;
+  h.dependencies.open=async(...args)=>{
+   const file=await open(...args);if(args[0]!==refusedOriginPath)return file;
+   let stats=0;
+   const hold=value=>new Promise(resolve=>{release=()=>resolve(value);entered();});
+   return {...file,
+    stat:async()=>{const value=await file.stat();return boundary==='initial stat'&&++stats===1?hold(value):value;},
+    writeFile:async bytes=>{const value=await file.writeFile(bytes);return boundary==='write'?hold(value):value;},
+    sync:async()=>{const value=await file.sync();return boundary==='file sync'?hold(value):value;}
+   };
+  };
+ });
+ const writing=f.adapter.persistRefusedStripeOrigin(refusedWitness(),f.limits);await paused;
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.equal(f.adapter.resources().status,'STOPPED');
+ const afterStop=f.events.length;release();assert.equal(await writing,false);await turn();
+ const late=f.events.slice(afterStop);
+ assert.equal(late.some(e=>e.type==='write'&&e.path===refusedOriginPath),false);
+ assert.equal(late.some(e=>e.type==='sync'&&[refusedOriginPath,DIR].includes(e.path)),false);
+ assert.equal(late.some(e=>['unlink','rename'].includes(e.type)),false);
+ assert.equal(f.adapter.resources().status,'STOPPED');assert.equal(f.adapter.persistenceDiagnostic(),null);
+});
+const writerPath=ROOT+'/test-results/stripe-sandbox/user-env.lock';
+const persistenceIntents=f=>JSON.parse(f.files.get(DIR+'/runtime.json').contents).intents;
+const persistenceMutations=events=>events.filter(e=>e.type==='process'&&(stoppedCompose(e)||e.args[4]==='container'&&['start','stop','rm'].includes(e.args[5])));
+function assertPrivatePersistenceOnly(f,events){
+ assert.equal(events.some(e=>e.path===writerPath||e.from===USERFILE||e.to===USERFILE||e.type==='unlink'&&e.path===USERFILE||e.type==='write'&&e.path===USERFILE),false);
+ assert.equal(events.some(e=>e.path===DIR+'/stripe-user.env.tmp'),false);
+}
+for(const previous of ['',SECRET,'whsec_A99999999999999999999'])for(const quote of ['',"'",'"'])for(const ending of ['\n','\r\n',''])
+test('failed-renewal private snapshot accepts '+(previous===''?'empty':previous===SECRET?'equal':'different')+' verifier '+JSON.stringify(quote)+' '+JSON.stringify(ending),async()=>{
+ const f=await failedRenewalPersistencePrepared(),entry=f.files.get(USERFILE);
+ const bytes=Buffer.from('# retained input'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_SECRET_KEY=sk_test_A00112233445566778899'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_PUBLISHABLE_KEY="pk_test_B00112233445566778899"'+(ending||'\n')+'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+quote+previous+quote+ending);
+ entry.contents=bytes;const inode=entry.ino;
+ // Deliberately opaque and unsafe: the new mode has no authority even to inspect this entry.
+ const oldWriter={contents:Buffer.from('opaque historical writer'),ino:99999,dev:2,mode:0o100777,uid:-1,nlink:2,symlink:true};f.files.set(writerPath,oldWriter);
+ const before=f.events.length;assert.equal(await f.adapter.persistWebhookSecret(SECRET),true);
+ assert.equal(f.files.get(USERFILE),entry);assert.equal(entry.ino,inode);assert.deepEqual(entry.contents,bytes);assert.equal(f.files.get(writerPath),oldWriter);
+ const final=f.files.get(DIR+'/final.env').contents.toString();assert.ok(final.includes('PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET='+SECRET+'\n'));
+ if(previous&&previous!==SECRET)assert.equal(final.includes(previous),false);
+ assertPrivatePersistenceOnly(f,f.events.slice(before));assert.equal(f.events.slice(before).filter(e=>e.type==='rename').every(e=>e.to===DIR+'/runtime.json'),true);
+ assert.equal(typeof f.adapter.persistenceDiagnostic,'function');assert.equal(f.adapter.persistenceDiagnostic(),null);assert.equal(f.adapter.resources().webhookReady,true);
+ assert.deepEqual(persistenceIntents(f).at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'ACKNOWLEDGED'});
+});
+for(const mode of ['sandbox','payment','renewal'])test('legacy '+mode+' keeps unequal webhook refusal and has no persistence diagnostic',async()=>{
+ const f=mode==='sandbox'?fixture():mode==='payment'?firstPaymentFixture():firstRenewalFixture();
+ const create=mode==='sandbox'?bootstrapModule.createOwnedSandboxBootstrap:mode==='payment'?bootstrapModule.createOwnedBillingFirstPaymentBootstrap:bootstrapModule.createOwnedBillingFirstRenewalBootstrap;
+ const b=await create(f.options,f.dependencies);await b.prepare(LIMIT());f.files.get(USERFILE).contents=Buffer.from(USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET=whsec_A99999999999999999999'));
+ await rejects(b.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(b.persistenceDiagnostic,undefined);assert.equal(f.files.has(DIR+'/final.env'),false);
+});
+for(const [name,bytes]of [
+ ['unknown',USERBYTES+'OTHER=value\n'],['duplicate',USERBYTES+'PAYMENT_STRIPE_SANDBOX_WEBHOOK_SECRET=\n'],['live',USERBYTES.replace('sk_test_','sk_live_')],
+ ['placeholder',USERBYTES.replace('sk_test_A00112233445566778899','sk_test_example')],['old malformed',USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET=arbitrary')],
+ ['NUL',USERBYTES+'\0'],['UTF8',Buffer.concat([Buffer.from(USERBYTES),Buffer.from([255])])],['quoted trailing',USERBYTES.replace('WEBHOOK_SECRET=','WEBHOOK_SECRET="" tail')],
+])test('failed-renewal private input refuses '+name+' without global writer access',async()=>{
+ const f=await failedRenewalPersistencePrepared(),entry=f.files.get(USERFILE);entry.contents=Buffer.from(bytes);const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_INPUT');assert.deepEqual(entry.contents,Buffer.from(bytes));assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));
+});
+for(const [name,change]of [ ['public',e=>{e.mode=0o100644;}],['foreign',e=>{e.uid=-1;}],['linked',e=>{e.nlink=2;}],['symlink',e=>{e.symlink=true;}],['oversize',e=>{e.contents=Buffer.alloc(65537,65);}] ])
+test('failed-renewal private input refuses '+name+' metadata',async()=>{
+ const f=await failedRenewalPersistencePrepared();change(f.files.get(USERFILE));const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_INPUT');assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));
+});
+// Break: a local refusal leaks dependency errors, resets its checkpoint or redispatches persistence.
+for(const checkpoint of ['ADMISSION','OWNERSHIP','INPUT','UNCHANGED','FINAL_STORE','ACK'])
+test('failed-renewal persistence checkpoint '+checkpoint+' is finite sticky and never readiness',async()=>{
+ let fired=false;
+ // Dependencies are captured at factory construction, so inject through retained function closures.
+ const g=await failedRenewalPersistencePrepared(h=>{
+  const inspect=h.dependencies.execute,open=h.dependencies.open,stat=h.dependencies.lstat;
+  h.dependencies.execute=async(...args)=>{if(checkpoint==='OWNERSHIP'&&h.rejectPersistence&&args[1][4]==='network'){fired=true;throw new Error('private path /canary whsec_private');}return inspect(...args);};
+  h.dependencies.lstat=async path=>{if(checkpoint==='UNCHANGED'&&h.rejectPersistence&&path===USERFILE&&h.inputOpened){fired=true;throw new Error('private path /canary whsec_private');}return stat(path);};
+  h.dependencies.open=async(...args)=>{const file=await open(...args),path=args[0];if(path===USERFILE)h.inputOpened=true;return {...file,
+   read:async(...readArgs)=>{if(checkpoint==='INPUT'&&h.rejectPersistence){fired=true;throw new Error('private input');}return file.read(...readArgs);},
+   sync:async()=>{if(checkpoint==='FINAL_STORE'&&h.rejectPersistence&&path===DIR+'/final.env'){fired=true;throw new Error('private store');}return file.sync();},
+   writeFile:async bytes=>{if(checkpoint==='ACK'&&h.rejectPersistence&&path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"')){fired=true;throw new Error('private ack');}return file.writeFile(bytes);},
+  };};
+ });
+ g.rejectPersistence=true;const before=g.events.length;await rejects(g.adapter.persistWebhookSecret(checkpoint==='ADMISSION'?'invalid':SECRET),'PERSIST_PENDING');
+ assert.equal(g.adapter.persistenceDiagnostic(),'PERSIST_'+checkpoint);if(checkpoint!=='ADMISSION')assert.equal(fired,true);
+ assert.equal(g.adapter.resources().status,'PENDING');assert.equal(g.adapter.startupDiagnostic(),null);assert.equal(persistenceMutations(g.events.slice(before)).length,0);assertPrivatePersistenceOnly(g,g.events.slice(before));
+ const count=g.events.length;await rejects(g.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(g.adapter.start(g.limits),'START_PENDING');assert.equal(g.events.length,count);assert.equal(g.adapter.persistenceDiagnostic(),'PERSIST_'+checkpoint);
+});
+for(const drift of ['bytes','identity'])test('failed-renewal snapshot rejects concurrent '+drift+' before final store',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);if(args[0]!==USERFILE)return file;let reads=0;return {...file,read:async(...readArgs)=>{const r=await file.read(...readArgs);if(++reads===1){const entry=h.files.get(USERFILE);if(drift==='bytes')entry.contents=Buffer.from(USERBYTES+'# concurrent\n');else h.files.set(USERFILE,{...entry,ino:entry.ino+1000});}return r;}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_UNCHANGED');assert.equal(f.files.has(DIR+'/final.env'),false);assertPrivatePersistenceOnly(f,f.events.slice(before));assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');
+});
+for(const interruption of ['timeout','abort'])test('failed-renewal persistence '+interruption+' keeps original authority consumed',async()=>{
+ const external=new AbortController();let clock=1000;
+ const f=failedRenewalPersistenceFixture(),open=f.dependencies.open;f.dependencies.now=()=>clock;
+ f.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env'){if(interruption==='timeout')clock=121000;else external.abort();}return file.sync();}};};
+ f.adapter=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);f.limits={deadline:121000,signal:external.signal};await f.adapter.prepare(f.limits);const before=f.events.length;
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ const count=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');await rejects(f.adapter.start(f.limits),'START_PENDING');assert.equal(f.events.length,count);
+});
+test('failed-renewal persistence wrapper admission retains its finite checkpoint before body IO',async()=>{
+ let clock=Date.now();const f=await failedRenewalPersistencePrepared(h=>{h.dependencies.now=()=>clock;});clock=f.limits.deadline;
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ADMISSION');assert.equal(f.events.length,before);
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ADMISSION');assert.equal(f.events.length,before);
+});
+test('failed-renewal held input close refusal preserves actual ACK and pending authority',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return args[0]!==USERFILE?file:{...file,close:async()=>{await file.close();throw new Error('private close canary');}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ACK');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ assert.equal(persistenceIntents(f).at(-1).status,'ACKNOWLEDGED');assert.equal(f.adapter.resources().status,'PENDING');
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+test('failed-renewal ACK file sync refusal preserves durable dispatch and memory uncertainty',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);let ack=false;return {...file,writeFile:async bytes=>{ack=args[0].startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"');return file.writeFile(bytes);},sync:async()=>{if(ack)throw new Error('private sync canary');return file.sync();}};};});
+ const before=f.events.length;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_ACK');assert.equal(persistenceIntents(f).at(-1).status,'DISPATCHING');assert.equal(f.adapter.resources().status,'PENDING');assertPrivatePersistenceOnly(f,f.events.slice(before));
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+async function failedRenewalPendingPersistence(){
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env')throw new Error('private canary');return file.sync();}};};});
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');return f;
+}
+// Each injected refusal is one-shot so cleanup cannot hide a ledger rewrite behind it.
+async function failedRenewalDurableUncertainty(boundary){
+ let fired=false,ackRenamed=false;
+ const f=await failedRenewalPersistencePrepared(h=>{
+  const open=h.dependencies.open,rename=h.dependencies.rename;
+  h.dependencies.rename=async(from,to)=>{await rename(from,to);if(h.rejectPersistence&&to===DIR+'/runtime.json'&&persistenceIntents(h).at(-1)?.status==='ACKNOWLEDGED')ackRenamed=true;};
+  h.dependencies.open=async(...args)=>{
+   const file=await open(...args),path=args[0];let dispatch=false,ack=false;
+   const refuse=()=>{fired=true;throw new Error('synthetic durable uncertainty');};
+   return {...file,
+    writeFile:async bytes=>{
+     dispatch=path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"DISPATCHING"');
+     ack=path.startsWith(DIR+'/runtime.json.tmp-')&&String(bytes).includes('"action":"PERSIST_WEBHOOK","name":"backend-key-persistence","status":"ACKNOWLEDGED"');
+     if(h.rejectPersistence&&!fired&&(boundary==='intent write'&&dispatch||boundary==='ACK write'&&ack))refuse();
+     return file.writeFile(bytes);
+    },
+    sync:async()=>{if(h.rejectPersistence&&!fired&&(boundary==='ACK file sync'&&ack||boundary==='ACK renamed directory sync'&&path===DIR&&ackRenamed))refuse();return file.sync();},
+    close:async()=>{await file.close();if(h.rejectPersistence&&!fired&&boundary==='post-ACK input close'&&path===USERFILE)refuse();},
+   };
+  };
+ });
+ f.rejectPersistence=true;await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(fired,true);
+ return f;
+}
+for(const boundary of ['intent write','ACK write','ACK file sync','ACK renamed directory sync','post-ACK input close']){
+ for(const state of ['inactive','running service','running helper'])test('failed-renewal '+boundary+' cleanup preserves exact durable bytes with '+state,async()=>{
+  const f=await failedRenewalDurableUncertainty(boundary),bytes=Buffer.from(f.files.get(DIR+'/runtime.json').contents),memory=f.adapter.resources();
+  const last=persistenceIntents(f).at(-1);
+  if(boundary==='intent write')assert.notEqual(last.action,'PERSIST_WEBHOOK');
+  else assert.equal(last.status,['ACK renamed directory sync','post-ACK input close'].includes(boundary)?'ACKNOWLEDGED':'DISPATCHING');
+  if(state!=='inactive'){
+   const service=state==='running service'?'backend':'issuer-probe',container=f.containers.get(memory.containers[service].id);
+   container.State={...container.State,Running:true,Status:'running'};
+  }
+  const before=f.events.length,limits={deadline:f.limits.deadline+120000};
+  if(state==='inactive')assert.equal(await f.adapter.stop(limits),true);else await rejects(f.adapter.stop(limits),'STOP_PENDING');
+  assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);assert.deepEqual(f.adapter.resources(),memory);
+  const cleanup=f.events.slice(before);assert.equal(persistenceMutations(cleanup).length,0);assertPrivatePersistenceOnly(f,cleanup);
+  assert.equal(cleanup.some(e=>e.type==='write'||e.type==='rename'||e.type==='unlink'),false);
+  assert.equal(cleanup.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,state==='inactive'?1:0);
+  if(state==='inactive'){
+   for(const container of Object.values(memory.containers))assert.ok(cleanup.some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect'&&e.args.at(-1)===container.id));
+   const after=f.events.length;await rejects(f.adapter.stop(limits),'STOP_PENDING');assert.equal(f.events.length,after);
+   assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);assert.deepEqual(f.adapter.resources(),memory);
+  }
+ });
+}
+test('failed-renewal proof-only cleanup cannot reuse an ambiguously closed owner descriptor',async()=>{
+ const f=await failedRenewalPersistencePrepared(h=>{const open=h.dependencies.open;h.dependencies.open=async(...args)=>{const file=await open(...args);return {...file,sync:async()=>{if(args[0]===DIR+'/final.env')throw null;return file.sync();},close:async()=>{await file.close();if(args[0]===DIR+'/owner.lock')throw null;}};};});
+ await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');const bytes=Buffer.from(f.files.get(DIR+'/runtime.json').contents);
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');const after=f.events.length;
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(f.events.length,after);assert.deepEqual(f.files.get(DIR+'/runtime.json').contents,bytes);
+ assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);
+});
+
+async function failedRenewalUncertainStartAck(boundary,{closeRefuses=false,restartMailpit=false}={}){
+ let rejected=false,ackRenamed=false;
+ const lastIsMailpitAck=(intents,f)=>{
+  const last=intents.at(-1),mailpit=f.adapter.resources().containers.mailpit;
+  return last?.action==='START_SERVICE'&&last.name===mailpit?.id&&last.status==='ACKNOWLEDGED';
+ };
+ const f=await failedRenewalPersistencePrepared(h=>{
+  const open=h.dependencies.open,rename=h.dependencies.rename,execute=h.dependencies.execute;
+  const refuse=()=>{rejected=true;throw new Error('synthetic START ACK uncertainty');};
+  if(restartMailpit)h.dependencies.execute=async(file,args,settings)=>{
+   const result=await execute(file,args,settings);
+   if(args[4]==='container'&&args[5]==='stop'&&args.at(-1)===h.adapter.resources().containers.postgres.id){
+    const mailpit=h.containers.get(h.adapter.resources().containers.mailpit.id);
+    mailpit.State={...mailpit.State,Running:true,Status:'running'};
+   }
+   return result;
+  };
+  h.dependencies.rename=async(from,to)=>{
+   await rename(from,to);
+   if(to===DIR+'/runtime.json'&&lastIsMailpitAck(persistenceIntents(h),h))ackRenamed=true;
+  };
+  h.dependencies.open=async(path,...args)=>{
+   const file=await open(path,...args);let ack=false;
+   return {...file,
+    writeFile:async bytes=>{
+     ack=path.startsWith(DIR+'/runtime.json.tmp-')&&lastIsMailpitAck(JSON.parse(bytes).intents,h);
+     if(!rejected&&ack&&boundary==='ACK write')refuse();
+     await file.writeFile(bytes);
+    },
+    sync:async()=>{
+     if(!rejected&&(ack&&boundary==='ACK file sync'||ackRenamed&&path===DIR&&boundary==='ACK directory sync'))refuse();
+     await file.sync();
+    },
+    close:async()=>{
+     await file.close();
+     if(closeRefuses&&path===DIR+'/owner.lock')throw new Error('synthetic owner close refusal');
+    },
+   };
+  };
+ });
+ await f.adapter.persistWebhookSecret(SECRET);
+ await rejects(f.adapter.start(f.limits),'START_PENDING');
+ assert.equal(rejected,true);
+ assert.equal(f.adapter.startupDiagnostic(),'START_MAILPIT_ACK_REJECTED');
+ assert.deepEqual(persistenceIntents(f).at(-1),{
+  action:'START_SERVICE',name:f.adapter.resources().containers.mailpit.id,
+  status:boundary==='ACK directory sync'?'ACKNOWLEDGED':'DISPATCHING',
+ });
+ return f;
+}
+
+for(const boundary of ['ACK write','ACK file sync','ACK directory sync'])test('failed-renewal START '+boundary+' cleanup preserves exact ledger bytes',async()=>{
+ const f=await failedRenewalUncertainStartAck(boundary),b=f.adapter,{mailpit,postgres}=b.resources().containers;
+ const ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),before=f.events.length;
+ const limits={deadline:f.limits.deadline+120000};
+ assert.equal(await b.stop(limits),true);
+ assert.ok(f.files.get(DIR+'/runtime.json').contents.equals(ledger),'cleanup preserves runtime ledger bytes');
+ const cleanup=f.events.slice(before);
+ assert.deepEqual(persistenceMutations(cleanup).map(e=>e.args.slice(5)),[['stop','--time','10',mailpit.id],['stop','--time','10',postgres.id]]);
+ assert.ok([...f.containers.values()].every(c=>!c.State.Running));
+ assert.equal(cleanup.some(e=>['write','rename','unlink'].includes(e.type)),false);
+ assert.equal(cleanup.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,1);
+ assert.equal(b.resources().status,'PENDING');
+ assert.equal(b.startupDiagnostic(),'START_MAILPIT_ACK_REJECTED');
+ const after=f.events.length;
+ await rejects(b.stop(limits),'STOP_PENDING');
+ await rejects(b.start(f.limits),'START_PENDING');
+ await rejects(b.verify(f.limits),'VERIFY_PENDING');
+ assert.equal(f.events.length,after);
+});
+
+for(const failure of ['ownership drift','final stopped proof','ambiguous owner close'])test('failed-renewal START ACK uncertainty preserves ledger after '+failure,async()=>{
+ const f=await failedRenewalUncertainStartAck('ACK write',{
+  closeRefuses:failure==='ambiguous owner close',restartMailpit:failure==='final stopped proof',
+ }),b=f.adapter;
+ const ledger=Buffer.from(f.files.get(DIR+'/runtime.json').contents),limits={deadline:f.limits.deadline+120000};
+ if(failure==='ownership drift')f.containers.get(b.resources().containers.mailpit.id).Labels['payment.sandbox.run']='foreign';
+ await rejects(b.stop(limits),'STOP_PENDING');
+ assert.ok(f.files.get(DIR+'/runtime.json').contents.equals(ledger),'cleanup preserves runtime ledger bytes');
+ assert.equal(stopCalls(f).length,failure==='ownership drift'?0:2);
+ assert.equal(f.events.filter(e=>e.type==='close'&&e.path===DIR+'/owner.lock').length,failure==='ambiguous owner close'?1:0);
+ if(failure==='ambiguous owner close'){
+  const after=f.events.length;
+  await rejects(b.stop(limits),'STOP_PENDING');
+  assert.equal(f.events.length,after);
+ }
+});
+
+test('failed-renewal exact pending persistence fresh proves seven stopped IDs without dispatch or acknowledgement',async()=>{
+ const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers,before=f.events.length;
+ assert.equal(Object.keys(recorded).length,7);assert.deepEqual(original.at(-1),{action:'PERSIST_WEBHOOK',name:'backend-key-persistence',status:'DISPATCHING'});
+ assert.equal(await f.adapter.stop({deadline:f.limits.deadline+120000}),true);assert.deepEqual(persistenceIntents(f),original);assert.equal(f.adapter.resources().status,'PENDING');assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');
+ assert.equal(persistenceMutations(f.events.slice(before)).length,0);assertPrivatePersistenceOnly(f,f.events.slice(before));
+ assert.deepEqual(f.adapter.resources().containers,recorded);assert.ok(f.events.slice(before).some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'));
+ for(const container of Object.values(recorded))assert.ok(f.events.slice(before).some(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='inspect'&&e.args.at(-1)===container.id));
+ const count=f.events.length;await rejects(f.adapter.start(f.limits),'START_PENDING');await rejects(f.adapter.persistWebhookSecret(SECRET),'PERSIST_PENDING');assert.equal(f.events.length,count);
+});
+for(const [name,mutate]of [
+ ['missing',f=>f.containers.delete(f.adapter.resources().containers.backend.id)],['extra',f=>f.containers.set(id(999),{Id:id(999)})],
+ ['foreign',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Labels['payment.sandbox.run']='foreign';}],
+ ['replaced',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Id=id(999);}],
+ ['image drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Image=image(999);}],
+ ['network drift',f=>{f.containers.get(f.adapter.resources().containers.backend.id).Networks[PROJECT+'-network'].NetworkID=id(999);}],
+ ['running',f=>{const c=f.containers.get(f.adapter.resources().containers.backend.id);c.State={...c.State,Running:true,Status:'running'};}],
+ ['started',f=>{f.containers.get(f.adapter.resources().containers.backend.id).State.StartedAt='2026-11-15T00:00:00Z';}],
+ ['exited service',f=>{f.containers.get(f.adapter.resources().containers.backend.id).State.Status='exited';}],
+ ['running helper',f=>{const c=f.containers.get(f.adapter.resources().containers['issuer-probe'].id);c.State={...c.State,Running:true,Status:'running'};}],
+ ['helper exit failure',f=>{f.containers.get(f.adapter.resources().containers['issuer-probe'].id).State.ExitCode=1;}],
+])test('failed-renewal pending persistence refuses '+name+' before any start stop removal',async()=>{
+ const f=await failedRenewalPendingPersistence(),original=persistenceIntents(f),recorded=f.adapter.resources().containers;mutate(f);const before=f.events.length;
+ await rejects(f.adapter.stop({deadline:f.limits.deadline+120000}),'STOP_PENDING');assert.equal(persistenceMutations(f.events.slice(before)).length,0);assertPrivatePersistenceOnly(f,f.events.slice(before));assert.deepEqual(persistenceIntents(f),original);assert.deepEqual(f.adapter.resources().containers,recorded);assert.equal(f.events.slice(before).some(e=>e.type==='close'&&e.path===DIR+'/owner.lock'),false);
+});
+test('failed-renewal pending persistence cannot renew cleanup budget',async()=>{
+ const f=await failedRenewalPendingPersistence(),before=f.events.length;await rejects(f.adapter.stop({deadline:f.limits.deadline+120001}),'STOP_PENDING');assert.equal(f.events.length,before);assert.equal(f.adapter.persistenceDiagnostic(),'PERSIST_FINAL_STORE');
+});
+for(const action of ['CREATE_STOPPED','CREATE_FINAL_BACKEND'])test('failed-renewal uncertain '+action+' cannot gain stopped-proof authority',async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute;f.dependencies.execute=async(...args)=>{if(stoppedCompose({type:'process',args:args[1]})&&args[1].includes(DIR+(action==='CREATE_STOPPED'?'/app.env':'/final.env'))){await execute(...args);throw null;}return execute(...args);};
+ const b=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies),limits=LIMIT();if(action==='CREATE_STOPPED')await rejects(b.prepare(limits),'PREPARE_PENDING');else{await b.prepare(limits);await b.persistWebhookSecret(SECRET);await rejects(b.start(limits),'START_PENDING');}
+ const original=persistenceIntents(f),before=f.events.length;assert.equal(original.at(-1).action,action);await rejects(b.stop({deadline:limits.deadline+120000}),'STOP_PENDING');assert.equal(persistenceMutations(f.events.slice(before)).length,0);assert.deepEqual(persistenceIntents(f),original);
+});
+
+for(const scenario of ['never started','started despite error','unavailable during cleanup'])test('failed-renewal Mailpit start failure reports ownership proof for '+scenario,async()=>{
+ const f=failedRenewalPersistenceFixture(),execute=f.dependencies.execute;
+ let enter,finish,cleanup=false,unexpected=0;
+ const entered=new Promise(resolve=>enter=resolve),release=new Promise(resolve=>finish=resolve);
+ delete f.dependencies.execute;
+ f.dependencies.execFile=(file,args,settings,done)=>{
+  const child=new EventEmitter();
+  queueMicrotask(async()=>{
+   const mailpit=args[4]==='container'&&args[5]==='start'&&f.containers.get(args.at(-1))?.Name==='/'+PROJECT+'-mailpit';
+   try{
+    if(mailpit){
+     if(scenario==='started despite error')await execute(file,args,settings);
+     else f.events.push({type:'process',file,args,settings});
+     done({code:1},'','synthetic daemon error');enter();await release;child.emit('close',1,null);return;
+    }
+    if(cleanup&&scenario==='unavailable during cleanup'){done({code:1},'','synthetic daemon unavailable');child.emit('close',1,null);return;}
+    const result=await execute(file,args,settings);done(null,result.stdout,result.stderr);child.emit('close',0,null);
+   }catch(error){done(error,'','');child.emit('close',1,null);}
+  });
+  return child;
+ };
+ const bootstrap=await bootstrapModule.createOwnedBillingFailedRenewalBootstrap(f.options,f.dependencies);
+ const {createOwnedBillingFailedRenewal,formatBillingFailedRenewalDiagnostic,parseBillingFailedRenewalDiagnosticLine}=await import('./stripe-billing-first-payment.mjs');
+ const unexpectedWork=async()=>{unexpected++;throw new Error('unexpected work after failed START');};
+ const owner=await createOwnedBillingFailedRenewal(f.options,{preflight:async()=>true,createBootstrap:async()=>bootstrap,login:async()=>true,
+  createCli:async()=>({validateBinding:async()=>true,startListener:()=>bootstrap.persistWebhookSecret(SECRET),stopListener:async()=>{cleanup=true;return true;}}),
+  createRuntime:unexpectedWork,createFixture:unexpectedWork});
+ const running=owner.run({initial:unexpectedWork,method:unexpectedWork,close:async()=>true},LIMIT());
+ const failed=assert.rejects(running,/START/);
+ await entered;
+ const before=persistenceIntents(f),ids=bootstrap.resources().containers;
+ try{
+  assert.deepEqual(before.at(-1),{action:'START_SERVICE',name:ids.mailpit.id,status:'DISPATCHING'});
+  assert.equal(bootstrap.startupDiagnostic(),null);assert.equal(cleanup,false);assert.equal(stopCalls(f).length,0);
+ }finally{finish();await failed;}
+ const result=await owner.close(),available=scenario!=='unavailable during cleanup';
+ assert.equal(result.diagnostic,'START_MAILPIT_COMMAND_NONZERO_EXIT');assert.equal(result.cleanupConfirmed,available);
+ assert.equal(result.cleanupFailure,available?null:'BOOTSTRAP_STOP');assert.equal(unexpected,0);
+ assert.equal(result.initialAccepted,false);assert.equal(result.failedRenewalAccepted,false);
+ assert.deepEqual(firstPaymentStarts(f).map(e=>e.args.at(-1)),[ids.postgres.id,ids.mailpit.id]);
+ assert.deepEqual(stopCalls(f).map(e=>e.args.at(-1)),!available?[]:scenario==='started despite error'?[ids.mailpit.id,ids.postgres.id]:[ids.postgres.id]);
+ assert.deepEqual(persistenceIntents(f),before);
+ const line='owned_failed_renewal_diagnostic stage=START checkpoint=START_MAILPIT_COMMAND_NONZERO_EXIT '+(available?'cleanup=CONFIRMED witness=NONE':'cleanup=UNCONFIRMED witness=BOOTSTRAP_STOP');
+ assert.equal(formatBillingFailedRenewalDiagnostic(result),line);assert.equal(parseBillingFailedRenewalDiagnosticLine(line),line);
+});
+
+test('required-trial STOP drains aborted database ownership verification before stopping exact containers',async()=>{
+  const f=fixture(),selectedCase='initial_required_trial';
+  Object.assign(f.options,{selectedCase,env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',
+    PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',PAYMENT_STRIPE_BILLING_CASE:selectedCase,
+    PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID:'22345678-1234-4234-8234-123456789abc'}});
+  const execute=f.dependencies.execute;
+  let armed=false,release,entered;
+  const commandEntered=new Promise(resolve=>entered=resolve);
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    if(armed&&args.includes('inspect')){
+      armed=false;
+      await new Promise(resolve=>{release=()=>resolve(result);entered();});
+      assert.equal(settings.signal.aborted,true);
+    }
+    return result;
+  };
+  const b=await bootstrapModule.createOwnedBillingBootstrap(f.options,f.dependencies);
+  const limits=LIMIT();
+  await b.prepare(limits);
+  await b.persistWebhookSecret(SECRET);
+  await b.start(limits);
+  const controller=new AbortController();
+  armed=true;
+  const read=b.withDatabaseCredentials(()=>assert.fail('aborted proof must not release credentials'),
+    {deadline:limits.deadline,signal:controller.signal});
+  const refusal=assert.rejects(read,/ADMIN_PENDING/);
+  await commandEntered;
+  controller.abort();
+  let stopped=false;
+  const stopping=b.stop(LIMIT()).then(outcome=>{stopped=true;return outcome;});
+  await turn();
+  const stops=()=>f.events.filter(e=>e.type==='process'&&e.args[4]==='container'&&e.args[5]==='stop');
+  assert.equal(stopped,false);
+  assert.equal(stops().length,0);
+  release();
+  await refusal;
+  assert.equal(await stopping,true);
+  assert.equal(b.resources().status,'STOPPED');
+  assert.deepEqual(new Set(stops().map(e=>e.args.at(-1))),
+    new Set(SERVICES.map(service=>b.resources().containers[service].id)));
+  assert.equal(stops().length,SERVICES.length);
 });

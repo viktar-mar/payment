@@ -1,5 +1,6 @@
 package dev.genericpayments.platform.donations.application.service;
 
+import static dev.genericpayments.platform.donations.application.service.DonationCheckoutPrivacy.*;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -75,14 +76,15 @@ class DonationCheckoutIntegrationTest extends PostgresIntegrationTest {
         return resolver.resolveOptional("Bearer "+issued.rawToken(),site,ORIGIN.toString(),CustomerSessionScope.CHECKOUT_CREATE).orElseThrow();
     }
     @Test void identityIsOwnedOnlyByPaymentAndNfcMessageIsEncrypted() {
-        var identity=identity();var result=create(command("identity",identity,1000,"cafe\u0301"));
+        var identity=identity();var result=create(command("identity",identity,1000,MESSAGE_NFD));
         assertThat(result.customerId()).isEqualTo(identity.customerId().value());
         assertThat(jdbc.queryForObject("select customer_id from payments",UUID.class)).isEqualTo(identity.customerId().value());
         var stored=donations.findEncryptedMessage(site,result.donationId()).orElseThrow();
-        assertThat(encryption.decrypt(stored)).isEqualTo("\u0001café");
-        assertThat(jdbc.queryForObject("select row_to_json(t)::text from donations t",String.class)).doesNotContain("café","cafe",identity.customerId().value().toString());
-        assertThat(jdbc.queryForObject("select row_to_json(t)::text from payment_events t",String.class)).doesNotContain("café","cafe","message");
-        assertThatThrownBy(()->create(command("identity",null,1000,"café"))).isInstanceOf(PaymentApplicationException.class)
+        assertThat(encryption.decrypt(stored)).isEqualTo("\u0001"+MESSAGE_NFC);
+        var donationRow=jdbc.queryForObject("select row_to_json(t)::text from donations t",String.class);
+        var eventRow=jdbc.queryForObject("select row_to_json(t)::text from payment_events t",String.class);
+        assertPrivateRows(donationRow,eventRow,identity.customerId().value());
+        assertThatThrownBy(()->create(command("identity",null,1000,MESSAGE_NFC))).isInstanceOf(PaymentApplicationException.class)
             .extracting("code").isEqualTo("IDEMPOTENCY_CONFLICT");
     }
     @Test void paymentAndSessionBoundariesRequireTheCallersTransactionAndCreationNeverCallsProvider() {

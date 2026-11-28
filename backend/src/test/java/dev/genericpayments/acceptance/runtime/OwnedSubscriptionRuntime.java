@@ -97,6 +97,7 @@ public final class OwnedSubscriptionRuntime {
 
     static void requireOptIn(Map<String,String> env) {
         if(!"true".equals(env.get("PAYMENT_STAGE4_TEST_RUNTIME"))
+            ||!Set.of("","false").contains(env.getOrDefault("PAYMENT_STRIPE_BILLING_FAILED_RENEWAL",""))
             ||!env.getOrDefault("PAYMENT_STAGE4_CONTROL_KEY","").matches("[A-Za-z0-9_-]{43}"))
             throw new IllegalArgumentException("Explicit owned runtime opt-in required");
     }

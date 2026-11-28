@@ -27,6 +27,8 @@ test('remainder exclusion precedes snapshots configuration and dependencies',asy
 import childProcess from 'node:child_process';
 import {syncBuiltinESMExports} from 'node:module';
 import {constants} from 'node:fs';
+import {chmod,link,lstat,mkdir,open,readFile,readdir,realpath,rm,symlink,writeFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 import {EventEmitter} from 'node:events';
 import {PassThrough} from 'node:stream';
 import {dirname,resolve} from 'node:path';
@@ -474,3 +476,1083 @@ test('changed or nonpositive child PID never grants kill authority',async()=>{
   const f=await setup();await start(f);f.children[0].pid=9999;await rejects(stop(f),'STOP');assert.deepEqual(f.children[0].signals,[]);await rejects(f.adapter.startListener(LIMIT()),'LISTENER');
   const g=fixture(),spawnFake=g.dependencies.spawn;g.dependencies.spawn=(...args)=>{const child=spawnFake(...args);child.pid=0;return child;};g.adapter=await createSandboxCliAdapter(g.options,g.dependencies);await rejects(g.adapter.startListener(LIMIT()),'LISTENER');assert.deepEqual(g.children[0].signals,[]);
 });
+
+const billingTarget=()=>({runId:RUN,expectedSource:'e'.repeat(40),accountId:'44444444-5555-4666-8777-888888888888',siteId:'22222222-3333-4444-8555-666666666666',customerId:'55555555-6666-4777-8888-999999999999',subscriptionId:'66666666-7777-4888-8999-000000000000',operationId:'33333333-4444-4555-8666-777777777777',priceId:'77777777-8888-4999-8000-111111111111',priceVersion:1,customerReference:'cus_original',subscriptionReference:'sub_original',productReference:'prod_original',priceReference:'price_original',invoiceReference:'in_original',allocationReference:'inpay_original',intentReference:'pi_original',periodStart:1800000000,periodEnd:1802678400});
+function billingObjects(){
+  const t=billingTarget(),base=(id,object)=>({id,object,livemode:false}),metadata={account_id:t.accountId,site_id:t.siteId,customer_id:t.customerId};
+  const price={...base(t.priceReference,'price'),product:t.productReference,active:true,unit_amount:2000,currency:'eur',tax_behavior:'inclusive',type:'recurring',recurring:{interval:'month',interval_count:1,usage_type:'licensed'},metadata:{local_price_id:t.priceId,local_price_version:'1'}};
+  const allocation={...base(t.allocationReference,'invoice_payment'),invoice:t.invoiceReference,currency:'eur',is_default:true,status:'paid',amount_paid:2000,amount_requested:2000,payment:{type:'payment_intent',payment_intent:t.intentReference},status_transitions:{paid_at:1800000001}};
+  const line={...base('il_original','line_item'),invoice:t.invoiceReference,subscription:t.subscriptionReference,quantity:1,amount:2000,currency:'eur',parent:{type:'subscription_item_details',subscription_item_details:{subscription:t.subscriptionReference,subscription_item:'si_original',proration:false}},pricing:{type:'price_details',price_details:{price:t.priceReference,product:t.productReference}},period:{start:t.periodStart,end:t.periodEnd},discount_amounts:[],pretax_credit_amounts:[]};
+  const list=data=>({object:'list',data,has_more:false});
+  return {
+    ['/v1/customers/'+t.customerReference]:{...base(t.customerReference,'customer'),metadata,test_clock:null},
+    ['/v1/subscriptions/'+t.subscriptionReference]:{...base(t.subscriptionReference,'subscription'),test_clock:null,metadata:{...metadata,subscription_id:t.subscriptionId,operation_id:t.operationId},customer:t.customerReference,status:'active',currency:'eur',latest_invoice:t.invoiceReference,trial_start:null,trial_end:null,items:list([{...base('si_original','subscription_item'),subscription:t.subscriptionReference,quantity:1,price,current_period_start:t.periodStart,current_period_end:t.periodEnd}])},
+    ['/v1/prices/'+t.priceReference]:price,
+    ['/v1/invoices/'+t.invoiceReference]:{...base(t.invoiceReference,'invoice'),customer:t.customerReference,parent:{type:'subscription_details',subscription_details:{subscription:t.subscriptionReference}},billing_reason:'subscription_create',status:'paid',collection_method:'charge_automatically',currency:'eur',amount_due:2000,amount_paid:2000,total:2000,subtotal:2000,amount_remaining:0,amount_paid_off_stripe:0,amount_overpaid:0,starting_balance:0,ending_balance:0,pre_payment_credit_notes_amount:0,post_payment_credit_notes_amount:0,discounts:[],total_discount_amounts:[],total_pretax_credit_amounts:[]},
+    ['/v1/invoices/'+t.invoiceReference+'/lines']:list([line]),'/v1/invoice_payments':list([allocation]),'/v1/refunds':list([]),
+    ['/v1/payment_intents/'+t.intentReference]:{...base(t.intentReference,'payment_intent'),customer:t.customerReference,status:'succeeded',currency:'eur',amount:2000,amount_received:2000,capture_method:'automatic',payment_method_types:['card'],latest_charge:'ch_original',client_secret:'never-return'},
+    ['/v1/charges/'+'ch_original']:{...base('ch_original','charge'),customer:t.customerReference,payment_intent:t.intentReference,status:'succeeded',paid:true,captured:true,currency:'eur',amount:2000,amount_captured:2000,amount_refunded:0,refunded:false,payment_method_details:{type:'card'},refunds:list([])},
+  };
+}
+async function billingSetup(mutate=()=>{}){
+  const module=await import('./stripe-sandbox-cli.mjs');assert.equal(typeof module.createBillingCliAdapter,'function');
+  const f=fixture(),base=f.dependencies.execute;f.objects=billingObjects();f.objects['/v1/invoices']={object:'list',data:[f.objects['/v1/invoices/in_original']],has_more:false};mutate(f.objects);
+  const spawn=f.dependencies.spawn;f.dependencies.spawn=(...args)=>{const child=spawn(...args);child.on('exit',()=>{if(child.autoClose!==false)queueMicrotask(()=>child.emit('close',0));});return child;};
+  f.dependencies.execute=async(file,args,settings)=>{const path=args.find(a=>a.startsWith('/v1/'));if(path&&path!=='/v1/balance'){f.calls.push({file,args,settings});return {stdout:JSON.stringify(f.objects[path]),stderr:''};}return base(file,args,settings);};
+  f.options={configuration:{env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true'},runId:RUN,expectedSource:'e'.repeat(40),daemon:'unix:///Users/test/docker.sock',ports:{backend:18080,demo:18081,receiver:18082,postgres:15432,mailpitHttp:18025,mailpitSmtp:11025},approvedBinding:{externalAccountId:ACCOUNT,apiVersion:VERSION},selectedCase:'initial_success'},cliDirectory:DIR,verifyForwardTarget:async()=>true,persistWebhookSecret:async()=>true};
+  f.adapter=await module.createBillingCliAdapter(f.options,f.dependencies);assert.equal(f.calls.length,0);f.limits=LIMIT();return f;
+}
+test('Billing CLI exposes only lifecycle and exact graph reads with fixed supported listener events',async()=>{
+  const f=await billingSetup();assert.equal(f.adapter.bindMissedIntent,undefined);assert.equal(f.adapter.bindManualPayment,undefined);
+  assert.equal(f.adapter.observeOwnedBillingCancellation,undefined);
+  assert.equal(f.adapter.proveOwnedBillingRequiredTrial,undefined);
+  await f.adapter.validateBinding(f.limits);await start(f);const args=f.calls.find(c=>c.child).args,events=args[args.indexOf('--events')+1].split(',');
+  assert.ok(events.includes('invoice.paid'));assert.ok(events.includes('customer.subscription.created'));assert.ok(events.includes('payment_intent.succeeded'));assert.equal(events.some(e=>e.startsWith('refund.')),false);
+  assert.equal(await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits),true);
+  const result=await f.adapter.observeOwnedBillingGraph(f.limits);assert.deepEqual(result,{providerVerified:true,initialCashVerified:true,lineCount:1,allocationCount:1,chargeCount:1});
+  assert.ok(f.calls.filter(c=>c.args.includes('get')&&!c.args.includes('/v1/balance')).every(c=>c.args.includes('--stripe-version')&&c.args.includes(VERSION)));
+  assert.equal(JSON.stringify(result).includes('never-return'),false);await stop(f);
+});
+for(const legacySubscription of [undefined,null])test(`Billing graph accepts a canonical invoice line with legacy subscription ${legacySubscription}`,async()=>{
+  const f=await billingSetup(o=>o['/v1/invoices/in_original/lines'].data[0].subscription=legacySubscription);
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  await stop(f);
+});
+for(const [name,mutateLine] of [
+  ['a conflicting legacy subscription',line=>line.subscription='sub_other'],
+  ['a missing nested subscription',line=>{
+    delete line.subscription;
+    delete line.parent.subscription_item_details.subscription;
+  }],
+  ['a foreign nested subscription',line=>{
+    delete line.subscription;
+    line.parent.subscription_item_details.subscription='sub_other';
+  }],
+  ['a foreign nested subscription item',line=>{
+    delete line.subscription;
+    line.parent.subscription_item_details.subscription_item='si_other';
+  }],
+])test(`Billing graph rejects an invoice line with ${name}`,async()=>{
+  const f=await billingSetup(o=>mutateLine(o['/v1/invoices/in_original/lines'].data[0]));
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await rejects(f.adapter.observeOwnedBillingGraph(f.limits),'BILLING_GRAPH');
+  await stop(f);
+});
+async function cancellationSetup(beforeExecute) {
+  const f=await billingSetup();
+  if(beforeExecute){
+    const execute=f.dependencies.execute;
+    f.dependencies.execute=async(file,args,settings)=>{
+      await beforeExecute(args,f.objects);
+      return execute(file,args,settings);
+    };
+  }
+  f.options.configuration.selectedCase='initial_cancel_withdraw';
+  f.options.configuration.env.PAYMENT_STRIPE_BILLING_CASE='initial_cancel_withdraw';
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  const target=billingTarget(),now=Math.floor(Date.now()/1000);
+  target.periodStart=now-3600;
+  target.periodEnd=now+2592000;
+  const subscription=f.objects['/v1/subscriptions/sub_original'];
+  Object.assign(subscription,{cancel_at:null,cancel_at_period_end:false,schedule:null,pending_update:null,pause_collection:null,
+    ended_at:null,collection_method:'charge_automatically',billing_cycle_anchor:target.periodStart,default_payment_method:null,default_source:null,discounts:[]});
+  Object.assign(subscription.items.data[0],{current_period_start:target.periodStart,current_period_end:target.periodEnd});
+  f.objects['/v1/invoices/in_original/lines'].data[0].period={start:target.periodStart,end:target.periodEnd};
+  f.objects['/v1/invoice_payments'].data[0].status_transitions.paid_at=target.periodStart+1;
+  f.objects['/v1/charges']={object:'list',data:[f.objects['/v1/charges/ch_original']],has_more:false};
+  await f.adapter.validateBinding(f.limits);
+  await start(f);
+  await f.adapter.bindOwnedBillingGraph(target,f.limits);
+  return {...f,target,subscription};
+}
+const challengeEvidence={result:'authenticated',authentication_flow:'challenge',version:'2.2.0'};
+for(const [variant,mutate] of [
+ ['authenticated',()=>{}],
+ ['absent',({charge})=>delete charge.payment_method_details.card.three_d_secure],
+ ['frictionless',({evidence})=>evidence.authentication_flow='frictionless'],
+ ['attempted',({evidence})=>evidence.result='attempt_acknowledged'],
+ ['v1',({evidence})=>evidence.version='1.0.2'],
+ ['trailing-newline',({evidence})=>evidence.version='2.2.0\n'],
+ ['different-charge',({charge,charges})=>charges.data=[{...charge,id:'ch_other'}]],
+ ['extra-charge',({charge,charges})=>charges.data.push({...charge,id:'ch_extra'})],
+ ['foreign intent response',({intent})=>intent.id='pi_other'],
+ ['foreign allocation intent',({allocations})=>allocations.data[0].payment.payment_intent='pi_other'],
+ ['foreign charge intent',({charge})=>charge.payment_intent='pi_other'],
+ ['wrong received amount',({intent})=>intent.amount_received=1999],
+ ['wrong intent currency',({intent})=>intent.currency='usd'],
+ ['wrong captured amount',({charge})=>charge.amount_captured=1999],
+ ['wrong charge currency',({charge})=>charge.currency='usd'],
+ ['multiple paid allocations',({allocations})=>allocations.data.push({...allocations.data[0],id:'inpay_extra'})],
+ ['multiple reverse allocations',({f,allocations})=>{
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+   if(args.includes('/v1/invoice_payments')&&args.includes('payment[payment_intent]=pi_original')){
+    return {stdout:JSON.stringify({...allocations,data:[...allocations.data,{...allocations.data[0],id:'inpay_extra'}]}),stderr:''};
+   }
+   return execute(file,args,settings);
+  };
+ }],
+ ['changed latest charge',({f,intent})=>{
+  const execute=f.dependencies.execute;
+  let reads=0;
+  f.dependencies.execute=async(file,args,settings)=>{
+   if(args.includes('/v1/payment_intents/pi_original')&&++reads===2){
+    return {stdout:JSON.stringify({...intent,latest_charge:'ch_other'}),stderr:''};
+   }
+   return execute(file,args,settings);
+  };
+ }],
+]){
+ test('initial 3DS requires the authenticated challenge on the single original captured charge: '+variant,async()=>{
+  const f=await billingSetup(),target=billingTarget();
+  assert.equal(f.adapter.observeOwnedBillingInitial3ds,undefined);
+  const config=f.options.configuration;
+  config.selectedCase='initial_3ds';config.env.PAYMENT_STRIPE_BILLING_CASE=config.selectedCase;
+  const charge=f.objects['/v1/charges/ch_original'],evidence={...challengeEvidence};
+  charge.payment_method_details.card={three_d_secure:evidence};
+  const charges=f.objects['/v1/charges']={object:'list',has_more:false,data:[charge]};
+  mutate({f,charge,evidence,charges,intent:f.objects['/v1/payment_intents/pi_original'],allocations:f.objects['/v1/invoice_payments']});
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  assert.equal(f.adapter.observeOwnedBillingGraph,undefined);
+  await f.adapter.validateBinding(f.limits);await start(f);
+  try{
+   const inspect=()=>f.adapter.observeOwnedBillingInitial3ds(target,f.limits);
+   if(variant==='authenticated')assert.equal(await inspect(),true);else await rejects(inspect(),'BILLING_INITIAL_3DS');
+   const count=f.calls.length;await rejects(inspect(),'BILLING_INITIAL_3DS');assert.equal(f.calls.length,count);
+  }finally{await stop(f);}
+ });
+}
+for(const flag of [false,true])test('Billing cancellation accepts the explicit original boundary with period-end flag '+flag+' and proves withdrawal',async()=>{
+  const f=await cancellationSetup();
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  f.subscription.cancel_at=f.target.periodEnd;
+  f.subscription.cancel_at_period_end=flag;
+  assert.equal(await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),true);
+  f.subscription.cancel_at=null;
+  f.subscription.cancel_at_period_end=false;
+  assert.equal(await f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits),true);
+  for(const path of ['/v1/charges','/v1/invoices']){
+    const inventory=f.calls.filter(c=>c.args.includes(path)&&c.args.includes('customer=cus_original'));
+    assert.equal(inventory.length,3);
+    assert.ok(inventory.every(c=>c.args.includes('get')&&c.args.includes('limit=100')&&c.args.includes(VERSION)));
+  }
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits),/BILLING_CANCELLATION/);
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+test('Billing cancellation requests the expandable out-of-band amount on the original invoice only',async()=>{
+  const invoicePath='/v1/invoices/in_original';
+  const f=await cancellationSetup((args,objects)=>{
+    if(args.includes(invoicePath)&&!args.includes('expand[]=amount_paid_off_stripe'))delete objects[invoicePath].amount_paid_off_stripe;
+  });
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  f.subscription.cancel_at=f.target.periodEnd;
+  await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  f.subscription.cancel_at=null;
+  await f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits);
+  const expanded=f.calls.filter(c=>c.args.some(arg=>arg.startsWith('expand[')));
+  assert.equal(expanded.length,3);
+  for(const call of expanded){
+    const get=call.args.indexOf('get');
+    assert.deepEqual(call.args.slice(get,get+4),['get',invoicePath,'-d','expand[]=amount_paid_off_stripe']);
+  }
+  await stop(f);
+  const ordinary=await billingSetup();
+  await ordinary.adapter.validateBinding(ordinary.limits);await start(ordinary);
+  await ordinary.adapter.bindOwnedBillingGraph(billingTarget(),ordinary.limits);
+  assert.equal((await ordinary.adapter.observeOwnedBillingGraph(ordinary.limits)).initialCashVerified,true);
+  assert.ok(!ordinary.calls.some(c=>c.args.includes('expand[]=amount_paid_off_stripe')));
+  await stop(ordinary);
+});
+test('Billing cancellation abandons overlapping observations without permitting either result',async()=>{
+  let release,entered;
+  const waiting=new Promise(resolve=>{entered=resolve;});
+  const paused=new Promise(resolve=>{release=resolve;});
+  let block=false;
+  const f=await cancellationSetup(async args=>{
+    if(block&&args.includes('/v1/customers/cus_original')){entered();await paused;}
+  });
+  await f.adapter.observeOwnedBillingGraph(f.limits);
+  f.subscription.cancel_at=f.target.periodEnd;
+  block=true;
+  const scheduled=f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  await waiting;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BUSY/);
+  release();
+  await assert.rejects(scheduled,/BILLING_CANCELLATION/);
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('withdrawn',f.limits));
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+test('Billing cancellation rechecks the observed schedule after reading invoices and charges',async()=>{
+  let clearDuringRead=false;
+  const f=await cancellationSetup((args,objects)=>{
+    if(clearDuringRead&&args.includes('/v1/charges'))objects['/v1/subscriptions/sub_original'].cancel_at=null;
+  });
+  await f.adapter.observeOwnedBillingGraph(f.limits);
+  f.subscription.cancel_at=f.target.periodEnd;
+  clearDuringRead=true;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BILLING_CANCELLATION/);
+  await stop(f);
+});
+for(const phase of ['before baseline','withdrawn','arbitrary','repeat scheduled'])test('Billing cancellation refuses '+phase+' before any new provider read',async()=>{
+  const f=await cancellationSetup();
+  if(phase!=='before baseline')await f.adapter.observeOwnedBillingGraph(f.limits);
+  if(phase==='repeat scheduled'){
+    f.subscription.cancel_at=f.target.periodEnd;
+    await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);
+  }
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation(phase==='before baseline'||phase==='repeat scheduled'?'scheduled':phase,f.limits),/BILLING_CANCELLATION/);
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits),/BILLING_CANCELLATION/);
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+for(const [name,phase,mutate] of [
+  ['preexisting schedule','baseline',f=>f.subscription.cancel_at=f.target.periodEnd],
+  ['terminal subscription','baseline',f=>f.subscription.ended_at=f.target.periodStart],
+  ['wrong boundary','scheduled',f=>f.subscription.cancel_at=f.target.periodEnd-1],
+  ['native boolean alone','scheduled',f=>{f.subscription.cancel_at=null;f.subscription.cancel_at_period_end=true;}],
+  ['missing flag','scheduled',f=>delete f.subscription.cancel_at_period_end],
+  ['subscription schedule','scheduled',f=>f.subscription.schedule='sub_sched_foreign'],
+  ['pending plan change','scheduled',f=>f.subscription.pending_update={expires_at:f.target.periodEnd}],
+  ['paused collection','scheduled',f=>f.subscription.pause_collection={behavior:'void'}],
+  ['unrelated default method','withdrawn',f=>f.subscription.default_payment_method='pm_other'],
+  ['item identity drift','withdrawn',f=>{f.subscription.items.data[0].id='si_other';f.objects['/v1/invoices/in_original/lines'].data[0].parent.subscription_item_details.subscription_item='si_other';}],
+  ['residual schedule flag','withdrawn',f=>f.subscription.cancel_at_period_end=true],
+  ['absent cleared boundary','withdrawn',f=>delete f.subscription.cancel_at],
+  ['different captured charge','withdrawn',f=>{const charge={...f.objects['/v1/charges/ch_original'],id:'ch_other'};f.objects['/v1/payment_intents/pi_original'].latest_charge=charge.id;f.objects['/v1/charges/ch_other']=charge;f.objects['/v1/charges'].data=[charge];}],
+  ['additional customer charge','withdrawn',f=>f.objects['/v1/charges'].data.push({...f.objects['/v1/charges/ch_original'],id:'ch_additional'})],
+  ['additional invoice','withdrawn',f=>f.objects['/v1/invoices'].data.push({...f.objects['/v1/invoices/in_original'],id:'in_additional'})],
+  ['missing out-of-band amount','withdrawn',f=>delete f.objects['/v1/invoices/in_original'].amount_paid_off_stripe],
+  ['out-of-band cash','withdrawn',f=>f.objects['/v1/invoices/in_original'].amount_paid_off_stripe=2000],
+  ['refund','withdrawn',f=>f.objects['/v1/refunds'].data.push({id:'re_pending'})],
+])test('Billing cancellation abandons '+name+' at '+phase,async()=>{
+  const f=await cancellationSetup();
+  if(phase!=='baseline')await f.adapter.observeOwnedBillingGraph(f.limits);
+  if(phase==='withdrawn'){f.subscription.cancel_at=f.target.periodEnd;await f.adapter.observeOwnedBillingCancellation('scheduled',f.limits);}
+  f.subscription.cancel_at=phase==='scheduled'?f.target.periodEnd:null;
+  mutate(f);
+  await assert.rejects(phase==='baseline'?f.adapter.observeOwnedBillingGraph(f.limits):f.adapter.observeOwnedBillingCancellation(phase,f.limits),/BILLING_(CANCELLATION|GRAPH)/);
+  const count=f.calls.length;
+  await assert.rejects(f.adapter.observeOwnedBillingCancellation('scheduled',f.limits));
+  assert.equal(f.calls.length,count);
+  await stop(f);
+});
+for(const [name,mutate] of [
+ ['foreign customer',o=>o['/v1/customers/cus_original'].metadata.account_id=RUN],['foreign subscription',o=>o['/v1/subscriptions/sub_original'].customer='cus_other'],['wrong price',o=>o['/v1/prices/price_original'].metadata.local_price_id=RUN],['out of band',o=>o['/v1/invoices/in_original'].amount_paid_off_stripe=2000],['extra line',o=>o['/v1/invoices/in_original/lines'].data.push({...o['/v1/invoices/in_original/lines'].data[0],id:'il_other'})],['split allocation',o=>o['/v1/invoice_payments'].data.push({...o['/v1/invoice_payments'].data[0],id:'inpay_other'})],['non-default',o=>o['/v1/invoice_payments'].data[0].is_default=false],['wrong intent',o=>o['/v1/invoice_payments'].data[0].payment.payment_intent='pi_other'],['uncaptured',o=>o['/v1/charges/ch_original'].captured=false],['refunded',o=>o['/v1/charges/ch_original'].amount_refunded=1],['live',o=>o['/v1/payment_intents/pi_original'].livemode=true],['endless pagination',o=>o['/v1/invoices/in_original/lines'].has_more=true],
+])test('Billing graph rejects '+name+' and latches failure',async()=>{const f=await billingSetup(mutate);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);});
+test('Billing original graph rejects rebinding and stale source before provider reads',async()=>{
+  for(const kind of ['source','accessor','rebind']){const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const target=billingTarget();let touched=0;
+    if(kind==='source')target.expectedSource='a'.repeat(40);if(kind==='accessor')Object.defineProperty(target,'intentReference',{enumerable:true,get(){touched++;throw null;}});
+    if(kind==='rebind')await f.adapter.bindOwnedBillingGraph(target,f.limits);const count=f.calls.length;
+    await assert.rejects(f.adapter.bindOwnedBillingGraph(target,f.limits),/BILLING_BINDING/);assert.equal(touched,0);assert.equal(f.calls.length,count);await stop(f);
+  }
+});
+test('Billing synchronous listener guard loses authority on exit and cannot restart after stop',async()=>{
+  const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const n=f.calls.length;
+  assert.equal(typeof f.adapter.assertBillingListener,'function');assert.equal(f.adapter.assertBillingListener(f.limits),true);assert.equal(f.calls.length,n);
+  f.children[0].emit('exit',1);assert.throws(()=>f.adapter.assertBillingListener(f.limits),/BILLING_LISTENER/);await assert.rejects(f.adapter.loginInvocation(f.limits));await stop(f);
+});
+test('Billing read guard rechecks approved account rather than trusting a prior login forever',async()=>{
+  const f=await billingSetup(),execute=f.dependencies.execute;let foreign=false;
+  f.dependencies.execute=async(file,args,settings)=>args.includes('whoami')&&foreign?{stdout:JSON.stringify({...oauth(),account_id:'acct_other'}),stderr:''}:execute(file,args,settings);
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);foreign=true;
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing follows bounded invoice cursors and checks the reverse PI allocation join',async()=>{
+  for(const reverseWrong of [false,true]){const f=await billingSetup(),execute=f.dependencies.execute;let invoices=0;
+    f.dependencies.execute=async(file,args,settings)=>{if(args.includes('/v1/invoices')){f.calls.push({file,args,settings});invoices++;return {stdout:JSON.stringify({object:'list',data:invoices===1?[f.objects['/v1/invoices/in_original']]:[],has_more:invoices===1}),stderr:''};}
+      if(reverseWrong&&args.includes('payment[type]=payment_intent'))return {stdout:JSON.stringify({object:'list',data:[{...f.objects['/v1/invoice_payments'].data[0],invoice:'in_other'}],has_more:false}),stderr:''};return execute(file,args,settings);};
+    const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+    if(reverseWrong)await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);else assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+    assert.equal(invoices,2);const calls=f.calls.filter(c=>c.args.includes('/v1/invoices'));assert.ok(calls[0].args.includes('subscription=sub_original'));assert.ok(calls[1].args.includes('starting_after=in_original'));await stop(f);
+  }
+});
+
+for(const signalMode of ['omitted','replaced'])for(const entry of ['guard','observe'])test(`Billing original abort survives ${signalMode} signal at ${entry}`,async()=>{
+  const f=await billingSetup(),root=new AbortController(),limits={...f.limits,signal:root.signal};
+  await f.adapter.validateBinding(limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  root.abort();const later={deadline:f.limits.deadline,...(signalMode==='replaced'?{signal:new AbortController().signal}:{})},count=f.calls.length;
+  if(entry==='guard')assert.throws(()=>f.adapter.assertBillingListener(later),/BILLING_LISTENER/);else await assert.rejects(f.adapter.observeOwnedBillingGraph(later),/BILLING_GRAPH/);
+  await assert.rejects(f.adapter.validateBinding(later),/BINDING/);assert.equal(f.calls.length,count);
+  assert.equal(await f.adapter.stopListener({deadline:f.limits.deadline+1000}),true);assert.ok(f.children[0].signals.includes('SIGINT'));
+});
+test('Billing original abort reaches an in-flight read with substituted signal and rejects late response',async()=>{
+  const f=await billingSetup(),root=new AbortController(),execute=f.dependencies.execute;let release,capturedSignal,entered;
+  const waiting=new Promise(resolveEntered=>{entered=resolveEntered;});
+  f.dependencies.execute=async(file,args,settings)=>{if(args.includes('/v1/customers/cus_original')){capturedSignal=settings.signal;entered();await new Promise(resolveRelease=>{release=resolveRelease;});}return execute(file,args,settings);};
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding({...f.limits,signal:root.signal});await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  const observation=f.adapter.observeOwnedBillingGraph({...f.limits,signal:new AbortController().signal});await waiting;root.abort();
+  const aborted=capturedSignal.aborted;release();await assert.rejects(observation,/BILLING_GRAPH/);assert.equal(aborted,true);
+  const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+for(const path of ['/v1/customers/cus_original','/v1/subscriptions/sub_original'])for(const clock of ['clock_excluded',undefined])test(`Billing no-clock proof rejects ${clock===undefined?'missing':'present'} test_clock on ${path}`,async()=>{
+  const f=await billingSetup(o=>{if(clock===undefined)delete o[path].test_clock;else o[path].test_clock=clock;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+const excludedRefundCollections=[
+ ['pending',{object:'list',data:[{id:'re_excluded',status:'pending'}],has_more:false}],
+ ['failed',{object:'list',data:[{id:'re_excluded',status:'failed'}],has_more:false}],
+ ['canceled',{object:'list',data:[{id:'re_excluded',status:'canceled'}],has_more:false}],
+ ['truncated',{object:'list',data:[],has_more:true}],['null',null],['missing',undefined],
+ ['wrong object',{object:'refund',data:[],has_more:false}],['missing data',{object:'list',has_more:false}],
+ ['missing completeness',{object:'list',data:[]}],
+];
+for(const [name,value] of excludedRefundCollections)test('Billing exact-charge refund read rejects '+name+' and latches',async()=>{
+  const f=await billingSetup(o=>{o['/v1/refunds']=value;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);const count=f.calls.length;await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits));assert.equal(f.calls.length,count);await stop(f);
+});
+for(const [name,value] of excludedRefundCollections.filter(([name])=>name!=='missing'))test('Billing embedded refund collection rejects '+name+' even when exact-charge query would be empty',async()=>{
+  const f=await billingSetup(o=>{o['/v1/charges/ch_original'].refunds=value;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing omitted embedded refunds require a fixed exact-charge complete empty query',async()=>{
+  const f=await billingSetup(o=>{delete o['/v1/charges/ch_original'].refunds;});await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);
+  assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).initialCashVerified,true);
+  const calls=f.calls.filter(c=>c.args.includes('/v1/refunds'));assert.equal(calls.length,1);assert.ok(calls[0].args.includes('charge=ch_original'));assert.ok(calls[0].args.includes('limit=100'));await stop(f);
+});
+test('Billing graph derives successful Charge only from exact bound original PI, with no caller override',async()=>{
+ const f=await billingSetup();await f.adapter.validateBinding(f.limits);await start(f);const target=billingTarget();
+ await f.adapter.bindOwnedBillingGraph(target,f.limits);assert.equal((await f.adapter.observeOwnedBillingGraph(f.limits)).chargeCount,1);
+ assert.ok(f.calls.some(c=>c.args.includes('/v1/charges/ch_original')));await stop(f);
+ const g=await billingSetup();await g.adapter.validateBinding(g.limits);await start(g);await assert.rejects(g.adapter.bindOwnedBillingGraph({...target,chargeReference:'ch_override'},g.limits),/BILLING_BINDING/);await stop(g);
+});
+for(const charge of [null,{},'pi_foreign','ch_foreign'])test('Billing derived latest Charge rejects '+JSON.stringify(charge),async()=>{
+ const f=await billingSetup(o=>o['/v1/payment_intents/pi_original'].latest_charge=charge);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('Billing latest Charge drift after reverse allocation read cannot accept',async()=>{
+ const f=await billingSetup(),execute=f.dependencies.execute;let reads=0;f.dependencies.execute=async(...args)=>{if(args[1].includes('/v1/payment_intents/pi_original')&&++reads===2)f.objects['/v1/payment_intents/pi_original'].latest_charge='ch_changed';return execute(...args);};
+ const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingCliAdapter(f.options,f.dependencies);await f.adapter.validateBinding(f.limits);await start(f);await f.adapter.bindOwnedBillingGraph(billingTarget(),f.limits);await assert.rejects(f.adapter.observeOwnedBillingGraph(f.limits),/BILLING_GRAPH/);await stop(f);
+});
+test('first-payment CLI retains binding and listener only with no provider graph capabilities',async()=>{const f=await billingSetup();f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_PAYMENT:'true'};f.options.configuration.controlPort=18083;f.options.configuration.frozenTime=1790000000;const {createBillingFirstPaymentCliAdapter}=await import('./stripe-sandbox-cli.mjs');f.adapter=await createBillingFirstPaymentCliAdapter(f.options,f.dependencies);assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','completeLoginInvocation','loginInvocation','startListener','stopListener','validateBinding']);await f.adapter.validateBinding(f.limits);await start(f);assert.equal(await f.adapter.assertBillingListener(f.limits),true);await stop(f);assert.equal(f.calls.some(c=>c.args.includes('post')||c.args.some(a=>a.startsWith('/v1/')&&!['/v1/balance','/v1/account'].includes(a))),false);});
+
+test('first-renewal CLI exposes binding and listener only and rejects mixed mode before dependencies',async()=>{
+ const f=await billingSetup();f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FIRST_RENEWAL:'true'};f.options.configuration.selectedCase='initial_and_first_renewal';f.options.configuration.controlPort=18083;f.options.configuration.frozenTime=1790000000;
+ const module=await import('./stripe-sandbox-cli.mjs');assert.equal(typeof module.createBillingFirstRenewalCliAdapter,'function');
+ f.adapter=await module.createBillingFirstRenewalCliAdapter(f.options,f.dependencies);assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','completeLoginInvocation','loginInvocation','startListener','stopListener','validateBinding']);
+ await f.adapter.validateBinding(f.limits);await start(f);assert.equal(await f.adapter.assertBillingListener(f.limits),true);await stop(f);
+ assert.equal(f.calls.some(c=>c.args.includes('post')||c.args.some(a=>a.startsWith('/v1/')&&!['/v1/balance','/v1/account'].includes(a))),false);
+ let reads=0;const trap=new Proxy({},{get(){reads++;throw null;}});await assert.rejects(module.createBillingFirstPaymentCliAdapter(f.options,trap),/OPT_IN_REQUIRED/);
+ f.options.configuration.env.PAYMENT_STRIPE_BILLING_FIRST_PAYMENT='true';await assert.rejects(module.createBillingFirstRenewalCliAdapter(f.options,trap),/OPT_IN_REQUIRED/);assert.equal(reads,0);
+});
+
+async function failedRenewalCli(persistWebhookSecret=async()=>true,configureChild=()=>{}) {
+  const f=await billingSetup();
+  Object.assign(f.options.configuration,{
+    env:{PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true'},
+    selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000,
+  });
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{const child=spawn(...args);configureChild(child);return child;};
+  f.options.persistWebhookSecret=persistWebhookSecret;
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);
+  return f;
+}
+
+const profileConfig='fake stripe cli project config\n',profileCredentials='{"fixture":"inert credential"}\n';
+const acceptanceProfileFlags={
+  initial_decline_retry:'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID',
+  initial_3ds:'PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID',
+  initial_cancel_withdraw:'PAYMENT_STRIPE_BILLING_CANCELLATION_CLI_PROFILE_RUN_ID',
+  initial_missed_reordered:'PAYMENT_STRIPE_BILLING_INVOICE_WEBHOOKS_CLI_PROFILE_RUN_ID',
+};
+async function failedRenewalProfile(t, acceptanceCase) {
+  const f=await billingSetup(),priors=ROOT+'/test-results/stripe-sandbox',prior=randomUUID(),run=randomUUID();
+  const cli=priors+'/'+run+'/cli',source=priors+'/'+prior+'/cli/config/stripe',destination=cli+'/config/stripe';
+  t.after(()=>Promise.all([prior,run].map(id=>rm(priors+'/'+id,{recursive:true,force:true}))));
+  for(const id of [prior,run]){
+    for(const path of ['/cli/home','/cli/config/stripe'])await mkdir(priors+'/'+id+path,{recursive:true,mode:0o700});
+  }
+  await writeFile(source+'/config.toml',profileConfig,{mode:0o600});
+  await writeFile(source+'/credentials.json',profileCredentials,{mode:0o600});
+  await writeFile(source+'/oauth_pending.json','unrelated',{mode:0o600});
+  await writeFile(destination+'/config.toml','',{mode:0o600});
+  Object.assign(f.options.configuration,{runId:run,env:{
+    PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_FAILED_RENEWAL:'true',
+    PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID:prior,
+  },selectedCase:'initial_failed_renewal_grace_recovery',controlPort:18083,frozenTime:1790000000});
+  if(acceptanceCase){
+    const profileFlag=acceptanceCase==='initial_required_trial'
+      ?'PAYMENT_STRIPE_BILLING_REQUIRED_TRIAL_CLI_PROFILE_RUN_ID':acceptanceProfileFlags[acceptanceCase];
+    f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_ACCEPTANCE:'true',
+      PAYMENT_STRIPE_BILLING_CASE:acceptanceCase,[profileFlag]:prior};
+    f.options.configuration.selectedCase=acceptanceCase;
+    delete f.options.configuration.controlPort;
+    delete f.options.configuration.frozenTime;
+  }
+  f.options.cliDirectory=cli;
+  Object.assign(f.dependencies,{lstat,open,readdir,realpath});
+  return {f,cli,source,destination};
+}
+
+async function optionalTrialProfile(t,expiry=new Date(Date.now()+600000).toISOString()){
+ const paths=await failedRenewalProfile(t),{f,source}=paths;
+ const old=f.options.configuration.env.PAYMENT_STRIPE_BILLING_FAILED_RENEWAL_CLI_PROFILE_RUN_ID;
+ f.options.configuration.env={PAYMENT_STRIPE_SANDBOX_ENABLED:'true',PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL:'true',
+  PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_CLI_PROFILE_RUN_ID:old,PAYMENT_STRIPE_BILLING_OPTIONAL_TRIAL_SUBNET:'10.94.40.0/28'};
+ f.options.configuration.selectedCase='optional_trial_pause_resume';
+ delete f.options.configuration.frozenTime;
+ const spawn=f.dependencies.spawn;
+ f.dependencies.spawn=(...args)=>{const child=spawn(...args);queueMicrotask(()=>child.stderr.write(READY));return child;};
+ const credentials=JSON.stringify({fixture:'inert credential',oauth_uat_expires_at:expiry});
+ await writeFile(source+'/credentials.json',credentials,{mode:0o600});
+ const {createOwnedBillingOptionalTrialCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+ f.adapter=await createOwnedBillingOptionalTrialCliAdapter(f.options,f.dependencies);
+ return {...paths,credentials};
+}
+
+test('optional trial reads a fresh profile before writes, then authenticates its copy',async t=>{
+ const {f,source,destination,credentials}=await optionalTrialProfile(t);
+ assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','checkSavedProfile','startListener','stopListener','validateBinding']);
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'READY');
+ assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ await f.adapter.validateBinding(f.limits);
+ assert.equal(await readFile(destination+'/config.toml','utf8'),profileConfig);
+ assert.equal(await readFile(destination+'/credentials.json','utf8'),credentials);
+ assert.equal(await readFile(source+'/config.toml','utf8'),profileConfig);
+ assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+ assert.equal(await f.adapter.startListener(f.limits),true);
+ assert.equal(await f.adapter.assertBillingListener(f.limits),true);
+ await stop(f);
+ assert.ok(f.calls.every(call=>!call.args.includes('post')
+  &&!call.args.some(arg=>arg.startsWith('/v1/')&&!['/v1/account','/v1/balance'].includes(arg))));
+});
+
+test('optional trial reports expired OAuth without invoking Stripe or writing a profile copy',async t=>{
+ const {f,source,destination,credentials}=await optionalTrialProfile(t,new Date(Date.now()-600000).toISOString());
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'EXPIRED');
+ await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+ assert.equal(await readFile(source+'/credentials.json','utf8'),credentials);
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('optional trial rechecks expiration of the profile snapshot it will copy',async t=>{
+ const {f,source,destination}=await optionalTrialProfile(t);
+ assert.equal(await f.adapter.checkSavedProfile(f.limits),'READY');
+ await writeFile(source+'/credentials.json',JSON.stringify({oauth_uat_expires_at:'2000-01-01T00:00:00Z'}));
+ await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('optional trial rejects malformed expiration without returning profile data',async t=>{
+ const {f,destination}=await optionalTrialProfile(t,'synthetic private detail');
+ await rejects(f.adapter.checkSavedProfile(f.limits),'CLI_PROFILE');
+ assert.deepEqual(await readdir(destination),['config.toml']);
+ assert.equal(f.calls.length,0);
+ assert.equal(await stop(f),true);
+});
+
+test('aborted optional-trial profile inspection never opens credentials after a delayed stat',async t=>{
+  const {f,source}=await optionalTrialProfile(t);
+  const target=source+'/credentials.json', abort=new AbortController();
+  let statStarted, releaseStat, opened=0;
+  const entered=new Promise(resolve=>{statStarted=resolve;});
+  const blocked=new Promise(resolve=>{releaseStat=resolve;});
+  const stat=f.dependencies.lstat, fileOpen=f.dependencies.open;
+  f.dependencies.lstat=async name=>{
+    if(name===target){statStarted();await blocked;}
+    return stat(name);
+  };
+  f.dependencies.open=(name,...args)=>{
+    if(name===target)opened++;
+    return fileOpen(name,...args);
+  };
+  const {createOwnedBillingOptionalTrialCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createOwnedBillingOptionalTrialCliAdapter(f.options,f.dependencies);
+  const refused=rejects(f.adapter.checkSavedProfile({...f.limits,signal:abort.signal}),'CLI_PROFILE');
+  await entered;
+  abort.abort();
+  releaseStat();
+  await refused;
+  assert.equal(opened,0);
+  assert.equal(f.calls.length,0);
+  assert.equal(await stop(f),true);
+});
+
+async function requiredTrialCli(t,{startListener=true,beforeRequest,identity=oauth,execFile,
+  configureListener=child=>queueMicrotask(()=>child.stderr.write(READY))}={}){
+  const {f,destination}=await failedRenewalProfile(t,'initial_required_trial');
+  const {runId,expectedSource}=f.options.configuration;
+  const scope={...billingTarget(),runId,expectedSource,siteKey:'s5a-'+runId.replaceAll('-',''),
+    productId:'99999999-1111-4222-8333-444444444444',createKeyHash:'b'.repeat(64)};
+  const startTime=Math.floor(Date.now()/1000)-30,endTime=startTime+7*86400;
+  const trialStart=new Date(startTime*1000),trialEnd=new Date(endTime*1000);
+  const customer='/v1/customers/cus_original',subscription='/v1/subscriptions/sub_original',invoice='/v1/invoices/in_original';
+  const setup='/v1/setup_intents/seti_original',method='/v1/payment_methods/pm_original';
+  const list=(...data)=>({object:'list',has_more:false,data});
+  Object.assign(f.objects[subscription],{status:'trialing',trial_start:startTime,trial_end:endTime,
+    default_payment_method:'pm_original',billing_mode:{type:'classic'},collection_method:'charge_automatically',
+    pause_collection:null,cancel_at:null,cancel_at_period_end:false,schedule:null,pending_update:null,ended_at:null,
+    trial_settings:{end_behavior:{missing_payment_method:'pause'}}});
+  Object.assign(f.objects[subscription].items.data[0],{current_period_start:startTime,current_period_end:endTime});
+  const line=f.objects[invoice+'/lines'].data[0];
+  Object.assign(line,{amount:0,period:{start:startTime,end:endTime}});
+  Object.assign(f.objects[invoice],{test_clock:null,amount_due:0,amount_paid:0,total:0,subtotal:0,lines:list(line)});
+  Object.assign(f.objects,{
+    [setup]:{id:'seti_original',object:'setup_intent',livemode:false,customer:'cus_original',payment_method:'pm_original',
+      status:'succeeded',usage:'off_session',payment_method_types:['card'],metadata:f.objects[subscription].metadata,
+      client_secret:'private-setup-value'},
+    [method]:{id:'pm_original',object:'payment_method',livemode:false,customer:'cus_original',type:'card',card:{}},
+    '/v1/invoice_payments':list(),'/v1/payment_intents':list(),'/v1/charges':list(),
+  });
+  const cliRequests=[],events=[],execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    if(args[11]==='whoami')return {stdout:JSON.stringify(identity()),stderr:''};
+    const path=args[12];
+    if(args[11]!=='get'||path==='/v1/balance')return execute(file,args,settings);
+    cliRequests.push({file,args,settings});
+    events.push(path);
+    const changed=await beforeRequest?.(f,path,settings);
+    return changed??{stdout:JSON.stringify(f.objects[path]),stderr:`< HTTP 200\n< Stripe-Version: ${VERSION}\n`};
+  };
+  if(execFile){
+    const executeCommand=f.dependencies.execute;
+    delete f.dependencies.execute;
+    f.dependencies.execFile=(...args)=>execFile(executeCommand,...args);
+  }
+  const seed=await readFile(new URL('./stripe-billing-required-trial-seed.sql',import.meta.url),'utf8');
+  const proof=await readFile(new URL('./stripe-billing-required-trial-proof.sql',import.meta.url),'utf8');
+  const seedArgs=[runId,scope.accountId,scope.siteId,scope.customerId,scope.productId,scope.priceId,
+    scope.subscriptionId,scope.operationId,scope.createKeyHash];
+  const ownedFixture={resources:()=>scope};
+  const readOnly=async(request,limits)=>{
+    assert.equal(request.mode,'read only');
+    assert.equal(limits.signal.aborted,false);
+    if(request.query===seed){
+      events.push('seed');
+      assert.deepEqual(request.args,seedArgs);
+      return [{customer_reference:'cus_original',setup_reference:'seti_original',method_reference:'pm_original',
+        subscription_reference:'sub_original',item_reference:'si_original',invoice_reference:'in_original',
+        provider_price_id:'price_original',provider_product_id:'prod_original',trial_start:trialStart,trial_end:trialEnd}];
+    }
+    assert.equal(request.query,proof);
+    events.push('proof');
+    assert.deepEqual(request.args,[...seedArgs,'cus_original','seti_original','pm_original','sub_original','si_original',
+      'in_original',trialStart.toISOString(),trialEnd.toISOString()]);
+    const evaluated=new Date();
+    return [{run_id:runId,billing_record_id:RUN,trial_started_event_id:scope.operationId,revision:1,
+      trial_start:trialStart,trial_end:trialEnd,access_evaluated_at:evaluated,access_valid_until:new Date(evaluated.getTime()+300000)}];
+  };
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{
+    const child=spawn(...args);
+    configureListener(child);
+    return child;
+  };
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);
+  if(startListener)await f.adapter.startListener(f.limits);
+  t.after(()=>f.adapter.stopListener(f.limits));
+  return {f,cliRequests,destination,events,ownedFixture,readOnly};
+}
+
+test('required-trial CLI exposes only the owned zero-cash proof and emits the nine scoped test-mode GETs',async t=>{
+  const {f,cliRequests,destination,events,ownedFixture,readOnly}=await requiredTrialCli(t);
+  assert.ok(Object.hasOwn(f.adapter,'proveOwnedBillingRequiredTrial'));
+  assert.deepEqual(Object.keys(f.adapter).sort(),['assertBillingListener','proveOwnedBillingRequiredTrial',
+    'startListener','stopListener','validateBinding']);
+  const limits={deadline:Date.now()+4000};
+  const result=await f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits);
+  assert.equal(result.trialVerified,true);
+  assert.equal(result.noCash,true);
+  assert.equal(result.runId,f.options.configuration.runId);
+  assert.equal(result.billingRecordId,RUN);
+  assert.doesNotMatch(JSON.stringify(result),/seti_original|private-setup-value|pm_original|whsec_/);
+  const expected=[
+    ['/v1/customers/cus_original'],
+    ['/v1/setup_intents/seti_original'],
+    ['/v1/payment_methods/pm_original'],
+    ['/v1/subscriptions/sub_original'],
+    ['/v1/invoices/in_original','-d','expand[]=amount_paid_off_stripe'],
+    ['/v1/invoices','-d','subscription=sub_original','-d','limit=2'],
+    ['/v1/invoice_payments','-d','invoice=in_original','-d','limit=1'],
+    ['/v1/payment_intents','-d','customer=cus_original','-d','limit=1'],
+    ['/v1/charges','-d','customer=cus_original','-d','limit=1'],
+  ];
+  assert.deepEqual(events,['seed',...expected.map(([path])=>path),'proof']);
+  assert.deepEqual(cliRequests.map(({args})=>args.slice(11)),expected.map(([path,...filters])=>
+    ['get',path,'--show-headers',...filters,'--stripe-version',VERSION]));
+  for(const {file,args,settings} of cliRequests){
+    assert.equal(file,'/usr/bin/sandbox-exec');
+    assert.equal(args[2],'/opt/homebrew/bin/stripe');
+    assert.equal(args[4],destination+'/config.toml');
+    assert.equal(settings.env.XDG_CONFIG_HOME,f.options.cliDirectory+'/config');
+    assert.equal(settings.env.HOME,f.options.cliDirectory+'/home');
+    assert.equal(settings.shell,false);
+    assert.ok(settings.timeout>0&&settings.timeout<=4000);
+  }
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits),'BILLING_REQUIRED_TRIAL');
+  assert.equal(cliRequests.length,9);
+});
+
+for(const [name,beforeRequest] of [
+  ['foreign API response version',()=>({stdout:'{}',stderr:'< HTTP 200\n< Stripe-Version: leaked-value\n'})],
+  ['foreign customer account',f=>{f.objects['/v1/customers/cus_original'].account='acct_other';}],
+  ['lost listener during a read',f=>{f.children[0].emit('exit',1);}],
+  ['untrusted command failure',()=>{throw new Proxy({},{get(){assert.fail('cannot inspect command failure');}});}],
+])test('required-trial CLI consumes a failed proof after '+name,async t=>{
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{beforeRequest});
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,['seed','/v1/customers/cus_original']);
+});
+
+test('required-trial CLI requires ready listener ownership before seed or provider reads',async t=>{
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{startListener:false});
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,[]);
+});
+
+test('required-trial CLI rechecks the authenticated account before the proof begins',async t=>{
+  let accountId=ACCOUNT;
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{identity:()=>({...oauth(),account_id:accountId})});
+  accountId='acct_other';
+  await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,f.limits),'BILLING_REQUIRED_TRIAL');
+  assert.deepEqual(events,[]);
+});
+
+for(const held of ['whoami','/v1/customers/cus_original'])test('required-trial stop awaits the aborted CLI close for '+held,async t=>{
+  let notifyStarted,hold=false;
+  const started=new Promise(resolve=>{notifyStarted=resolve;});
+  const {f,events,ownedFixture,readOnly}=await requiredTrialCli(t,{
+    execFile(execute,file,args,settings,callback){
+      const child=new EventEmitter();
+      void execute(file,args,settings).then(({stdout,stderr})=>{
+        if(hold&&args.includes(held)){
+          settings.signal.addEventListener('abort',()=>callback(new Error('private failure'),'',''),{once:true});
+          notifyStarted({child,signal:settings.signal});
+        }else{
+          callback(null,stdout,stderr);
+          child.emit('close',0);
+        }
+      });
+      return child;
+    },
+  });
+  hold=true;
+  const controller=new AbortController(),limits={...f.limits,signal:controller.signal};
+  const result=f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits);
+  const proofFailed=rejects(result,'BILLING_REQUIRED_TRIAL');
+  const {child,signal}=await started;
+  controller.abort();
+  const stopping=f.adapter.stopListener({deadline:f.limits.deadline+1000});
+  let stopSettled=false;
+  void stopping.then(()=>{stopSettled=true;},()=>{stopSettled=true;});
+  try {
+    await rejects(f.adapter.proveOwnedBillingRequiredTrial(ownedFixture,readOnly,limits),'BILLING_REQUIRED_TRIAL');
+    await turn();
+    assert.equal(signal.aborted,true);
+    assert.equal(stopSettled,false);
+    assert.deepEqual(f.children[0].signals,[]);
+  } finally {
+    child.emit('close',1);
+    await proofFailed;
+  }
+  assert.equal(await stopping,true);
+  assert.deepEqual(f.children[0].signals,['SIGINT']);
+  assert.deepEqual(events,held==='whoami'?[]:['seed',held]);
+});
+
+test('required-trial stop awaits the owned listener close after startup is aborted',async t=>{
+  let notifySpawn;
+  const spawned=new Promise(resolve=>{notifySpawn=resolve;});
+  const {f}=await requiredTrialCli(t,{startListener:false,configureListener:child=>{
+    child.autoClose=false;
+    notifySpawn(child);
+  }});
+  const controller=new AbortController();
+  const startFailed=rejects(f.adapter.startListener({...f.limits,signal:controller.signal}),'LISTENER');
+  const child=await spawned;
+  controller.abort();
+  const stopping=f.adapter.stopListener({deadline:f.limits.deadline+1000});
+  let stopSettled=false;
+  void stopping.then(()=>{stopSettled=true;},()=>{stopSettled=true;});
+  try {
+    await turn();
+    assert.equal(stopSettled,false);
+    assert.deepEqual(child.signals,['SIGINT']);
+  } finally {
+    child.emit('close',0);
+    await startFailed;
+  }
+  assert.equal(await stopping,true);
+  assert.deepEqual(child.signals,['SIGINT']);
+});
+
+for(const selectedCase of Object.keys(acceptanceProfileFlags))for(const reason of ['valid','expired','extra scope','linked credentials'])test(selectedCase+' reuses an isolated test-only profile: '+reason,async t=>{
+  const {f,source,destination}=await failedRenewalProfile(t,selectedCase);
+  if(selectedCase==='initial_missed_reordered'){
+    const {syntheticInvoiceIngress}=await import('./fixtures/invoice-ingress-harness.mjs');
+    const {ingress}=syntheticInvoiceIngress(f.options.configuration);
+    await ingress.open(f.limits);
+    t.after(()=>ingress.close());
+    f.options.invoiceIngress=ingress;
+  }
+  if(reason==='linked credentials')await link(source+'/credentials.json',source+'/linked.json');
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    if(args.includes('whoami')){
+      if(reason==='expired')throw Error('private authorization failure');
+      if(reason==='extra scope')return {stdout:JSON.stringify({...oauth(),authorized_accounts:[{id:ACCOUNT,modes:['test','extra']}]}),stderr:''};
+    }
+    return execute(file,args,settings);
+  };
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingCliAdapter(f.options,f.dependencies);
+  assert.equal(f.adapter.loginInvocation,undefined);
+  assert.equal(f.adapter.completeLoginInvocation,undefined);
+  if(reason==='valid'){
+    assert.equal(await f.adapter.validateBinding(f.limits),true);
+    assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get']);
+    assert.ok(f.calls.every(call=>call.args[call.args.indexOf('--config')+1]===destination+'/config.toml'));
+    assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+    for(const [file,contents] of [['config.toml',profileConfig],['credentials.json',profileCredentials]]){
+      assert.equal(await readFile(destination+'/'+file,'utf8'),contents);
+      assert.equal((await lstat(destination+'/'+file)).mode&0o777,0o600);
+      assert.notEqual((await lstat(destination+'/'+file)).ino,(await lstat(source+'/'+file)).ino);
+    }
+  }else{
+    await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+    await rejects(f.adapter.startListener(f.limits),'LISTENER');
+    assert.equal(f.children.length,0);
+  }
+  assert.equal(await readFile(source+'/config.toml','utf8'),profileConfig);
+  assert.equal(await readFile(source+'/credentials.json','utf8'),profileCredentials);
+});
+
+for(const selectedCase of Object.keys(acceptanceProfileFlags))test(selectedCase+' carries a reused CLI binding through listener readiness',async t=>{
+  const {f,cli:cliDirectory}=await failedRenewalProfile(t,selectedCase);
+  const {createOwnedBillingDeclineRetry,createOwnedBillingInitial3ds,createOwnedBillingCancellation,createOwnedBillingInvoiceWebhooks}=await import('./stripe-billing-acceptance.mjs');
+  const createOwner={
+    initial_decline_retry:createOwnedBillingDeclineRetry,
+    initial_3ds:createOwnedBillingInitial3ds,
+    initial_cancel_withdraw:createOwnedBillingCancellation,
+    initial_missed_reordered:createOwnedBillingInvoiceWebhooks,
+  }[selectedCase];
+  const {syntheticInvoiceIngress}=await import('./fixtures/invoice-ingress-harness.mjs');
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  const events=[];
+  const spawn=f.dependencies.spawn;
+  f.dependencies.spawn=(...args)=>{
+    const child=spawn(...args);
+    queueMicrotask(()=>child.stderr.write(READY));
+    return child;
+  };
+  const bootstrap={
+    prepare:async()=>true,resources:()=>({cliDirectory}),
+    verifyForwardTarget:async()=>{events.push('target');return true;},
+    persistWebhookSecret:async secret=>{assert.equal(secret,SECRET);events.push('ready');return true;},
+    start:async limits=>{
+      assert.equal(f.adapter.assertBillingListener({deadline:Math.min(limits.deadline,Date.now()+1000),signal:limits.signal}),true);
+      events.push('start');
+      return true;
+    },
+    stop:async()=>{events.push('stop');return true;},
+  };
+  const owner=await createOwner(f.options.configuration,{
+    preflight:async()=>true,createBootstrap:async()=>bootstrap,
+    createInvoiceIngress:(configuration,_bootstrap,{onFailure})=>syntheticInvoiceIngress(configuration,onFailure).ingress,
+    createCli:async options=>{f.adapter=await createBillingCliAdapter(options,f.dependencies);return f.adapter;},
+    login:()=>assert.fail('saved profile must not prompt for a device code'),
+    createFixture:async()=>({provision:async()=>false,close:async()=>true}),
+  });
+  await assert.rejects(owner.run(()=>assert.fail('browser after deliberate fixture stop'),{deadline:Date.now()+300000}),{message:'billing_PROVISION'});
+  assert.deepEqual(events,['target','ready','start','stop']);
+  assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get','--version','whoami','get','listen']);
+  const listenerArgs=f.calls.at(-1).args;
+  const forwardTarget=listenerArgs[listenerArgs.indexOf('--forward-to')+1];
+  assert.equal(listenerArgs[listenerArgs.indexOf('--events-from')+1],'@self');
+  if(selectedCase==='initial_missed_reordered'){
+    assert.equal(listenerArgs[listenerArgs.indexOf('--events')+1],'invoice.finalized,invoice.paid');
+    assert.match(forwardTarget,/^http:\/\/127\.0\.0\.1:24555\/invoice\/[a-f0-9]{64}$/);
+  }else assert.equal(forwardTarget,'http://127.0.0.1:'+f.options.configuration.ports.backend+'/api/v1/provider-webhooks/stripe/stripe-sandbox-default');
+  assert.equal(f.children.length,1);
+  assert.deepEqual(f.children[0].signals,['SIGINT']);
+  assert.equal(owner.resources().cleanupConfirmed,true);
+});
+
+test('failed-renewal seeds only CLI authentication files into the fresh profile before binding and listening',async t=>{
+  const {f,cli,source,destination}=await failedRenewalProfile(t);
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  assert.equal(f.adapter.loginInvocation,undefined);
+  assert.equal(f.adapter.completeLoginInvocation,undefined);
+  assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+  assert.equal(await f.adapter.validateBinding(f.limits),true);
+  assert.deepEqual((await readdir(destination)).sort(),['config.toml','credentials.json']);
+  for(const [file,contents] of [['config.toml',profileConfig],['credentials.json',profileCredentials]]){
+    assert.equal(await readFile(destination+'/'+file,'utf8'),contents);
+    assert.equal(await readFile(source+'/'+file,'utf8'),contents);
+    assert.equal((await lstat(destination+'/'+file)).mode&0o777,0o600);
+    assert.notEqual((await lstat(destination+'/'+file)).ino,(await lstat(source+'/'+file)).ino);
+  }
+  const starting=f.adapter.startListener(f.limits);
+  for(let i=0;i<200&&!f.children.length;i++)await new Promise(resolveTurn=>setTimeout(resolveTurn,5));
+  assert.equal(f.children.length,1);
+  f.children[0].stderr.write(READY);
+  assert.equal(await starting,true);
+  for(const call of f.calls){
+    assert.equal(call.file,'/usr/bin/sandbox-exec');
+    assert.equal(call.args[call.args.indexOf('--config')+1],destination+'/config.toml');
+    assert.equal(call.settings.env.HOME,cli+'/home');
+    assert.equal(call.settings.env.XDG_CONFIG_HOME,cli+'/config');
+    if(call.args.includes('/v1/balance'))assert.deepEqual(call.args.slice(-2),['--stripe-version',VERSION]);
+  }
+  assert.deepEqual(f.calls.map(c=>c.args[11]),['--version','whoami','get','--version','whoami','get','listen']);
+  assert.equal(await stop(f),true);
+});
+
+for(const reason of ['missing credentials','public credentials','linked credentials','symlinked profile','source changed',
+  'expired credentials','wrong account','extra scope','wrong API','live balance','wrong CLI'])test('failed-renewal profile refuses '+reason+' without login or listener',async t=>{
+  const {f,source,destination}=await failedRenewalProfile(t);
+  const credentials=source+'/credentials.json';
+  if(reason==='missing credentials')await rm(credentials);
+  if(reason==='public credentials')await chmod(credentials,0o644);
+  if(reason==='linked credentials')await link(credentials,source+'/another-link.json');
+  if(reason==='symlinked profile'){
+    await rm(source,{recursive:true});
+    await symlink(destination,source,'dir');
+  }
+  if(reason==='source changed')f.dependencies.open=async(path,...args)=>{
+    if(path===credentials)await writeFile(source+'/config.toml',profileConfig+'modified');
+    return open(path,...args);
+  };
+  const cliFailure=['expired credentials','wrong account','extra scope','wrong API','live balance','wrong CLI'].includes(reason);
+  const execute=f.dependencies.execute;
+  f.dependencies.execute=async(file,args,settings)=>{
+    const result=await execute(file,args,settings);
+    if(args.includes('whoami')){
+      if(reason==='expired credentials')throw Error('private auth failure');
+      if(reason==='wrong account')return {stdout:JSON.stringify({...oauth(),account_id:'acct_wrong'}),stderr:''};
+      if(reason==='extra scope')return {stdout:JSON.stringify({...oauth(),authorized_accounts:[{id:ACCOUNT,modes:['test','extra']}]}),stderr:''};
+    }
+    if(reason==='wrong API'&&args.includes('/v1/balance'))return {...result,stderr:'< HTTP 200\n< Stripe-Version: other\n'};
+    if(reason==='live balance'&&args.includes('/v1/balance'))return {...result,stdout:JSON.stringify({object:'balance',livemode:true})};
+    if(reason==='wrong CLI'&&args.includes('--version'))return {...result,stdout:'stripe version 1.53.0\n'};
+    return result;
+  };
+  const {createBillingFailedRenewalCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  f.adapter=await createBillingFailedRenewalCliAdapter(f.options,f.dependencies);
+  await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  assert.equal(f.adapter.loginInvocation,undefined);
+  assert.equal(f.adapter.completeLoginInvocation,undefined);
+  assert.equal(f.children.length,0);
+  assert.equal(f.calls.some(c=>c.args.includes('login')),false);
+  if(!cliFailure){
+    assert.equal(f.calls.length,0);
+    assert.equal(await readFile(destination+'/config.toml','utf8'),'');
+    assert.deepEqual(await readdir(destination),['config.toml']);
+  }
+  assert.equal(await stop(f),true);
+});
+
+for(const outcome of ['rejected','aborted'])test('failed-renewal listener close proves cleanup after '+outcome+' persistence',async()=>{
+  let writes=0,finishWrite;
+  const f=await failedRenewalCli(async()=>{
+    writes++;
+    if(outcome==='rejected')throw Error('synthetic persistence refusal');
+    return new Promise(resolve=>{finishWrite=resolve;});
+  });
+  const abort=new AbortController();
+  const starting=rejects(f.adapter.startListener({...f.limits,signal:abort.signal}),'LISTENER');
+  await turn();
+  const child=f.children[0];
+  child.stderr.write(READY);
+  await turn();
+  assert.equal(writes,1);
+  if(outcome==='aborted')abort.abort();
+  await starting;
+  const count=f.calls.length;
+  assert.deepEqual(child.signals,['SIGINT']);
+  assert.equal(await f.adapter.stopListener(f.limits),true);
+  finishWrite?.(true);
+  await turn();
+  assert.throws(()=>f.adapter.assertBillingListener(f.limits),/BILLING_LISTENER/);
+  await rejects(f.adapter.validateBinding(f.limits),'BINDING');
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  assert.equal(f.calls.length,count);
+  assert.equal(writes,1);
+  assert.deepEqual(child.signals,['SIGINT']);
+});
+
+for(const evidence of ['owned close','PID drift','deadline'])test('failed-renewal cleanup waits passively after startup teardown: '+evidence,async()=>{
+  const f=await failedRenewalCli(async()=>false,child=>{child.autoClose=false;});
+  const starting=rejects(f.adapter.startListener(f.limits),'LISTENER');
+  await turn();
+  const child=f.children[0];
+  child.stderr.write(READY);
+  await turn();
+  assert.deepEqual(child.signals,['SIGINT']);
+  f.fire(5000);await turn();
+  f.fire(5000);await starting;
+  let settled=false;
+  const stopping=f.adapter.stopListener(f.limits).then(value=>value,error=>error.message).finally(()=>{settled=true;});
+  await turn();
+  assert.equal(settled,false);
+  if(evidence==='deadline'){
+    const timers=[...f.timers.values()];
+    assert.equal(timers.length,1);
+    timers[0].callback();
+  }else{
+    if(evidence==='PID drift')child.pid++;
+    child.emit('close',0);
+  }
+  assert.equal(await stopping,evidence==='owned close'?true:'stripe_sandbox_cli_STOP');
+  assert.deepEqual(child.signals,['SIGINT','SIGTERM']);
+});
+
+test('failed-renewal listener stop rejects a PID change before owned close',async()=>{
+  const f=await failedRenewalCli(async()=>true,child=>{child.autoClose=false;});
+  await start(f);
+  const child=f.children[0];
+  const closing=rejects(f.adapter.stopListener(f.limits),'STOP');
+  await turn();
+  assert.deepEqual(child.signals,['SIGINT']);
+  child.pid++;
+  child.emit('close',0);
+  await closing;
+  await rejects(f.adapter.stopListener(f.limits),'STOP');
+  assert.deepEqual(child.signals,['SIGINT']);
+});
+
+test('failed-renewal stop cannot confirm a spawned listener without an owned PID',async()=>{
+  const f=await failedRenewalCli(async()=>true,child=>{child.pid=undefined;});
+  await rejects(f.adapter.startListener(f.limits),'LISTENER');
+  f.children[0].emit('close',1);
+  await rejects(f.adapter.stopListener(f.limits),'STOP');
+  assert.deepEqual(f.children[0].signals,[]);
+});
+
+async function initialRetrySetup(){
+  const f=await billingSetup(),t=billingTarget(),o=f.objects;
+  f.options.configuration.selectedCase='initial_decline_retry';
+  f.options.configuration.env.PAYMENT_STRIPE_BILLING_CASE='initial_decline_retry';
+  f.adapter=await (await import('./stripe-sandbox-cli.mjs')).createBillingCliAdapter(f.options,f.dependencies);
+  await f.adapter.validateBinding(f.limits);await start(f);
+  const receipt={chargeReference:'ch_declined',declineCode:'generic_decline'};
+  const captured=o['/v1/charges/ch_original'];
+  const failed={...captured,id:receipt.chargeReference,status:'failed',paid:false,captured:false,amount_captured:0,
+    failure_code:'card_declined',outcome:{type:'issuer_declined',reason:receipt.declineCode}};
+  o['/v1/charges/ch_declined']=failed;
+  const fresh=billingObjects(),pi=o['/v1/payment_intents/pi_original'];
+  o['/v1/subscriptions/sub_original'].status='incomplete';
+  Object.assign(o['/v1/invoices/in_original'],{status:'open',amount_paid:0,amount_remaining:2000});
+  Object.assign(o['/v1/invoice_payments'].data[0],{status:'open',amount_paid:0,status_transitions:{paid_at:null}});
+  Object.assign(pi,{status:'requires_payment_method',amount_received:0,latest_charge:failed.id,
+    last_payment_error:{type:'card_error',code:'card_declined',decline_code:receipt.declineCode,charge:failed.id}});
+  o['/v1/charges']={object:'list',data:[failed],has_more:false};
+  function settle(){Object.assign(o,fresh);o['/v1/invoices'].data=[o['/v1/invoices/in_original']];o['/v1/charges'].data=[failed,captured];}
+  return {f,t,o,receipt,settle,decline:()=>f.adapter.observeOwnedBillingInitialRetry('declined',{...t,periodStart:null,periodEnd:null},receipt,f.limits),
+    recover:()=>f.adapter.observeOwnedBillingInitialRetry('recovered',t,receipt,f.limits)};
+}
+test('initial Retry requires the original failed card charge and one different captured charge on the same intent',async()=>{
+  const {f,decline,recover,settle}=await initialRetrySetup();
+  assert.equal(await decline(),true);settle();assert.equal(await recover(),true);await stop(f);
+});
+for(const amount of [undefined,null])test(`initial Retry accepts an open allocation with amount_paid ${amount}`,async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();
+  o['/v1/invoice_payments'].data[0].amount_paid=amount;
+  assert.equal(await decline(),true);
+  settle();
+  assert.equal(await recover(),true);
+  await stop(f);
+});
+for(const [name,change] of [
+  ['decline attributed to another intent',o=>o['/v1/charges/ch_declined'].payment_intent='pi_other'],
+  ['extra charge on the customer',o=>o['/v1/charges'].data.push(o['/v1/charges/ch_original'])],
+  ['foreign allocation',o=>o['/v1/invoice_payments'].data[0].invoice='in_foreign'],
+  ['a nonzero open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid=1],
+  ['a negative open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid=-1],
+  ['a string open allocation amount',o=>o['/v1/invoice_payments'].data[0].amount_paid='0'],
+  ['received cash with an unpaid allocation',o=>{
+    o['/v1/invoice_payments'].data[0].amount_paid=null;
+    o['/v1/payment_intents/pi_original'].amount_received=1;
+  }],
+])test('initial Retry denies '+name,async()=>{
+  const {f,o,decline}=await initialRetrySetup();change(o);await assert.rejects(decline(),/BILLING_INITIAL_RETRY/);await stop(f);
+});
+for(const amount of [undefined,null,0,1999])test(`initial Retry rejects a paid allocation with amount_paid ${amount}`,async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();
+  await decline();
+  settle();
+  o['/v1/invoice_payments'].data[0].amount_paid=amount;
+  await rejects(recover(),'BILLING_INITIAL_RETRY');
+  await stop(f);
+});
+test('initial Retry refuses missing failed-charge history after settlement',async()=>{
+  const {f,o,decline,recover,settle}=await initialRetrySetup();await decline();settle();o['/v1/charges'].data.shift();
+  await assert.rejects(recover(),/BILLING_INITIAL_RETRY/);await stop(f);
+});
+test('an open allocation may omit transition timestamps only with zero cash and an exact failed charge',async()=>{
+  const {f,o,decline}=await initialRetrySetup();
+  delete o['/v1/invoice_payments'].data[0].status_transitions;
+  assert.equal(await decline(),true);await stop(f);
+});
+for(const fault of ['none','extra charge','second invoice','changed charge','foreign graph','missing final period','changed period','unexpected exit','unexpected close','unexpected error','readiness changed','unbranded ingress']){
+ test('only two original invoice events and an unchanged captured provider graph: '+fault,async()=>{
+  const f=await billingSetup(),cfg=f.options.configuration;
+  cfg.selectedCase='initial_missed_reordered';cfg.env.PAYMENT_STRIPE_BILLING_CASE=cfg.selectedCase;
+  const {createBillingCliAdapter}=await import('./stripe-sandbox-cli.mjs');
+  const {createOwnedInvoiceIngress,ownedInvoiceForwardTarget}=await import('./stripe-billing-invoice-ingress.mjs');
+  const fake=Object.assign(new EventEmitter(),{listening:false,address:()=>({address:'127.0.0.1',port:25555}),
+   listen(_port,_host,ready){this.listening=true;ready();},close(done){this.listening=false;done();},closeAllConnections(){}});
+  let lost=0;
+  const ingress=createOwnedInvoiceIngress(cfg,{verify:async()=>true},{createServer:()=>fake,onFailure:()=>{lost++;}});await ingress.open(f.limits);
+  try{
+   const opts={...f.options,invoiceIngress:fault==='unbranded ingress'?{url:'http://localhost/foreign'}:ingress};
+   if(fault==='unbranded ingress'){await assert.rejects(createBillingCliAdapter(opts,f.dependencies));assert.equal(f.calls.length,0);return;}
+   f.adapter=await createBillingCliAdapter(opts,f.dependencies);
+   assert.equal(f.adapter.bindOwnedBillingGraph,undefined);assert.equal(f.adapter.observeOwnedBillingCancellation,undefined);
+   await f.adapter.validateBinding(f.limits);await start(f);
+   const args=f.calls.find(v=>v.child).args;assert.equal(args[args.indexOf('--forward-to')+1],ownedInvoiceForwardTarget(ingress,cfg));
+   assert.equal(args[args.indexOf('--events')+1],'invoice.finalized,invoice.paid');assert.equal(args[args.indexOf('--events-from')+1],'@self');
+   const graph=billingTarget(),charge=f.objects['/v1/charges/ch_original'];
+   f.objects['/v1/charges']={object:'list',has_more:false,data:[charge]};
+   if(fault==='extra charge')f.objects['/v1/charges'].data.push({...charge,id:'ch_foreign'});
+   if(fault==='second invoice')f.objects['/v1/invoices'].data.push({...f.objects['/v1/invoices/in_original'],id:'in_foreign'});
+   const inspect=g=>f.adapter.observeOwnedBillingCapturedInvoice(g,f.limits);
+   const first={...graph,periodStart:null,periodEnd:null};
+   if(['extra charge','second invoice'].includes(fault))await assert.rejects(inspect(first));
+   else{
+    assert.equal(await inspect(first),true);
+    if(fault==='foreign graph')graph.operationId=graph.subscriptionId;
+    if(fault==='missing final period')Object.assign(graph,{periodStart:null,periodEnd:null});
+    if(fault==='changed period')graph.periodEnd++;
+    if(fault==='changed charge'){
+     f.objects['/v1/payment_intents/pi_original'].latest_charge='ch_other';
+     const other={...charge,id:'ch_other'};f.objects['/v1/charges/ch_other']=other;f.objects['/v1/charges'].data=[other];
+    }
+    if(['none','unexpected exit','unexpected close','unexpected error','readiness changed'].includes(fault)){
+     assert.equal(await inspect(graph),true);
+     if(fault==='readiness changed')f.children[0].stderr.write(READY.replace(SECRET,'whsec_changed'));
+     if(fault.startsWith('unexpected '))f.children[0].emit(fault.slice('unexpected '.length));
+     assert.equal(lost,fault==='none'?0:1);
+    }else await assert.rejects(inspect(graph));
+   }
+   const last=f.calls.length;await assert.rejects(inspect(graph));assert.equal(f.calls.length,last);await stop(f);
+   assert.equal(lost,fault.startsWith('unexpected ')||fault==='readiness changed'?1:0);
+  }finally{await ingress.close();}
+ });
+}

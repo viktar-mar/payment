@@ -97,7 +97,7 @@ public class SubscriptionPlanTransaction {
         }));
     }
     /** Final locked revalidation after the external quote read, before any mutation is dispatched. */
-    public void beforeMutation(SubscriptionCommandContext c,Reserved r,boolean conditional){translated(()->tx.requiresNew(()->{
+    public SubscriptionOperation beforeMutation(SubscriptionCommandContext c,Reserved r,boolean conditional){return translated(()->tx.requiresNew(()->{
         var o=operations.lock(r.operation().id());authority.revalidate(c,true);
         var account=accounts.findByIdForUpdate(r.account().id()).orElseThrow(SubscriptionRuleErrors::conflict);var s=subscriptions.lock(c.siteId(),r.subscription().id());var policy=policies.load(c.siteId());
         if(o.status()!=SubscriptionOperation.Status.RESERVED||account.status()!=PaymentAccountStatus.ACTIVE||!policy.enabled()||policy.version()!=o.policyVersion())throw stale();
@@ -107,7 +107,32 @@ public class SubscriptionPlanTransaction {
             validateQuote(c,r.subscription(),r.quote(),policy,conditional);
         }else if(s.revision()!=o.expectedRevision()||s.pendingChange()==null||s.pendingChange().state()!=Subscription.ChangeState.SCHEDULED
             ||!s.pendingChange().equals(r.subscription().pendingChange())||!clock.instant().isBefore(s.pendingChange().effectiveAt()))throw stale();
-        operations.save(status(o,SubscriptionOperation.Status.PROCESSING,null),o.version());return null;
+        return operations.save(status(o,SubscriptionOperation.Status.PROCESSING,null),o.version());
+    }));}
+    /** Final local authority fence for an explicitly requested original dispatched continuation. */
+    public void beforeOriginalReplay(SubscriptionCommandContext c,Reserved r){translated(()->tx.requiresNew(()->{
+        var o=operations.lock(r.operation().id());authority.revalidate(c,true);
+        var account=accounts.findByIdForUpdate(r.account().id()).orElseThrow(SubscriptionRuleErrors::conflict);
+        var s=subscriptions.lock(c.siteId(),r.subscription().id());var policy=policies.load(c.siteId());
+        var q=quotes.forOperation(c.siteId(),s.id(),o.id()).orElseThrow(SubscriptionRuleErrors::conflict);
+        if(!o.equals(r.operation())||!q.equals(r.quote())||!account.equals(r.account())
+            ||account.provider()!=PaymentProviderType.STRIPE||account.mode()!=PaymentAccountMode.SANDBOX||account.status()!=PaymentAccountStatus.ACTIVE
+            ||!Set.of(SubscriptionOperation.Status.PROCESSING,SubscriptionOperation.Status.UNKNOWN).contains(o.status())
+            ||!o.siteId().equals(c.siteId())||!o.customerId().equals(c.customerId())||!o.subscriptionId().equals(s.id())
+            ||!o.authorityScope().equals(principal(c))||!q.authorityScope().equals(scope(c))
+            ||!s.paymentAccountId().equals(account.id())||!policy.enabled()||policy.version()!=o.policyVersion()||q.policyVersion()!=o.policyVersion()
+            ||!s.nonTerminal()||s.billingStatus()!=Subscription.Status.ACTIVE||s.debt()!=null||s.cancellation()!=null||s.pendingChange()==null
+            ||!s.pendingChange().target().equals(q.target())||!s.pendingChange().effectiveAt().equals(q.effectiveAt())
+            ||!s.billingPrice().priceId().equals(q.fromPriceId())||s.billingPrice().version()!=q.fromPriceVersion()
+            ||!clock.instant().isBefore(s.paidThrough()))throw stale();
+        if(o.kind()==SubscriptionOperation.Kind.CHANGE){
+            if(s.revision()!=o.expectedRevision()+1||q.subscriptionRevision()!=o.expectedRevision()
+                ||!s.pendingChange().operationId().equals(o.id())||s.pendingChange().state()!=Subscription.ChangeState.UNKNOWN)throw stale();
+        }else if(o.kind()!=SubscriptionOperation.Kind.CLEAR_CHANGE||s.revision()!=o.expectedRevision()
+            ||!s.pendingChange().equals(r.subscription().pendingChange())
+            ||!quotes.forOperation(c.siteId(),s.id(),s.pendingChange().operationId()).filter(q::equals).isPresent()
+            ||s.pendingChange().state()!=Subscription.ChangeState.SCHEDULED||!clock.instant().isBefore(s.pendingChange().effectiveAt()))throw stale();
+        return null;
     }));}
     /** No provider mutation was dispatched: release only this reservation's pending change. */
     public void rejectBeforeMutation(Reserved r){tx.requiresNew(()->{

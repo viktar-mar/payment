@@ -1,0 +1,12 @@
+export const RETRY_CLI_PROFILE_RUN_ID:'PAYMENT_STRIPE_BILLING_RETRY_CLI_PROFILE_RUN_ID';
+export const RETRY_NETWORK_SUBNET:'PAYMENT_STRIPE_BILLING_RETRY_SUBNET';
+export const THREE_DS_CLI_PROFILE_RUN_ID:'PAYMENT_STRIPE_BILLING_3DS_CLI_PROFILE_RUN_ID';
+export const THREE_DS_NETWORK_SUBNET:'PAYMENT_STRIPE_BILLING_3DS_SUBNET';
+export const PORTAL_CLI_PROFILE_RUN_ID:'PAYMENT_STRIPE_BILLING_PORTAL_CLI_PROFILE_RUN_ID';
+export const PORTAL_NETWORK_SUBNET:'PAYMENT_STRIPE_BILLING_PORTAL_SUBNET';
+export function billingAcceptanceProfileRunId(env:Readonly<Record<string,unknown>>):string|undefined;
+export function billingAcceptanceSubnet(env:Readonly<Record<string,unknown>>):string|undefined;
+export function billingAcceptanceExcluded(env:unknown):boolean;
+export function billingAcceptanceOptIn(env:unknown):boolean;
+export function validateBillingAcceptanceOptions(options:unknown):Readonly<Record<string,unknown>>|null;
+export function snapshotBillingAcceptanceEnvironment(env:unknown):Readonly<Record<string,string|undefined>>|null;

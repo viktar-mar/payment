@@ -1,5 +1,9 @@
 # Local development through Stage 4
 
+## Fresh failed-renewal operator checkpoint — 2026-11-15
+
+The separate `PAYMENT_STRIPE_BILLING_FAILED_RENEWAL` manual case is **OFFLINE_PREPARED**. Native execution is **NOT_RUN** and full Stage 5B is **NOT_ACCEPTED**. A future authorized run requires the exact passing source, fresh run UUID, a fresh Sandbox subscription and its original customer session throughout. The operator confirms the initial EUR20 payment and later confirms one replacement method on the same Chrome page. The owner verifies the original EUR20 renewal debt and its recovery, with a EUR40 cash ceiling. The procedure includes fixed settings, stage budgets, first-failure stop, private evidence and scoped cleanup. [Future operator procedure](testing/billing-failed-renewal-recovery.md#future-operator-procedure)
+
 ## Stage 5A offline regression and explicit Sandbox acceptance
 
 The default Maven suite includes `@stripe-sandbox` Cucumber scenarios using real PostgreSQL,
@@ -273,7 +277,7 @@ Stage4 smoke additionally requires loopback backend/receiver/Mailpit/database UR
 
 Run backend `./mvnw verify`; SDK typecheck/test/build; Admin lint/typecheck/test/build; demo build and complete Playwright with `--retries=0`; then all five infrastructure Node test files (receiver, Stage2, Stage3A, Stage3B, Stage4). Runtime acceptance executes the existing Stage1–3 entrypoints and `node infrastructure/smoke-stage-4.mjs` against a unique owned Compose project. Supply ephemeral credentials only via ENV, `PAYMENT_SMOKE_ENV_ONLY=true`, and an explicit empty Compose `--env-file`. Establish free loopback ports and exact container IDs/Compose project+service labels before any stop/restart. Legacy Mailpit outage tests now require `PAYMENT_E2E_MAILPIT_OWNER` and `PAYMENT_E2E_COMPOSE_PROJECT`; they fail closed without owned authority and restore only that verified ID. Keep traces/video/screenshots off for auth flows. Stop only this run's services and retain volumes; never use `down -v` or wipe user data.
 
-Stage 5 prerequisites include a separately reviewed real provider adapter, Stripe Sandbox credentials and webhook verification, real client action/Payment Element integration, real Portal lifecycle, supported payment-method/account capabilities, provider tax and billing edge cases, operational reconciliation/alerts and a production deployment/security review. No real charge, production/legal assurance or payment-method availability is established by Stage 4.
+Stage 4 alone establishes local Fake behavior. The [Stage 5A matrix](stage-5a-acceptance.md) records accepted one-time Sandbox evidence; the [Stage 5B matrix](stage-5b-acceptance.md) separately records implemented Billing/Elements/Portal paths, current verification and remaining gaps. Billing provider acceptance, operational reconciliation/alerts and production deployment/security review remain separate gates. The Stage 4 business-clock launcher does not establish owned native Stripe TestClock support.
 
 Run from the project root. Use Docker Engine/Desktop with Compose v2, Bash, Node 24 built-ins, JDK 25 and pnpm 11.1.3. Maven 3.9.11 is provided by `backend/mvnw`. The Stage 1 catalog/authentication remains available; Stage 2 adds one-time payments, refunds, callbacks, Partner APIs, SDK and demo.
 
@@ -290,6 +294,15 @@ node infrastructure/init-local-customer-issuer.mjs
 The fixture and real `.env` files are intentionally ignored by Git. Do not force-add them or reuse local fixture/example keys in production. Public issuer keys are derived by the protected local endpoint; no checked-in private or public fixture file is required.
 
 ### Secret-free CI coverage
+
+Hosted Maven consumers cache `~/.m2/wrapper/dists` separately from the dependency
+repository cached by `setup-java`. The exact cache key includes runner OS/architecture,
+the POSIX wrapper and its properties; no partial-key restore or cache-based test
+skipping is used. A cold or evicted cache still requires Maven Central to be available.
+Distribution fetching retains three attempts with finite transport timeouts. A failed
+fetch reports the downloader exit code and the final validated HTTP status, or
+`UNKNOWN` when unavailable. Raw downloader responses and headers are suppressed;
+archive validation/extraction and Maven execution are never retried by this loop.
 
 [Offline CI](../.github/workflows/ci.yml) runs on pushes, pull requests and manual dispatch with
 Node 24, JDK 25, pnpm 11.1.3 and Docker. Its three bounded jobs run default Maven verification
@@ -681,7 +694,7 @@ aborts retain their original classification. Legacy diagnostics keep their exact
 format. Browser exceptions remain opaque, failed journeys keep cleanup unconfirmed,
 and this observation supplies no financial proof or cause for a historical failure.
 
-The optional Sandbox overlay prepares backend configuration only. It does not establish a working Stripe backend until the Stage 5A adapter is implemented and verified. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work; Stripe subscriptions require Stage 5B. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
+The optional Sandbox overlay prepares backend configuration; configuration alone is not provider acceptance. The [Stage 5A matrix](stage-5a-acceptance.md) records the accepted one-time adapter evidence. The default Compose file continues to use Fake without Stripe keys; the overlay also retains `PAYMENT_PROVIDER=fake` while enabling the separate Sandbox marker and `local` profile. Fake subscriptions continue to work. Stripe Billing paths are implemented but [Stage 5B remains unaccepted](stage-5b-acceptance.md), with owned initial attempts unaccepted and other provider scenarios NOT_RUN. This setup never enables live payments, Connect, Managed Payments, or business activation for real money.
 
 Create the separate private file from the project root:
 
@@ -1429,3 +1442,671 @@ The later separately authorized attempt `75456a71-342e-4549-a5b2-b7dfd605ade3` o
 The controller also retains the existing once-only bootstrap stop's directly observed literal-true settlement time. If its 30-second close slice expires but that same stop fulfills true strictly before the original cleanup ceiling while the existing final work drain runs, the final immutable report can record `runtime_closed=true`. False, rejection, unsettled work and true observed at or after the ceiling cannot supply that proof; fulfillment after the report never changes it. The failure remains latched as PENDING/exit 1, with no new stop, wait, retry or authority extension. Gateway and listener closure rules are unchanged. Persisted `STOPPED` or exited-container metadata alone is insufficient: bootstrap lock closure and its final deadline check follow the manifest write. This source correction does not rewrite historical reports or prove their runtime cause.
 
 Diagnostic output gets at most one second clipped to the original cleanup ceiling; failure or stall leaves exit 1/PENDING and cannot postpone independent cleanup or authorize another attempt. Report version/shape, source/account/API/ownership/signed-journal/callback/capture gates, one Pay/permit, ten-second child/HTTP, 45-minute authority, 45-second/30-probe proof, five-minute page and original plus two-minute cleanup limits remain unchanged. This offline correction ran no runtime/provider operation and authorizes none; historical reports remain intact. Stage 5A was NOT_ACCEPTED at that checkpoint; see the [dated acceptance matrix](stage-5a-acceptance.md) for the current evidence decision and gates.
+
+## Stage 5B Billing implementation and acceptance checkpoint
+
+Stage 5B passed local Sandbox acceptance on November 27 and hosted regression on November 28. [Acceptance matrix and CI results](stage-5b-acceptance.md#stage-5b-closure-on-2026-11-28)
+
+### Earlier implementation checkpoint
+
+At this checkpoint, the first payment and renewal had passed. The remaining provider scenarios were still open. The SDK manager now supports memory-only PAYMENT/SETUP client sessions and visible ready Stripe Elements. It reads the exact original operation/action even when CREATE returns PROCESSING with `action_available=false`; explicit Pay consumes the grant, and only its winning response-bound permission allows one browser confirmation. Polling, replay, lost ACK and UNKNOWN never reopen it. Preparation failure may be retried only by explicit Refresh of the same unspent operation. Fresh v2 synchronous-decline proof permits one explicit successor and separate Pay; native decline/successor acceptance remains NOT_RUN.
+
+Billing actions are default-disabled and require a dedicated versioned backend key outside repository tooling. The [client-session guide](stripe-billing-client-sessions.md#disabled-safe-dedicated-key-configuration) describes the exact key configuration and UTC grant boundary. Use the [current SDK guide](../frontend/sdk/README.md#stripe-billing-forms-and-portal) for PAYMENT/SETUP, authority/expiry teardown, constrained real Portal parsing and return behavior. Portal creation/navigation and return do not prove payment, cancellation or entitlement; current backend review/hosted gates are recorded in the matrix.
+
+Task 12’s eight Billing Cucumber scenarios and combined v2 source passed exact-head `152ea79121fb14742be25e8a2f7e1fade06f2dcd`, CI `40855668800`: backend 3563/0 failures/0 errors/1 existing skip, Cucumber 87/676 steps, SDK 892/32 files, Admin 239/36, demo 9/3, support 401, return 7, default Fake 61/61 and infrastructure 2120. The initial-only owner/browser/proof slice subsequently passed exact head `4b604b89d8a4f05690015dd6e69458fe84617423`, [CI 40877692992](https://github.com/viktar-mar/payment/actions/runs/40877692992), completed SUCCESS: backend 3564/0 failures/0 errors/1 existing skip, Cucumber 87, shared SQL 1/1, SDK 892/32, Admin 239/36, demo 10/3, support 417, return 7, default Fake 61/61 and infrastructure 2220. The matrix retains cancelled `e518`/40872292196 (2220 infrastructure, 1 failed allowlist assertion) and `660`/40873611776 (backend/infrastructure passed, Fake 60/61 failed CDP body assertion, fixed by `4b604b8`). The corrected billing/UTC prerequisite subsequently passed `287bcb79085372c230275fb54e86050833997a97`, [CI40897288993](https://github.com/viktar-mar/payment/actions/runs/40897288993), completed SUCCESS: backend 3587 tests, Cucumber 87 scenarios, all jobs green. The owned TestClock/Customer component passed `b7776a72c28eedd499630d5c3a9bebd95db5b2d1`, [CI40916243540](https://github.com/viktar-mar/payment/actions/runs/40916243540): backend 3718 tests/0 failures/0 errors/1 existing skip, Cucumber 87 scenarios/676 steps, all three jobs green. The initial Subscription composition later passed `04e036e` / CI40940823768, as recorded below; the current combined publication passed `3b9114c` / CI41302204254. The later combined run `e7080356` accepts initial success and one unchanged-terms renewal with its bounded advances at `a59dad7`, as recorded next. The separate initial-only attempts retain their historical results; decline/manual 3DS, trials, failed renewal/grace/recovery, changes and Portal acceptance remain outstanding. Stage 4 clock injection supplies none of that provider evidence. The prepared initial-only entry below covers no clock-driven case. The matrix records the required source, review, hosted and separately authorized runtime gates without extending earlier 5A authority or touching its retained evidence.
+
+### Current operator checkpoint — 2026-11-05
+
+The [safe completed receipt](../.superpowers/sdd/2026-11-05-prepare-cleanup-publication/native-after-storage-107/e7080356-9c8c-4dd8-9ed4-b9ee94e57039/result.json) records run `e7080356-9c8c-4dd8-9ed4-b9ee94e57039`, source `a59dad7fd979cea774537210e76ed98f95f334a8`, scope `OWNED_INITIAL_AND_FIRST_RENEWAL`, exit **0** at `2026-11-05T19:53:40.845Z`. Initial and renewal amounts of 2000 EUR minor units (EUR20) each are accepted with cash, journal and signed-callback gates verified. Cleanup is confirmed, all seven containers are stopped and the network has zero active endpoints in that receipt. **Full 5B remains NOT_ACCEPTED** (`full5bAccepted=false`). The accepted combined run supersedes earlier “NONE ACCEPTED” current-status claims, while every earlier failure and consumed authority remains historical and nonretryable. It does not upgrade the separate initial-only lane's attempts or establish current storage capacity.
+
+The [failed-renewal/recovery guide](testing/billing-failed-renewal-recovery.md) documents the next **offline-only** test component at `28acc7c0438d61f36962c37a3a3d3a0f18cbd943`: pure compilation and **72/72 selected tests passed**, zero skipped, aborted or failed. No Docker/Stripe execution or native recovery acceptance occurred. METHOD_READY is only an unchanged labelled observation; FRESH is synthetic and grants no financial authority. Runtime admission/publication, scoped time and recovery permission, verified method transitions and actual SQL/provider/journal/callback proof remain blockers. There is no native command for this component.
+
+### Historical operator checkpoint — 2026-11-01
+
+The recorded executable-source checkpoint is `3b9114c9599a59efe0e5290d2992c5f57b8c564c`; [CI41302204254](https://github.com/viktar-mar/payment/actions/runs/41302204254) completed **SUCCESS** for infrastructure (job `124835329705`), frontend (`124835329825`) and backend (`124835329884`). The [saved publication receipt](../.superpowers/sdd/2026-11-01-first-payment-confirm-diagnostics/publication-3b9114c/completion.json) records those outcomes without test counts. Historical authored/compiled/pending statements below describe preparation at their named scopes; they are superseded as current gate status, with original counts and failures retained. See the [current acceptance checkpoint](stage-5b-acceptance.md#current-checkpoint--2026-11-05).
+
+Owned initial native cases were attempted, none accepted. Latest run `150000ac-0789-4992-98c6-238dbf38b11d` at this source failed at `START_POSTGRES_HEALTH_NOT_RUNNING`, before CREATE/CONFIRM dispatch or acknowledgement. Its [safe report](../.superpowers/native-billing-first-payment/150000ac-0789-4992-98c6-238dbf38b11d/report.json), [completion](../.superpowers/native-billing-first-payment/150000ac-0789-4992-98c6-238dbf38b11d/completion.json) and [publication status](../.superpowers/native-billing-first-payment/publish-3b9114c/status.json) preserve consumed one-use authority, no retry, confirmed cleanup and independently stopped seven containers. The PENDING runtime ledger and original START/DISPATCHING latch stay unchanged. A later [read-only observation](../.superpowers/investigations/2026-11-01-postgres-start-150000ac/read-only-log-observation.json) reported `STORAGE_NO_SPACE`; the [findings](../.superpowers/investigations/2026-11-01-postgres-start-150000ac/storage-findings.md) identify neither an exhausted filesystem/inode/quota nor fixed startup. The [approved cleanup receipt](../.superpowers/inventories/2026-11-01-old-containers-networks-150000ac/approved-six-cleanup/result.json) removed only six never-started containers (four `150000ac`, two `15f2c8fd`), preserving every other object, network, volume, image, cache and ledger/report. It is not a new run and claims no meaningful space gain.
+
+Ordinary time remains UTC, original READY F is immutable and original initial-only guards remain. The next offline product prerequisite is a separately scoped first unchanged-terms renewal with durable advancement/later READY evidence; see the [prepared design](superpowers/specs/2026-11-01-owned-first-renewal-design.md) and [implementation plan](superpowers/plans/2026-11-01-owned-first-renewal-implementation.md). These documents do not enable it. stripe-java **34.0.0** / API **2026-09-30.endive**, credential-free default Fake and all historical ACK/DISPATCHING records remain preserved. Old EUR13 and DISPATCHING records are not 5B fixtures. Provider acceptance, including accepted initial success and the remaining decline/3DS, trial, renewal, mutation, Portal and webhook matrix, is still outstanding: **Stage 5B NOT_ACCEPTED**. This documentation adds no runtime authority or new execution.
+
+### Prepared initial Billing entry — separate runtime authorization required
+
+The following component sections preserve preparation-era scope and named hosted checkpoints. Their native **NOT_RUN** labels and subsequent unaccepted-attempt statements are historical; the current operator checkpoint above records the accepted combined run. The invocation examples below remain future-only.
+
+Native status is **NOT_RUN**; scope is **INITIAL_NON_CLOCK**, and full 5B is **NOT_ACCEPTED**. After separate authorization and exact-head hosted verification, the dedicated entry from `examples/demo-site` is `pnpm exec playwright test --config=playwright.stripe-billing.config.ts`. This documentation is not permission to launch it.
+
+Supply `PAYMENT_STRIPE_SANDBOX_ENABLED=true` and `PAYMENT_STRIPE_BILLING_ACCEPTANCE=true`, a fresh lowercase UUID in `PAYMENT_STRIPE_SANDBOX_RUN_ID`, the clean checked-out 40-character SHA in `PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE`, the canonical owned Unix socket in `PAYMENT_STRIPE_SANDBOX_DAEMON`, and six distinct loopback ports in `PAYMENT_STRIPE_SANDBOX_PORT_BACKEND`, `_DEMO`, `_RECEIVER`, `_POSTGRES`, `_MAILPITHTTP`, `_MAILPITSMTP`. Existing full/remaining/manual/refund/diagnostic and ALLOW_TEST_OPERATIONS modes must be absent or false; debug/trace flags must be off. Approved binding is fixed to `acct_1UPiMpELswAd8tpR` / `2026-09-30.endive`. Do not supply old provider IDs, keys, fixture files or recovery state.
+
+Concrete adapters wire the existing bootstrap/CLI, fresh admin endpoints, real OTP/Elements, scoped read-only SQL, exact provider reads and signed canonical callback digests. Construction is inert; run is single-use. One worker, zero retries and no screenshot/video/trace are enforced. The SDK’s original fresh keys are fsynced before CREATE and confirm continue unchanged. One explicit Pay is the financial budget; UNKNOWN/lost ACK cannot reopen it. Finite independent cleanup stops exact owned resources and retains volumes. Reports contain fixed phases, scope/acceptance booleans and public run/source identities, never credentials, raw responses or browser error details.
+
+The owner retains its 45-minute lifetime/financial authority. The dedicated test allows 48 minutes, including 120 seconds for independent cleanup and 60 seconds for setup/scheduling; the global runner ceiling is 50 minutes. This headroom grants no additional financial attempt or owner lifetime.
+
+Preparation's intended local boundary was injected Node contracts, pure frontend tests and typecheck/build. An accidental local Vite runtime batch attempted standalone, embedded and preview child tests: all **3 failed**, alongside **7 passing pure tests**. The original failed log is retained; child cleanup is **not independently confirmed**. There was no local retry or runtime investigation. The later `4b604b8` hosted Vite/runtime gate completed **SUCCESS**, with shared SQL **1/1**; that result does not independently confirm cleanup of the earlier local child processes.
+
+See the [acceptance matrix](stage-5b-acceptance.md#prepared-initial-only-native-entry) for proof requirements and the hosted-only SQL schema test. Actual initial success, decline/manual 3DS and remaining native cases need separate evidence. No Docker, SQL, full Java application, Stripe or native Billing browser execution occurred during preparation.
+
+### Prepared scoped billing-time prerequisite
+
+The [finite billing-time spec](superpowers/specs/2026-10-29-billing-time-domains.md) adds an exact account/Site/Customer sample with explicit ordinary/isolated mode. Production returns the existing Clock instant unchanged. No native activation, registration, configuration, HTTP route or Stage 4 bean-list extension exists. Only the dedicated hosted test configuration supplies a +35-day billing instant while operational/security clocks stay UTC. The isolated slice covers unchanged-term INITIAL/RENEWAL paid/unpaid projection, exact reads and exact grace expiry; trial/change/cancel/paused/resume and other command proof shapes are refused. Exact views suppress financial actions and list/offers/global deadline guards execute before SQL.
+
+Local verification is restricted to audited exact pure-JUnit classes and cached offline Maven compilation. The real SQL/application integration fixture is authored and compiled only locally. Its first hosted run, exact head `c19f3c4dda941f729432cbcdfe1954f382ea1ae1` / [CI40891001665](https://github.com/viktar-mar/payment/actions/runs/40891001665), completed FAILURE: backend 3583 tests / 1 failure / 1 error / 1 existing skip. Both new lifecycle cases failed (cash-object binding used provider occurrence as creation audit, and equal-time setup contained unsupported recovery annotations); Task1 callback integration 6/6 and new pure tests passed, as did frontend and infrastructure. The narrow correction subsequently passed the completed `287bcb79085372c230275fb54e86050833997a97` / [CI40897288993](https://github.com/viktar-mar/payment/actions/runs/40897288993) hosted gate: backend 3587 tests, Cucumber 87 scenarios, all jobs green. It checks lifecycle occurrence/access versus UTC audit/enqueue, both callback families, lease/retry/signature independence, foreign owners and representative session/capability expiry. It does not prove complete JWT/OTP/quote boundaries, provider timestamps or any native Billing outcome. Status is **hosted prerequisite passed**, native **NOT_RUN**, full 5B **NOT_ACCEPTED**. The completed `287bcb7` receipt predates the new owned TestClock/Customer component and cannot substitute for its gate.
+
+The cash-binding correction deliberately records new PAYMENT object bindings with the existing operational Clock instead of provider occurrence, including Stage 4 future snapshots. Provider occurrence remains in payment event history, and immutable existing bindings are never rewritten. The Stage 4 clock injection list and functional billing/callback time contract are unchanged. The isolated integration setup uses an explicit plain-paid synthetic snapshot and separately asserts that raw recovery annotations are refused; this does not relax isolated admission or implement recovery semantics.
+
+### Prepared owned TestClock and fresh Customer binding
+
+The [finite spec](superpowers/specs/2026-10-29-billing-clock-binding.md) prepares one exact fresh Account/Site/Customer/run: durable intent, original clock POST, a single exact READY read and Customer creation bound only to that READY. Historical ordinary keys/fingerprints are preserved. UNKNOWN, expired or stopped attempts cannot redispatch, ordinary Customer fallback is refused, and known Customer ACK repair is local and limited to active ownership or BINDING_FAILED. All operational audit/lease times stay UTC; provider frozen/created fields remain separate evidence, not an inferred timestamp contract.
+
+The [test-only orchestration fixture](../backend/src/test/java/dev/genericpayments/platform/support/StripeBillingClockCustomerFixture.java) composes real stores/adapters/SQL with an inert official SDK transport and has no main, endpoint or production registration. The early head `218b89017b3046510516d1d29d9b4042f8400473` / [CI40911986452](https://github.com/viktar-mar/payment/actions/runs/40911986452) failed with backend 3694 tests/2 failures/1 error/1 existing skip; Cucumber 87/676 and frontend/infrastructure passed. The corrected combined head `b7776a72c28eedd499630d5c3a9bebd95db5b2d1` / [CI40916243540](https://github.com/viktar-mar/payment/actions/runs/40916243540) subsequently completed **SUCCESS**: backend **3718/0 failures/0 errors/1 existing skip**, Cucumber **87 scenarios/676 steps**, all three jobs green. The earlier failed evidence is retained. These SQL/application tests were never executed locally.
+
+### Prepared owned initial Subscription composition
+
+The [initial Subscription spec](superpowers/specs/2026-10-29-billing-clock-subscriptions.md) and [hosted fixture](../backend/src/test/java/dev/genericpayments/platform/support/StripeBillingClockSubscriptionCompositionFixture.java) compose fresh clock admission/READY/Customer before real command reservation, then explicit owned create, atomic original receipt, real reply publication/object binding and fenced FactService OPEN/INCOMPLETE projection. The fresh-admission guard still rejects preexisting lifecycle rows. Owned Subscription read/reserve/claim/ACK acquire Site → Customer → pinned Account to agree with publication; claim/ACK keep provider-row-first and DB-clock lease checks. Four bounded hosted publication/read races passed the `5ebb3fbe` hosted run below and remain unexecuted locally. A test-only primary time sampler joins admission/READY/original receipt with one nonlocking statement in the caller transaction; it never calls independent stores while lifecycle locks are held. Missing/stopped/foreign authority and unscoped admitted-owner queries refuse. Original opaque created/item/period values, F and operational UTC stay distinct. A narrow FactService correction avoids treating isolated pristine initial PENDING/no-cash observations as failed renewals; ordinary/actual failure semantics remain covered by pure controls.
+
+Status: **HOSTED COMPONENT PASSED** at `04e036e24b46b7d8b9dab372785866e198929389` / [CI40940823768](https://github.com/viktar-mar/payment/actions/runs/40940823768): backend **3923 tests / 0 failures / 0 errors / 1 existing skip**, **87 Cucumber scenarios / 676 steps**, all backend/frontend/infrastructure jobs passed. Native Billing **NOT_RUN**, full 5B **NOT_ACCEPTED**. Intermediate [CI40926703467](https://github.com/viktar-mar/payment/actions/runs/40926703467) failed backend with **3750 tests/2 failures/0 errors/1 existing skip** (two existing expired clock/Customer claim controls), while Cucumber **87/676**, frontend and infrastructure passed. It predates the new composition and cannot establish its result. The [acceptance checkpoint](stage-5b-acceptance.md#prepared-owned-initial-subscription-component) retains that result and records the later corrected full hosted gate without changing this failed checkpoint.
+
+The subsequent combined head `5ebb3fbe799be5577a555ba99fd6ed2fc1056233` / [CI40935558836](https://github.com/viktar-mar/payment/actions/runs/40935558836) completed **FAILURE**: backend **3923/2 failures/0 errors/1 existing skip**; Cucumber **87/676**, frontend and infrastructure passed. Publication-lock races **4/4**, owned store **20/20** and clock/Customer composition **26/26** passed. Only two Subscription composition assertions failed: a consumed observation fence is translated by the repository proxy to `InvalidDataAccessApiUsageException` with `IllegalStateException: OBSERVATION_STALE` as its cause. The narrow test correction requires both exact types/messages, preserves direct version-check exceptions and verifies no persisted change after rejection. Production guards are unchanged. Corrected assertions were compiled-only locally and subsequently passed the complete `04e036e` / CI40940823768 hosted gate; the failed run remains historical evidence.
+
+INITIAL_NON_CLOCK, default Fake, the production ordinary time adapter, Stage 4 clock injection list and launcher packaging allowlist are unchanged. At that preparation checkpoint the confirmation/payment component below still needed its own combined gate; later gates are recorded separately. Clock advance/renewal/trial support and remaining mutation/security boundaries remain separate work beyond the existing initial-only launcher. This documentation authorizes no local DB/application/provider/browser execution or native financial action.
+
+### Prepared owned initial payment confirmation composition
+
+The [finite confirmation spec](superpowers/specs/2026-10-29-billing-clock-confirmation.md) adds receipt-linked V32 roots and explicitly constructed owned action/provider/v2 service composition for the original non-trial CREATE. The real service's durable READY → DISPATCHING claim owns one original PI confirm POST; the provider validates its exact persisted evidence and original graph outside transactions. No production registry/public route/native activation or SDK protocol is added. OBSERVE and REQUIRES_ACTION remain unpaid until fresh fenced owned observation reaches actual FactService/cash/journal/outbox. Owned UNKNOWN/decline/lost response or ACK has no retry/successor; admitted owners remain refused by ordinary/public/v1 paths. Existing ordinary v2 retry and browser/Fake regressions remain required in full hosted CI.
+
+The [derived fixture](../backend/src/test/java/dev/genericpayments/platform/support/StripeBillingClockConfirmationCompositionFixture.java) uses real create/recordReply, guarded phases and durable stores with the official SDK's inert in-memory HttpClient. Only catalog/owner/session/callback prerequisites are synthetic rows. The positive action/attempt/lifecycle/payment chain comes from production services. It asserts one confirmed CASH bill/payment/journal, original CREATE SUCCEEDED and original-period PERIOD_PAID/access plus both actual callback snapshots; repeated fresh observation deduplicates and stale/corrupt evidence preserves prior state. F, original opaque created/item/period, and UTC expiry/audit/enqueue are deliberately distinct.
+
+Historical preparation status: **AUTHORED / COMPILED; combined hosted gate pending at that time**. The later `69e61e7` / CI40971762290 component gate and current `3b9114c` gate supersede that pending status. The prior `04e036e` / CI40940823768 component passed **3923 backend tests / 0 failures / 0 errors / 1 existing skip; 87 Cucumber scenarios / 676 steps; frontend/infrastructure passed**. Prior Task 2 standalone audited tests passed **257 / zero failures/errors/skips**. At preparation time, new composition **30** and finite contention **5** invocations were **compiled only locally**, with complete offline compilation of **343 test sources**; no integration test was locally executed. At preparation time hosted CI still had to establish two READY callers/one durable winner, replay and stop during the sole POST, guard/stop and real CASH publication contention, all negative graph/authority cases and complete ordinary/browser regressions. The subsequent review and exact-head hosted gates are recorded separately from this compilation history in the [acceptance checkpoint](stage-5b-acceptance.md#prepared-owned-initial-payment-confirmation-component).
+
+No local Docker, database/SQL, application/context, browser, provider/financial call or private environment/key/archive/recovery read was performed. Native Billing is **NOT_RUN**, full 5B **NOT_ACCEPTED**. Historical failed gates and historical financial/evidence records are preserved.
+
+### Owned first-renewal hosted composition
+
+The [first-renewal design](superpowers/specs/2026-11-01-owned-first-renewal-design.md) is implemented as explicitly constructed internal consumers and a hosted-only sampler. The [shared genuine fixture](../backend/src/test/java/dev/genericpayments/platform/support/StripeBillingFirstRenewalCompositionFixture.java) obtains its initial payment through actual create/action/select/durable confirm/fresh CASH/FactService before renewal admission; no successful Payment is seeded. Two single-dispatch advances produce B=E and T=E+3600, then fresh full CASH evidence permits atomic publication of provider period `[E,N)`, paidThrough N and authenticated access. The [complete composition tests](../backend/src/test/java/dev/genericpayments/platform/provider/adapter/out/stripe/billing/StripeBillingFirstRenewalCompositionIntegrationTest.java) check 2 bills, 2 Payments, 2 PERIOD_PAID events, 4 actual outbox payloads and byte-preserved original evidence. The hosted fixture remains EUR10 per invoice.
+
+Exact code source `d8db07b362c097fe48e41418f65e2045940db315` passed [owning run 41340553475](https://github.com/viktar-mar/payment/actions/runs/41340553475), [job 124949420797](https://github.com/viktar-mar/payment/actions/runs/41340553475/job/124949420797): **272/272 tests, zero failures/errors/skips**, including **11/11** full composition, **7/7** observation and **39/39** publication cases. This hosted PostgreSQL/application result is separate from local compile-only checks. At this documentation checkpoint, final all-three-jobs Offline CI on the exact final source commit, including this documentation, is **PENDING**; its completion receipt will be recorded separately. See the [acceptance checkpoint](stage-5b-acceptance.md#owned-first-unchanged-terms-renewal-component).
+
+Seven V33 evidence relations preserve immutable provenance and the one-use graph-read claim. One original 30-second invocation allows one boundary graph or at most three final graphs, with at most 100 requests per attempt and bounded SDK calls without retries. Pending/exhaustion and authority/fence drift cannot publish; concurrent publication commits once, and separate local receipt replay performs no graph read, new claim, money/event/outbox write or fence consumption. The sampler configuration is an explicit hosted test opt-in; the original observation context and ordinary billing-time registration remain unchanged. Original F and later B/T are billing evidence only; operational/security clocks and callback delivery remain UTC. V33 is frozen after the owning gate; further SQL changes require the next additive migration, preserving V30–32 and unknown applied checksums.
+
+This component adds no launcher, runtime switch or native invocation command. Native first renewal remains **NOT_RUN**, native initial paid acceptance remains outstanding, and full 5B is **NOT_ACCEPTED**. A future separately authorized fresh native scope must explicitly include initial EUR20 plus one EUR20 renewal, both B/T advances, resources and bounded reads; this documentation grants no such budget. Actual wire fields, payment-method persistence and timing still need that external evidence. All historical native failures and old EUR13/donation/CREATE/DISPATCHING records, keys and ledgers remain preserved and cannot be adopted or retried. No local Docker, SQL/application, browser or provider execution is established by this hosted checkpoint.
+
+## Prepared owned initial-payment scenario (separate future execution)
+
+The bounded owned off-Stripe policy changes the application evidence requirement for a typed original receipt, positive INITIAL invoice and actual `open`/`paid` status only. The shared action/material/preconfirm/OPEN/CASH mapper accepts an unavailable (omitted or JSON-null typed getter) `amount_paid_off_stripe`; zero remains accepted and any supplied numeric nonzero refuses. Unavailable stays unknown. The other five zero-money fields and required empty adjustment lists remain strict, and ordinary/nonoriginal, draft/uncollectible/VOID, zero/trial/proration and mutation `noAdjustments` retain explicit zero. Exact unpaid graph proof is still required before action, and exact full allocation/PI/captured card Charge/reverse/paid-at proof before CASH. Full gross card cash does not prove absence of additional outside funding. This is a deliberate evidence-policy choice, not proof of Stripe wire optionality, null=zero, the historical native value/cause, or actual-provider acceptance. It grants no new native permission: older retained consumed CREATE/DISPATCHING evidence remains uncertain and nonretryable; initial-payment and full 5B remain **NOT_ACCEPTED**. Offline verification selects only the three audited pure Java classes with inert SDK transport; it cannot substitute for native or hosted acceptance.
+
+For a typed original receipt, positive INITIAL invoice and actual invoice status exactly `open`, action/material/preconfirm accept allocation `amount_paid` as typed null or explicit numeric zero; supplied positive or negative amounts refuse. The [pinned stripe-java 34.0.0 model](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/model/InvoicePayment.java) documents null until the payment is paid, corroborated by the [official object reference](https://docs.stripe.com/api/invoice-payment/object); the [pinned SDK API version](https://raw.githubusercontent.com/stripe/stripe-java/v34.0.0/src/main/java/com/stripe/ApiVersion.java) is `2026-09-30.endive`. Omitted and JSON-null source representations both deserialize to typed null; this boundary cannot distinguish them or establish conforming wire omission. Null remains unfinalized/unknown, never numeric zero or cash. Complete independent unpaid proof remains mandatory: invoice paid explicitly zero and remaining exactly positive catalog due; sole default open allocation requesting that due with exact owner/currency/mode/payment reference; matching card-only automatic PI with received explicitly zero, automatic confirmation, `requires_payment_method` and no latest Charge; exact sole reverse allocation; original receipt/clock/period/line and secret bounds. Ordinary/nonoriginal action still requires explicit allocation zero. CASH still requires explicit full paid allocation, succeeded full PI, full paid/captured card Charge, exact reverse ownership and paid timestamp. This is a bounded admission correction, with no new financial route, read, root authority or dispatch budget. Historical run `aabe30d7-d499-46bf-bb56-4f592ed50aa8` reached a getter returning null; its precise wire representation and provider outcome remain unknown. Its uncertain CREATE is consumed and nonretryable; initial-payment/full 5B remain NOT_ACCEPTED and no native attempt is authorized.
+
+The source preparation added a dedicated `OWNED_INITIAL_PAYMENT` lane for one fresh READY Stripe TestClock, its owned Customer, a fresh published EUR20 MONTH inclusive Price with no trial, one original CREATE and one 4242 `SERVER_CONFIRM_V2` confirmation. Native initial-payment and full 5B remain **NOT_ACCEPTED**. The previous component checkpoint `69e61e7` / [CI40971762290](https://github.com/viktar-mar/payment/actions/runs/40971762290) passed. It does not prove this new scenario. The intermediate `05f897b` hosted run exposed a finite inert-import test allowlist omission, now repaired in source; at that preparation checkpoint the combined scenario still required independent review and successful hosted CI. The later `3b9114c` / CI41302204254 gate above passed all three jobs; native attempts remain unaccepted.
+
+This paragraph and command document a future invocation, not permission to execute it. Obtain separate runtime approval for the exact reviewed source SHA, new UUID, canonical owned Docker daemon, seven free loopback ports, explicit frozen epoch, pinned account `acct_1UPiMpELswAd8tpR` / API `2026-09-30.endive`, and fixed financial budget `{clock:1,customer:1,create:1,confirm:1}`. Fresh fixed catalog provisioning is separate. Do not adopt any old provider/local IDs, private recovery state, retained run or prior volume. All old Billing/full/remaining/manual/refund/diagnostic/Stage4 flags must be absent or false; DEBUG/NODE_DEBUG/PWDEBUG/PW_TRACE must be off. The reviewed bootstrap alone reads its existing private Sandbox credential file and creates fresh keys, issuer, ledger and runtime capability. No runtime control key is an operator/browser input.
+
+With that approval, a clean checkout of the approved SHA and the existing installed repository toolchain, use the shipped adapters directly. From the repository root, set the approved daemon and frozen epoch explicitly, then run:
+
+```sh
+: "${PAYMENT_STRIPE_SANDBOX_DAEMON:?Export the reviewed canonical unix:// daemon socket}"
+: "${PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_FROZEN_TIME:?Export the approved positive safe-integer epoch seconds}"
+export PAYMENT_STRIPE_SANDBOX_ENABLED=true
+export PAYMENT_STRIPE_BILLING_FIRST_PAYMENT=true
+export PAYMENT_STRIPE_SANDBOX_RUN_ID="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
+export PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE="$(git rev-parse HEAD)"
+export PAYMENT_STRIPE_SANDBOX_PORT_BACKEND=28080
+export PAYMENT_STRIPE_SANDBOX_PORT_DEMO=24173
+export PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER=28082
+export PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES=25432
+export PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP=28025
+export PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP=21025
+export PAYMENT_STRIPE_BILLING_FIRST_PAYMENT_CONTROL_PORT=28083
+pnpm --dir examples/demo-site exec playwright test \
+  --config playwright.stripe-billing-first-payment.config.ts
+```
+
+The illustrative seven ports must be the ports approved for that fresh run. The source SHA must equal the approved clean checkout; preflight refuses drift, unknown daemon identity or occupied ports. No separate adapter implementation or manual backend startup is missing from this invocation. The dedicated config selects only `stripe-billing-first-payment.spec.ts`, one worker, zero retries, no web-server auto-discovery, trace/video/screenshots off and a fixed sanitized reporter. Its 48-minute test and 50-minute global budgets leave headroom around the owner's one total at-most-45-minute deadline and separate at-most-120-second cleanup budget. The page receives at most five minutes within the owner's existing deadline. A failed/uncertain run cannot be restarted or retried under its original authority.
+
+Bootstrap builds the backend with `backend/Dockerfile.billing-first-payment` and the exact `PAYMENT_RUNTIME_SOURCE_SHA` build argument. The nine explicitly exported classes (eight dedicated runtime/scenario classes and the existing billing-time support class) live beside the unchanged production jar and launch through Boot PropertiesLauncher. Only this runtime installs the persisted READY billing-time sampler; ordinary scheduling is disabled, callback delivery remains active and operational/security clocks remain UTC. Seven loopback mappings, exact container ID, source, launcher and private runtime environment are proved before use. The public application has no new production route or registry entry.
+
+Bootstrap also passes `PAYMENT_DEMO_BUILD_MODE=billing-first-payment` to the existing demo Dockerfile. Vite selects only `billing-first-payment.html`, its source SDK bundle/CSS and a fixed public `health` asset for the existing `/health` probe. The page route is `/billing-first-payment.html`. Normal production build inputs are unchanged. The Dockerfile copies that HTML and ordinary `src`; private DTO types and Node adapters live solely in `tests/support`, so no infrastructure directory, DTO runtime, private file or key is copied into the browser image.
+
+The page authenticates by the real SDK's EMAIL_OTP flow. Its same client/session then calls `action`, `confirmationSession` and the existing exported `mountStripePaymentAttempt`. A dedicated Playwright transport fulfills only the original exact action GET and selected session POST from the private prepare result; it removes only `action_token:null` from the v2 session DTO. There is no second backend selection, synthetic SDK authority binding or alternate Stripe token implementation. One visible stable host waits for the real Element-ready event; the controller enters 4242 and clicks Pay once. The original SDK attempt, capability, ConfirmationToken and Idempotency-Key pass unchanged through Node to the private confirm handler. Unexpected next action is rejected before the driver can receive permission. The browser returns after OBSERVE; only Node's subsequent fresh-fence reconciliation, original CASH/SQL proof and delivered signed callbacks can accept the scenario. Ordinary inbound webhook acceptance is not claimed.
+
+The dedicated page blocks its own sessionStorage/localStorage before constructing the client, exercising the SDK's existing memory-authority fallback; failure to enforce this stops before authentication. No original storage handle is retained by the native page. Compatibility of this isolated parent-page policy with actual Stripe loading remains a future native gate. Pagehide, hidden tabs, expiry, abort, reload, duplicate calls, invalid confirmation and lost acknowledgements stop the attempt. No secrets enter page state attributes, URL, events, reports or saved media; only fixed phases are visible. CLI authentication handoff text is the existing bounded exception. Cleanup stops the exact owned resources and retains volumes/evidence; it never repairs uncertainty by redispatch.
+
+Verification is deliberately layered: hosted Chromium uses the actual built page and deployment CSP with inert Stripe transport, genuine SDK OTP authority and the real Node owner/private client; all its external requests are fulfilled or denied. Hosted PostgreSQL uses the actual private HTTP Handler in memory, the real owned scenario/services and inert official Stripe SDK transport, then the existing SQL and signed callback proof. A hosted packaging step checks the exact export, production-jar absence and production-only dependency closure without launching the runtime. These synthetic checks establish source contracts, not native payment acceptance or an executed container deployment. No native scenario is launched by ordinary CI.
+
+The first-payment Compose proof treats only absent or `null` backend `command` and `entrypoint` fields as inherited image defaults; explicit values, including empty strings and arrays, remain forbidden. The exact source/build, image launcher, private runtime environment and seven loopback-port proofs still apply. The prior native attempt reached preparation after issuer setup and stopped before stopped-service creation and Stripe operations. Offline regression tests reproduce and correct the null-default rejection; they do not establish the exact native failure cause or successful native execution. Native payment acceptance remains **NOT_ACCEPTED**.
+
+
+Prepare failures now retain a fixed diagnostic in the Node owner's final result. The
+private client accepts a server checkpoint only from the exact bounded status-400
+`INITIAL_PAYMENT_STOPPED` envelope with one allowlisted stage and no extra fields
+or duplicate keys. Other failures identify only the authority, request, HTTP,
+response or owner-acknowledgement boundary. External rejection properties, response
+bodies, HTTP statuses, credentials and identifiers never enter that diagnostic.
+The dedicated test emits one validated `owned_initial_payment_diagnostic` line
+after `owner.close()`, containing only the fixed code and
+`cleanup=CONFIRMED|UNCONFIRMED`. The dedicated reporter permits that one line
+after the existing CLI authorization handoff while suppressing arbitrary output
+and repeated handoffs.
+
+These codes identify a stopped boundary. In particular,
+`PREPARE_SERVER_SUBSCRIPTION_CREATE` does not prove that a provider POST happened,
+that a subscription was created, or that money moved. The original native root
+cause and creation outcome remain unknown. The original DISPATCHING operation
+remains uncertain, consumed and permanently non-retryable; these source changes
+provide no recovery authority. Offline inert tests establish diagnostic handling
+only, with no native acceptance claim.
+
+Action selection retains the fixed adapter boundaries `ACTION_AUTHORITY`,
+`ACTION_VERIFICATION`, `ACTION_GRAPH`, and `ACTION_RESERVATION`. A failed
+owned action graph can refine `ACTION_GRAPH` using closed labels:
+
+- `ACTION_GRAPH_LINE_ASSOCIATION`: the existing invoice-line association guard
+  failed, including a supplied conflicting flat subscription, the mandatory nested
+  parent subscription/type, or explicit proration-flag presence. A typed original
+  receipt permits an omitted/JSON-null duplicate flat subscription only while the
+  complete nested and original-receipt proof still matches. Ordinary null-clock
+  reads continue requiring the exact flat subscription.
+- `ACTION_GRAPH_INVOICE_SETTLEMENT` remains the coarse compatibility label for
+  the normalized invoice OPEN-or-CASH guard or later action-only OPEN requirement.
+  New failures can use the exact `ACTION_GRAPH_INVOICE_SETTLEMENT_<reason>`
+  stages below; only these fixed suffixes are accepted:
+  `PRORATION_FLAG`, `PRORATION_KIND`, `COLLECTION_METHOD`,
+  `PAID_OFF_STRIPE`, `OVERPAID`, `STARTING_BALANCE`, `ENDING_BALANCE`,
+  `PRE_CREDIT_NOTES`, `POST_CREDIT_NOTES`, `INVOICE_DISCOUNTS`,
+  `INVOICE_DISCOUNT_AMOUNTS`, `INVOICE_PRETAX_CREDITS`,
+  `LINE_DISCOUNT_AMOUNTS`, `LINE_PRETAX_CREDITS`, `TOTAL`, `SUBTOTAL`,
+  `LINE_AMOUNT`, `OPEN_DUE_POSITIVE`, `OPEN_DUE_CATALOG`, `OPEN_PAID`,
+  `OPEN_REMAINING`, `OPEN_ALLOCATION_STATUS`, `OPEN_ALLOCATION_PAYMENT`,
+  `OPEN_ALLOCATION_TYPE`, `OPEN_ALLOCATION_INTENT`, `SNAPSHOT_UNSUPPORTED`,
+  `ACTION_OPEN_CASH`, and `ACTION_OPEN`.
+  A common/plain or OPEN suffix identifies the first failed existing predicate
+  only when the existing settlement boundary actually rejects. Missing, null and
+  nonzero/nonempty field variants share one category; no presence or value is
+  reported. Paid CASH eligibility and a returned-null capture proof retain the
+  coarse `SNAPSHOT_UNSUPPORTED` fallback. A successfully normalized CASH reaching
+  the later action OPEN requirement uses `ACTION_OPEN_CASH`. Capture exceptions
+  and unknown/null statuses remain generic graph failures. Earlier INITIAL,
+  price/period and allocation-cardinality guards keep their existing precedence;
+  in particular, a PRORATION invoice still fails INITIAL generically.
+- `ACTION_GRAPH_PAYMENT_ALLOCATION`: compatible coarse fallback for the shared
+  six-assertion allocation contract before the PaymentIntent read. The contract
+  requires status exactly `open`, default exactly `Boolean.TRUE`, requested amount
+  exactly invoice due, paid amount typed-null or explicitly zero only for the bounded
+  owned original positive INITIAL graph (explicitly zero otherwise), payment present
+  and type exactly `payment_intent`, in that order. Owned action diagnostics refine
+  it with exactly
+  eleven suffixes under `ACTION_GRAPH_PAYMENT_ALLOCATION_`:
+  `STATUS_UNAVAILABLE`, `STATUS_NOT_OPEN`, `DEFAULT_UNAVAILABLE`, `DEFAULT_NOT_TRUE`,
+  `AMOUNT_REQUESTED_UNAVAILABLE`, `AMOUNT_REQUESTED_MISMATCH`,
+  `AMOUNT_PAID_UNAVAILABLE`, `AMOUNT_PAID_NONZERO`, `PAYMENT_UNAVAILABLE`,
+  `TYPE_UNAVAILABLE`, `TYPE_UNEXPECTED`.
+
+Allocation `UNAVAILABLE` means only that the reached typed getter returned Java
+null. Omitted and explicit JSON null share that category. The compatible closed
+`AMOUNT_PAID_UNAVAILABLE` label remains, but the bounded owned graph now accepts
+documented allocation null; ordinary allocation null still refuses. Mismatch
+labels disclose
+no actual value, sign or delta. Sequential evaluation preserves the original second
+payment getter before type; a throwing getter, null second-payment dereference or
+parser failure stays generic. Earlier settlement refusals keep their earlier stage.
+The bounded owned allocation paid predicate is the admission correction described
+above. Ordinary create/change/resume/recovery admission, request budgets, root
+authority and dispatch authority remain unchanged. OPEN observation remains
+descriptive; independent full CASH proof remains
+strict and does not gain an action-default requirement.
+
+The selected cached stripe-java 34.0.0 binary has direct nullable boxed/reference
+getters with no defaults. The pinned official model and current reference linked
+above establish allocation
+null until paid, while wire omission validity remains unproved. Eleven closed enum
+reasons and their finite mappings/tests retain diagnostic compatibility while
+independent graph failures still refuse. The historical getter-null is known; its
+precise wire representation and provider outcome remain UNKNOWN. No provider
+values or exception details enter the existing exact two-field status-400 envelope
+or final one-line 160-character diagnostic. Initial-payment/full 5B remain
+NOT_ACCEPTED; older retained CREATE/DISPATCHING evidence is consumed, uncertain and nonretryable.
+This work grants no new Sandbox attempt, replay/reset/adoption/reconciliation or
+publication.
+
+These labels identify the predicate at the existing rejecting boundary, without
+native values or a historical cause. Other graph failures retain generic
+`ACTION_GRAPH`. Tentative reasons belong to one invoice and action call and
+cannot annotate a success or unrelated failure. Exception messages, properties,
+causes, stacks and response bodies cannot supply provenance. Ordinary mapping
+and observation behavior, provider read order, and all other financial and
+nested ownership checks remain strict.
+
+The allocation policy is a bounded admission correction. Offline artificial
+fixtures establish source behavior, while the historical paid-amount getter-null
+does not establish its wire representation or successful native payment semantics.
+Initial-payment and full5B remain `NOT_ACCEPTED`; the
+original CREATE/DISPATCHING remains consumed and non-retryable. This patch
+provides no authority to replay, reset, adopt or reconcile it.
+
+The private prepare scenario also distinguishes `ACTION_SCOPE` before scope
+resolution, `ACTION_RESULT` after the adapter returns (including a denied null
+result), and `ACTION_BINDING` before binding lookup. Unknown or unavailable
+adapter metadata keeps the `ACTION_SELECT` fallback. These labels travel through
+the same exact code-plus-stage status-400 envelope and one final
+`PREPARE_SERVER_<stage>` diagnostic; they add no DTO fields, provider reads,
+financial authority, or retries. Unknown stages, forged suffixes, extra fields,
+duplicate keys and escaped wire aliases remain rejected. The first failure
+survives abort, cleanup, and duplicate refusal, and the reporter suppresses
+unrecognized output and repeated final diagnostics.
+
+Source-only reproductions use official SDK JSON parsing with an in-memory
+transport. Exact, omitted and JSON-null duplicate flat subscriptions preserve the
+same owned action binding/proof, successful root, confirmation material/preconfirm
+and OPEN/CASH observations. Every supplied foreign, empty or malformed flat
+reference rejects, as do missing/null/conflicting authoritative nested associations
+under both allowed absence forms. Null/omitted/nonzero invoice ending balances,
+supplied nonzero allocation paid amounts and the existing amount/currency,
+default/status, receipt/clock/period/catalog, PI/reverse/capture/Charge and durable
+authority attacks still refuse without issuing a root or an unauthorized POST.
+A wrong allocation payment type can fail the earlier normalized settlement guard
+and therefore carry the settlement label. Nullable money is never converted to
+zero. Omitted/JSON-null allocation paid is accepted only in the complete bounded
+owned unpaid action graph and cannot establish CASH. First-failure and concurrent
+guard provenance remain covered with a supplied foreign flat reference. Audited pure Java and injected Node/reporter tests establish
+source behavior and bounded transport only; no new native operation is included.
+
+This is an intentional owned application representation rule. The cached SDK's
+independent fields establish neither provider-valid omission nor SDK deprecation,
+and cannot establish the historical wire representation. The historical reached
+allocation paid getter-null is known; no label proves a provider POST,
+subscription outcome or movement of money. No old or current DISPATCHING invocation
+may be retried, adopted, reset or reconciled. Native initial-payment acceptance and
+full 5B remain NOT_ACCEPTED; these offline changes include no new native attempt.
+
+
+The first-payment owner now lets the owned bootstrap stop use the remaining shared
+120-second cleanup budget. Previously its per-method bound clipped that stop to
+30 seconds. Listener stop still precedes container stop, and listener, runtime and
+fixture cleanup retain their existing bounds. Time spent on earlier cleanup is
+subtracted from the same deadline. A confirmed stop requires fresh, complete
+ownership checks and actual nonrunning state for every recorded container; command
+stdout alone cannot confirm it. Only first-payment START_SERVICE uncertainty for
+exact, previously recorded owned container IDs can coexist with that stopped-state
+proof. The durable ledger remains PENDING with its original DISPATCHING intent;
+start and verify remain denied, and no intent is acknowledged, replayed or reset.
+Unknown creates, replacements, extra resources and ownership drift still refuse
+cleanup before any container stop.
+
+The dedicated Java runtime also owns startup acquisition and unwind. A failure
+while acquiring the scenario, control server or executor closes every resource
+already acquired, even if another close fails. The exact application-context
+listener and the subsequent closing/inactive check prevent shutdown races from
+allowing further startup. Successful startup keeps those resources alive until
+normal context closure; repeated closure does not dispose them twice.
+
+First-payment startup failures retain one fixed terminal code before cleanup, for
+example `START_BACKEND_COMMAND_NONZERO_EXIT`,
+`START_BACKEND_HEALTH_NOT_RUNNING`, `START_BACKEND_HEALTH_UNHEALTHY`,
+`START_BACKEND_HEALTH_PROOF_REJECTED`, or
+`START_BACKEND_PUBLIC_HEALTH_REJECTED`. The closed service/checkpoint/category set
+also distinguishes owned abort/deadline signals and internally normalized command
+failures such as output limits or spawn failures. NOT_RUNNING and UNHEALTHY are
+used only after the unchanged complete ownership and runtime identity projection
+succeeds. A rejected proof reports its fixed checkpoint instead. Foreign thrown
+values supply no diagnostic authority: their properties, messages, causes, stacks
+and raw output are never read for this code. The first code survives later
+start/verify/cleanup failures and reaches the same bounded final
+`owned_initial_payment_diagnostic code=... cleanup=CONFIRMED|UNCONFIRMED`
+line after owner closure. These startup codes extend only terminal reporting;
+the authenticated private PREPARE envelope and its allowlist remain unchanged.
+
+These repairs establish source behavior with injected offline tests. The historical
+backend exit 137 was observed after cleanup, and OOMKilled=false does not establish
+the original startup failure or exclude other causes. Its historical cause remains
+unknown. Existing admission, runtime/image/source/ownership proofs, financial
+validation and original dispatch authority remain in force. No old DISPATCHING
+operation gains retry or recovery authority. Native initial-payment and full5B
+acceptance remain **NOT_ACCEPTED**.
+
+Owned first-payment browser failures now preserve a finite operation checkpoint
+in the Node owner's existing terminal diagnostic. The exact closed set is
+`BROWSER_CONTEXT`, `BROWSER_PAGE`, `BROWSER_SETUP`, `BROWSER_NAVIGATION`,
+`BROWSER_CONFIGURE`, `BROWSER_OTP_REQUEST`, `BROWSER_OTP_VERIFY`,
+`BROWSER_PREPARE`, `BROWSER_ACTION_BRIDGE`, `BROWSER_SESSION_BRIDGE`,
+`BROWSER_CONFIRM_BRIDGE`, `BROWSER_WAIT_READY`, `BROWSER_CARD_NUMBER`,
+`BROWSER_CARD_EXPIRY`, `BROWSER_CARD_CVC`, `BROWSER_POSTAL_CHECK`,
+`BROWSER_POSTAL_FILL`, `BROWSER_PAY_CLICK`, `BROWSER_WAIT_OBSERVE`, and
+`BROWSER_CLOSE`. A checkpoint names the first operation where failure was
+observed; it does not identify a Stripe, DOM, validation, or historical root
+cause. Private WeakMap provenance supplies the code; rejected values, messages,
+properties, getters, causes and stacks supply no authority. The displayed browser
+error remains `Error: first_payment_BROWSER`.
+
+The runner latches asynchronous bridge, binding and navigation failures before
+abort/close. A later close rejection cannot replace the primary checkpoint or
+make a rejected run successful. The owner's first failure also wins when its
+diagnostic was null, so an earlier PREPARE/CONFIRM/abort failure cannot acquire a
+later browser label. Only the BROWSER boundary consumes browser provenance.
+The existing final line remains
+`owned_initial_payment_diagnostic code=<CLOSED_CODE> cleanup=<CONFIRMED|UNCONFIRMED>`;
+only the finite code and existing cleanup boolean leave the process. There are
+no new wire fields or private PREPARE response labels.
+
+Cleanup remains `UNCONFIRMED` when browser close is rejected, bounded out, or
+not yet known to have completed. The owner tracks journey settlement separately
+from the outer abort race and snapshots browser cleanup knowledge before starting
+its existing container cleanup. A pending journey or foreign rejection cannot
+claim confirmed browser cleanup. Late settlement cannot upgrade the first null
+diagnostic or reopen the final result. A journey that never started adds no
+browser uncertainty. Existing owner/page/locator/bridge/close limits and the
+container-stop budget are unchanged; there is no extra wait or close call.
+
+The safe report for run `6c32724b-cd17-4ab2-9b52-88f85f392701` at source
+`56ea76f74ffb48356a938d7b30ff7bbecfb198fb` records CREATE dispatch and
+acknowledgement, no CONFIRM dispatch/acknowledgement, a null diagnostic, STOPPED
+runtime state, and independent confirmation that all seven containers stopped.
+The interval after CREATE acknowledgement and before CONFIRM dispatch is inferred;
+the historical browser cause remains unknown. CREATE is consumed, acknowledged
+and nonretryable, cash remains unverified, and native initial-payment/full 5B
+remain **NOT_ACCEPTED**. Offline injected tests establish the diagnostic repair
+only. This source change grants no Sandbox execution, replay, recovery, new
+attempt, selector change, or financial authority.
+
+The private first-payment page now preserves confirmation branch provenance from
+one actual SDK handle through a closure-owned terminal snapshot. The SDK's nine
+internal categories are exactly `GUARD`, `STATE`, `SUBMIT_VALIDATION`, `SUBMIT`,
+`TOKEN_VALIDATION`, `TOKEN`, `CLIENT`, `NEXT_ACTION`, and `RETIRED`. The page adds
+`RECEIPT` when its existing returned-receipt checks refuse. The ten corresponding
+terminal labels are `BROWSER_CONFIRM_GUARD`, `BROWSER_CONFIRM_STATE`,
+`BROWSER_CONFIRM_SUBMIT_VALIDATION`, `BROWSER_CONFIRM_SUBMIT`,
+`BROWSER_CONFIRM_TOKEN_VALIDATION`, `BROWSER_CONFIRM_TOKEN`,
+`BROWSER_CONFIRM_CLIENT`, `BROWSER_CONFIRM_NEXT_ACTION`,
+`BROWSER_CONFIRM_RETIRED`, and `BROWSER_CONFIRM_RECEIPT`.
+
+These categories identify observed control-flow branches. `CLIENT` does not
+prove CONFIRM dispatch or provider acceptance; `TOKEN_VALIDATION` covers both a
+token validation result and a missing token. The internal handle WeakMap retains
+only its first finite category, without changing public SDK handles, results or
+errors. Ordinary SDK field-validation correction remains available. The dedicated
+page still permits one Pay only, reads provenance before clearing its handle,
+and exposes `__firstPaymentFailure()` as a nonconfigurable, nonwritable reader.
+It returns a primitive category only after STOPPED; success returns null. Normal
+successful final retirement remains compatible with OBSERVE.
+
+After its original prepare and Pay, the Node runner atomically samples terminal
+phase and category in its owned main frame and origin. It admits only the exact
+primitive labels from a valid own reader descriptor, then mints local terminal
+provenance. Unknown, absent, malformed, throwing or unavailable terminal snapshots
+remain `BROWSER_WAIT_OBSERVE`. Earlier Node bridge or owner
+failures win, including an earlier null diagnostic; renderer and Node events do
+not establish a shared chronological ordering. The snapshot grants no payment,
+cash, retry or cleanup authority. Existing financial guards, deadlines, one final
+line under 160 characters, cleanup proof and private PREPARE allowlist remain.
+
+The dedicated page optionally sends primitive pending changes to its context-local
+binding. After the original prepare, READY and Pay start, Node accepts only
+SUBMIT, null, TOKEN, null from the owned main frame and exact demo origin.
+Invalid open observations permanently disable the hint. Only rejection of the
+original OBSERVE wait, while the parent is live and before its original deadline,
+can report `BROWSER_WAIT_OBSERVE_LAST_OBSERVED_SUBMIT` or
+`BROWSER_WAIT_OBSERVE_LAST_OBSERVED_TOKEN`. The same already received finite
+sequence now distinguishes no accepted marker (`BROWSER_WAIT_OBSERVE_MARKER_MISSING`),
+the clear after SUBMIT (`BROWSER_WAIT_OBSERVE_SUBMIT_CLEARED`), the clear after
+TOKEN (`BROWSER_WAIT_OBSERVE_TOKEN_CLEARED`), and an invalid/unavailable marker
+sequence (`BROWSER_WAIT_OBSERVE_MARKER_INVALID`). Parent abort or expiry retains
+the generic code; terminal-page errors keep their existing labels.
+
+The page also sends an optional fixed Pay signal when its handler begins. If Node
+receives that signal from the owned main frame before the wait fails, but receives
+no pending stage, it reports `BROWSER_WAIT_OBSERVE_PAY_SIGNAL_OBSERVED_MARKER_MISSING`.
+This proves only that Node received a page signal, not that a payment was sent or
+the handler ran. Same-origin page code can invoke the binding, and delayed signals
+can leave the older `MARKER_MISSING` label. Neither label grants a retry.
+
+LAST_OBSERVED means the last pending stage received by Node before failure.
+Delayed renderer messages can make it stale; missing observation is inconclusive.
+The first failure freezes its local label and immediately cancels the browser
+journey before yielding. Late messages and provider completions cannot rewrite it
+or start a new CONFIRM. No diagnostic page read occurs after a rejected wait.
+Original deadlines, the 45000ms OBSERVE cap and 15000ms close/drain cap remain.
+These labels establish neither live provider state, cause, dispatch, cash nor
+acceptance, and cannot retrospectively classify any historical consumed run.
+
+The consumed run `7f141480-7d89-409c-aa88-996922e2fa58` stopped with the old
+generic `BROWSER_WAIT_OBSERVE` label and confirmed cleanup. Its journal contains
+CREATE acknowledgement but no CONFIRM dispatch. The old label does not reveal
+which finite marker state was present, and this diagnostic change does not
+classify that run or establish the provider's final financial state.
+
+The safe consumed report for run `0d750060-5cf9-4009-b89e-c2dca1e4815c` records
+CREATE dispatch/acknowledgement, no CONFIRM dispatch/acknowledgement,
+`BROWSER_WAIT_OBSERVE` with confirmed cleanup, STOPPED runtime and all seven
+containers independently stopped. Its acknowledged CREATE is consumed and
+nonretryable. Cash is unverified, the historical root cause is unknown, and
+native initial-payment/full 5B remain **NOT_ACCEPTED**. Offline tests establish
+this diagnostic correction only; they grant no new runtime, replay, attempt,
+push or CI authority.
+
+## Prepared initial payment and first renewal scenario
+
+The separate combined lane is **NATIVE ACCEPTED** at `a59dad7fd979cea774537210e76ed98f95f334a8` / run `e7080356-9c8c-4dd8-9ed4-b9ee94e57039`, as recorded in the current checkpoint above. Full stage 5B remains **NOT_ACCEPTED**. It reuses the original browser payment component for a fresh EUR20 MONTH subscription, then performs exactly one unchanged-terms EUR20 renewal. The original initial-only launcher remains available with its original authority and result. The completed receipt is evidence for that run only. Any later run needs fresh authority and current prerequisite checks; it permits no reuse of retained resources, operations, keys or ledgers.
+
+The dedicated entry is `examples/demo-site/tests/stripe-billing-first-renewal.spec.ts`, selected only by `playwright.stripe-billing-first-renewal.config.ts`. Ordinary and offline Playwright discovery exclude it. One worker, zero retries, disabled trace/screenshots/video, the existing browser component and a bounded scope-specific reporter preserve the initial lane's privacy and cleanup rules. Both accepted flags become true only after the initial proof, final proof and confirmed cleanup. An incomplete run consumes its authority; there is no retry, resume, arbitrary advance or graph command.
+
+For an operator-attended diagnostic of the same owned scenario, use the separate `playwright.stripe-billing-first-renewal-manual.config.ts` only in a newly authorized run. It opens installed Chrome visibly, performs the original OTP/prepare/card-entry path, then waits at most three minutes for the operator to press Pay once. It never clicks Pay automatically or resumes a consumed attempt. The existing server proof and cleanup still decide acceptance; a visible form or on-screen payment message is not proof. The unattended config and default discovery remain unchanged. Do not run both configs for the same run ID.
+
+In that Chrome window, wait until the test-card fields are filled and Pay becomes enabled; then press Pay once. Do not enter a real card, refresh, open the URL in a second browser, or press Pay again. Observe the on-screen state immediately after the click; the controlled window closes when the bounded attempt finishes. Report the visible state separately from the fixed server diagnostic. The local ignored `launch-manual-next.mjs` uses the same one-shot preflight and fresh run ID as the unattended launcher but selects only this manual config; merely listing tests is never evidence of payment.
+
+A future native run requires separate approval of a clean exact source SHA, fresh UUID/resources, canonical daemon, seven free loopback ports, explicit frozen epoch, pinned account/API and budget `{clock:1,customer:1,create:1,confirm:1,advance:2}` plus one fresh product and price. Resolve and independently verify adequate native storage before requesting that run; the earlier cleanup receipt is not proof of available capacity. With those prerequisites approved, from the repository root use the **unattended invocation below, which clicks Pay automatically**. These required variables must contain the approved values; this example does not select a daemon, source, run or ports automatically. Do not use the unattended command for the manual Chrome check.
+
+```sh
+: "${PAYMENT_STRIPE_SANDBOX_RUN_ID:?Approved fresh UUID required}"
+: "${PAYMENT_STRIPE_SANDBOX_EXPECTED_SOURCE:?Approved clean source SHA required}"
+: "${PAYMENT_STRIPE_SANDBOX_DAEMON:?Approved canonical unix:// socket required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_BACKEND:?Approved backend port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_DEMO:?Approved demo port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_RECEIVER:?Approved receiver port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_POSTGRES:?Approved database port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_MAILPITHTTP:?Approved mail HTTP port required}"
+: "${PAYMENT_STRIPE_SANDBOX_PORT_MAILPITSMTP:?Approved mail SMTP port required}"
+: "${PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_CONTROL_PORT:?Approved distinct control port required}"
+: "${PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_FROZEN_TIME:?Approved positive epoch seconds required}"
+export PAYMENT_STRIPE_SANDBOX_ENABLED=true
+export PAYMENT_STRIPE_BILLING_FIRST_RENEWAL=true
+pnpm --dir examples/demo-site exec playwright test \
+  --config playwright.stripe-billing-first-renewal.config.ts
+```
+
+For a separately authorized manual Chrome run, use the same approved environment and preflight, but invoke **only** this config instead of the unattended command:
+
+```sh
+pnpm --dir examples/demo-site exec playwright test \
+  --config playwright.stripe-billing-first-renewal-manual.config.ts
+```
+
+In this worktree the ignored `node .superpowers/sandbox-5b/launch-manual-next.mjs` performs the fresh preflight and invokes that manual config. It has not been run. Never invoke both launchers for one run ID.
+
+Export the required values before invocation. All other initial-only, billing acceptance, legacy/native, diagnostic, manual, refund and Stage4 opt-ins must be absent or false, and debug/trace controls off. The bootstrap generates the private control key and supplies only the `PAYMENT_STRIPE_BILLING_FIRST_RENEWAL_*` runtime identity fields. It builds `backend/Dockerfile.billing-first-renewal` with the exact source argument and verifies the `OwnedBillingFirstRenewalRuntime` PropertiesLauncher entrypoint, `/app/renewal-runtime` closure, source/environment identity and seven loopback ports before use. The private `withFirstRenewalRuntime` capability is unavailable on the initial-only bootstrap. The CLI provides only binding/login/listener capabilities. The demo image continues to use `billing-first-payment` mode and `/billing-first-payment.html`.
+
+The owner proves the original one-payment/no-advance SQL before admission, then invokes only empty-body `/first-renewal/boundary` and `/first-renewal/finalization`. Boundary is B=E and finalization T=E+3600; N comes from the provider. Final evidence requires two EUR2000 cash facts, two payment events, two PERIOD_PAID events, the committed publication, both ACK/READY steps and exactly seven acknowledged provider operations with no recovery: product, price, clock, customer, original subscription and two advances. Four signed delivered callbacks must be the exact INITIAL/RENEWAL union. No production route or ordinary clock registration changes; authentication, leases and delivery remain on UTC.
+
+The hosted combined test creates catalog operations through the actual catalog adapter with inert SDK transport, retains the original SQL before admission, executes the shipped final SQL in a real read-only database transaction and passes its actual row plus signature-verified deliveries to the production Node validator. Rollback-only SQL mutations check missing, foreign, unresolved and altered operation evidence without new SDK requests or financial writes. These tests and production-only exported closure checks belong to hosted CI; local source compilation and pure injected tests do not establish database, browser, Stripe or native acceptance. Final source-bound CI outcomes are retained in the external completion receipt, not inferred from this preparation status.
+
+The following failed runs and offline diagnostic changes are historical checkpoints predating the accepted `e7080356` receipt. Their financial uncertainty, consumed authority and cleanup results remain unchanged; they do not override the current combined status.
+
+The earlier isolated combined Sandbox run `206b7940-6495-4f4f-a09a-d43e79175990`
+reached acknowledged original CREATE and CONFIRM but exited 1 with no accepted
+initial or renewal proof. Its terminal output had no stage diagnostic; retained
+metadata is PENDING, while all seven exact-run containers were independently
+observed exited. The provider's final financial state was not queried. The
+attempt is consumed and cannot be replayed. In the owner source, generic errors
+after CONFIRM kept their finite phase but did not qualify for the closed terminal
+diagnostic; the offline correction now emits only a fixed post-CONFIRM checkpoint
+for browser, observation, evidence, renewal boundary, finalization, renewal
+evidence or cleanup. This is the last owner stage, not a cause or cash proof, and
+cannot retrospectively locate the historical failure. Payment dispatch,
+budgets, retries, deadlines and acceptance checks are unchanged. Stage 5B
+remains NOT_ACCEPTED.
+
+
+### Offline clock-advance diagnostics and late READY refusal (2026-11-05)
+
+The consumed run `0bb368b2-f97c-435a-9b5b-436d08d518f4` stopped at the
+broad `CLOCK_ADVANCE` boundary checkpoint. Its exact historical cause remains
+unknown: available local fixture snapshots end at the original CONFIRM ACK and
+contain no clock-specific failure trace. No provider state is inferred, and the
+attempt must not be replayed.
+
+The offline patch routes fixed source-owned `CLOCK_ADVANCE_*` checkpoints through
+the existing boundary failure response and terminal diagnostic allowlists. They
+cover local authority, preparation, account, reservation, claim and client;
+pre-read/validation, POST/validation, ACK store, poll wait/read/validation/exhaustion
+and READY store. The legacy broad `CLOCK_ADVANCE` remains valid. These names identify
+the last reached source location; they are neither root causes nor financial
+outcomes. No exception text, provider bodies/status codes, identifiers, timing or
+counters are exported, and unknown/forged suffixes fail closed.
+
+A separate inert regression proves an acceptance gap: `recordReady` could return
+after the original 30-second monotonic invocation budget while the original
+60-second lease remained valid. A post-return budget check now refuses that late
+successful return before graph observation and follows the existing fenced
+UNKNOWN attempt and admission stop path. It cannot roll back a READY write already
+committed; a committed ACK also remains ACKNOWLEDGED when the consumed claim can no
+longer mark it UNKNOWN. Stopping the admission blocks continuation and retries.
+The ordinary constructor still uses `System.nanoTime`. One POST per claimed step,
+zero SDK retries, two seconds per call, 30 seconds per invocation, the original
+60-second lease, twelve polls and 250 ms spacing are unchanged, as are exact
+identity/account/clock/target checks and persistence fences.
+
+Verification is limited to explicitly selected pure/inert Java and Node tests.
+No Docker, application/database/browser/provider execution, financial action,
+archive access, installation or old operation replay was performed. This supplies
+no native fix or acceptance evidence; Stage 5B remains **NOT_ACCEPTED**.
+
+### Offline bounded clock-poll pacing (2026-11-05)
+
+The later consumed run `ab6505e3-f1ee-48cb-bfc7-88debe42d1a9` ended at
+`CLOCK_ADVANCE_POLL_EXHAUSTED`; cleanup was confirmed. This establishes one
+acknowledged advance POST followed by twelve validated advancing observations.
+It does not establish their elapsed time, a provider fault or eventual READY.
+The former fixed 250 ms cadence complied with the specified ceilings; this
+change is bounded robustness, not a proven historical root-cause fix. All prior
+run reports, consumed operations and no-replay restrictions remain preserved.
+
+The first post-ACK poll still waits 250 ms. Each later wait uses the smaller of
+the original invocation's remaining 30-second monotonic budget and the original
+claim's remaining 60-second UTC lease. With zero-based `poll` and
+`pollsRemaining = 12 - poll`, the delay is
+`max(250ms, (remaining - 2s) / pollsRemaining)`. A delay at least as large as the
+remaining budget is refused before sleeping; the same original budget is checked
+after sleeping. The final SDK allowance remains `min(2s, remaining)`. Neither the
+deadline, lease, claim, key nor poll counter is renewed. With inert instantaneous
+IO and a full original budget, twelve advancing reads now span 28 seconds,
+reserving two seconds for the last call; this is a test fixture result, not a
+measurement of either historical native run.
+
+Deterministic inert tests demonstrate READY becoming available at six seconds:
+the old spacing exhausted twelve reads at three seconds, while paced reads
+observe READY within the original budget. The fast READY path still returns at
+250 ms. Tests also cover original preparation/POST time, short leases, oversleep,
+interrupt, authority drift, late READY store refusal and the existing
+uncooperative SDK worker cancellation deadline. The injected wait runs on the
+caller; ordinary constructors retain real monotonic time and interrupted sleep
+with the interrupt flag preserved. No callback, sleep or store continuation is
+transferred to the SDK worker.
+
+The unchanged limits are one POST, zero SDK retries, at most twelve post-ACK GET
+polls, at least 250 ms spacing, at most two seconds per SDK call, original
+30-second invocation and 60-second claim lease, all identity/target/ownership
+fences, ACK/READY persistence checks and terminal stop/no-replay behavior. Only
+explicitly selected offline pure tests were run; no runtime/provider execution
+or native acceptance was performed. Full Stage 5B remains **NOT_ACCEPTED**.
+
+### Offline PREPARE location and missing-cleanup diagnostics (2026-11-05)
+
+The later consumed combined run `483a0469` ended at generic `PREPARE_REQUEST`
+with `cleanup=UNCONFIRMED`. Its exact historical cause remains unknown. A local
+CREATE dispatch record proves only the local dispatch boundary, not that the
+provider received or completed CREATE, nor its financial outcome. The original
+saved PENDING state is retained and may survive stop. Later observation of all
+seven containers as Exited does not contradict UNCONFIRMED: it does not establish
+the browser, listener, START settlement or every owned cleanup callback's proof.
+No old CREATE or consumed operation may be replayed.
+
+For future separately authorized runs, the owner can report the last local
+PREPARE location through the existing primary diagnostic: `PREPARE_REQUEST_AUTHORITY`
+before bootstrap admission, `PREPARE_REQUEST_TRANSPORT` immediately before fetch,
+or `PREPARE_REQUEST_RESPONSE` after fetch resolves and before response processing.
+Only genuine process-local runtime provenance supplies those labels. Legacy
+generic PREPARE_REQUEST and detailed source-owned failures remain valid; the first
+failure, including a null diagnostic, stays latched. A location is not a cause,
+request completion, authenticated ACK or provider outcome.
+
+Rejected CLOSED results with unconfirmed cleanup may additionally print one
+independent line: `owned_initial_payment_cleanup_diagnostic code=<LITERAL>` or
+`owned_initial_and_first_renewal_cleanup_diagnostic code=<LITERAL>`. The closed
+literals, in existing cleanup order, are BROWSER_UNSETTLED, BROWSER_CLOSE,
+RUNTIME_CLOSE, LISTENER_STOP, START_SETTLEMENT, BOOTSTRAP_STOP and FIXTURE_CLOSE.
+Only the first missing proof is retained. BROWSER_UNSETTLED means the journey was
+still pending at the original cleanup snapshot; BROWSER_CLOSE means it had
+settled without trusted completed-close proof. START_SETTLEMENT means the existing
+bounded START drain did not supply settlement proof before bootstrap stop; it
+does not diagnose bootstrap internals. No late wait, new probe, retry or stop is
+added, and late completion cannot upgrade the frozen UNCONFIRMED result.
+
+Each dedicated spec prints the cleanup line after the unchanged primary line,
+when either qualifies independently. Each reporter forwards at most one primary
+line and one cleanup line for its own scope, plus the existing one CLI handoff.
+Lines remain at most 160 characters with exact finite grammar; the reporter keeps
+its 4096-character buffer and suppresses raw errors, stderr and arbitrary fields.
+No exception/provider text, IDs, timing or counters cross these boundaries.
+These added locations are neither historical root-cause evidence nor financial
+or stop evidence. Original single-use budgets, 45-minute owner lifetime, request
+bounds, separate 120-second cleanup allowance, ownership and acceptance rules
+are unchanged. Explicit inert Node tests and cached TypeScript checking only:
+no native execution or new authority. Full Stage 5B remains **NOT_ACCEPTED**.
+
+### Authenticated owned method component preparation (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#authenticated-method-completion-and-successor-recovery--2026-11-07) records the explicit backend method-completion and same-debt successor-recovery consumer. It remains unregistered, at the existing READY2 E+3600 sample, with no runnable native command. Local evidence is selected socket-free JUnit and compilation; the new genuine JDBC/provider-ACK/FactService composition is authored and compiled only, awaiting exact-source hosted execution. The [acceptance checkpoint](stage-5b-acceptance.md#authenticated-method-and-same-debt-recovery-preparation--2026-11-07) separates these boundaries.
+
+Synthetic SetupIntent confirmation and saved-card SDK responses in the hosted fixture do not exercise owned browser capability issuance or actual customer confirmation. Native Sandbox interoperability, exact-owner later time/grace/G+1 lineage, runtime integration and delivered callbacks remain outstanding. Native failed-renewal recovery is **NOT_RUN** and full Stage 5B **NOT_ACCEPTED**. Existing native authority and consumed-resource restrictions are unchanged.
+
+### Owned method browser permission preparation (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#owned-method-browser-permission-preparation--2026-11-07) now describes the original-session browser enrollment/one-shot permission service and reusable SDK `mountStripeSubscriptionMethod` entry. Custom sites supply the actual client/session and authenticated operation locator, keep a visible current host, and enable their explicit confirmation button only after readiness. The browser result is the actual pending RESERVED operation; independent succeeded SetupIntent/card proof, METHOD acknowledgement and the observer/FactService still establish completion. This service remains explicitly composed and unregistered; no native command is added. General query and ordinary clock-owner denial are unchanged.
+
+Only audited inert Java/JSDOM tests may run locally for this checkpoint. Existing pinned Stripe JS 10.1.0 dependencies are unavailable in the local cache, so full SDK types/build/test verification belongs to exact-source hosted CI; do not infer it from the selected mocked suites. Genuine database/controller composition is compile-only locally. Exact commands/results and the dependency gap are retained in the worktree-local `.superpowers/sdd/2026-11-07-owned-method-browser/task-3-report.md`, which is ignored and absent from a fresh published checkout; the [tracked browser design](superpowers/specs/2026-11-07-owned-method-browser-design.md) defines the published contract. No Docker, local SQL/Spring/application/server/browser/socket, real provider or native method execution occurs. Native recovery is **NOT_RUN** and Stage 5B **NOT_ACCEPTED**.
+
+The whole-review-fix checkpoint passes 38 owned-entry tests and 99 across the three related mocked SDK suites. Earlier 65-case inert Java/hosted compilation evidence remains unchanged, with no Java rerun in this fix. Owned confirmation invokes the original privately retained authorized command despite public-method replacement, requires actual RESERVED/no-action permission before Stripe and refuses a live publishable key before loading. The guard records original physical/composed ancestor removal through same-origin iframe shadow/slot roots even after same-turn reinsertion. Worktree-local `whole-fix-report.md` in the same retained report directory records this fix; prior reports retain the intermediate timeout, isolated reproduction and missing-dependency failure. These source checks do not provide native method confirmation or a new runnable lane.
+
+The later browser baseline `87effaa8cc0b8b47417f9a3003a1028b9233055a` passed [full CI](https://github.com/viktar-mar/payment/actions/runs/42379983006), including 5,366 backend cases (zero failures/errors, one existing skip) and all 76 failed-renewal composition cases, plus SDK/type/build and runtime packaging. [Dedicated renewal CI](https://github.com/viktar-mar/payment/actions/runs/42379982986) passed. That is hosted browser/completion evidence at its exact source, without native method acceptance.
+
+### Authenticated original owned SETUP producer (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#authenticated-original-owned-setup-producer--2026-11-07) and [design](superpowers/specs/2026-11-07-owned-method-setup-design.md) describe the explicitly constructed server producer now used by the hosted browser fixture. It authenticates the original enrolled reservation before proof exists, permits one first original claim/SDK create, and returns only the actual ACK-backed unbound proof. A separate browser issuer remains responsible for any client secret or confirmation permission. Existing non-browser preparation is preserved; independent saved-card binding and observer/FactService completion surround the browser METHOD writer described below.
+
+The subsequent SETUP checkpoint `dc3c470df9058a89f5e92388d72cb03c3a34743e` passed [full CI](https://github.com/viktar-mar/payment/actions/runs/42390500538): 5,420 backend cases, zero failures/errors, one existing skip and all 92 failed-renewal composition cases, frontend/infrastructure and both packaging checks. [Dedicated renewal CI](https://github.com/viktar-mar/payment/actions/runs/42390500550) passed 379/379. It covers genuine original SETUP production and the existing independent method-completion chain at that exact source; it does not establish native acceptance or the new METHOD writer below.
+
+### Authenticated original owned METHOD application (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#authenticated-original-owned-method-application--2026-11-07) and [design](superpowers/specs/2026-11-07-owned-method-apply-design.md) describe the explicitly constructed METHOD writer. Fresh actual-service inspection requires the original authenticated management context/key, unchanged debt/operation/binding/sample, independent bound SETUP proof/ACK and committed browser consumption. One original typed first claim permits only one bounded SDK subscription update containing the original bound default method; only a genuine ACK is returned. SETUP shares its existing time/cancellation/termination mechanics without moving authority or response handling into a framework.
+
+The hosted browser fixture now uses the separate binding producer below for independent succeeded SetupIntent/card retrieval and atomic original proof binding, calls this METHOD adapter, then separately invokes real lifecycle authentication and observer/FactService. The non-browser manual path is preserved. ACK evidence can finish after the final valid inspection crosses original expiry/revocation; the later lifecycle transition must refuse a dead session. A genuine failed lifecycle save rolls back its own transaction and retains the independent ACK, without permitting another POST. No runtime registration, route or native command is added.
+
+The METHOD baseline `5297e40e10364b150d6f60971246073d7cab0725` passed [full CI 42405505802](https://github.com/viktar-mar/payment/actions/runs/42405505802): 5,506 backend cases, zero failures/errors, one existing skip and all 127 failed-renewal composition cases; [dedicated renewal 42405505688](https://github.com/viktar-mar/payment/actions/runs/42405505688) passed 379/379. This covers the prior manual binding fixture. The later actual-binding baseline `394f4a4` passed [full CI 42413877138](https://github.com/viktar-mar/payment/actions/runs/42413877138): 5,566 backend cases and all 147 failed-renewal composition cases; [dedicated renewal 42413877140](https://github.com/viktar-mar/payment/actions/runs/42413877140) passed 379/379. Binding is verified at that source, while the new recovery-preparation gate below remains pending.
+
+### Original confirmed-method binding (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#original-confirmed-method-binding--2026-11-07) and [design](superpowers/specs/2026-11-07-owned-method-binding-design.md) describe the explicitly constructed, unregistered binding adapter. Fresh actual-service inspection requires the exact original unbound proof, canonical SETUP ACK/v2, unchanged debt/operation/binding/sample, original live enrolled management context/key and committed browser consumption. A separate atomic binding transaction repeats those checks, conditionally updates the exact unbound proof and revalidates original authority/enrollment after blocking work, with rollback on failure and no METHOD requirement or lifecycle/financial change.
+
+The adapter performs at most two logical official SDK GETs: original succeeded SetupIntent, then exactly its referenced original-customer sandbox card method. It reuses the unchanged ordinary SETUP validator, including operation_id/subscription_id metadata and original created window; browser method IDs, secrets and snapshots are not binding evidence. Full authenticated context comparisons precede each GET and final binding handoff. One immutable 30-second UTC/real/injected monotonic invocation budget includes caller inspection and credential/client work; each GET has at most two-second connect/read/complete-call limits, pinned API `2026-09-30.endive`, zero SDK/application retries and no idempotency key. Workers check original exact expiry/interruption and deadlines at SDK entry, without store/service capabilities. Cancellation bounds local waiting, not remote execution; transparent GET recovery may occur within bounds, so no single-wire-attempt claim is made. Safe cause-free refusal neither stops the branch nor creates a provider row. A fresh read-only invocation may inspect the still-unbound original again without minting browser permission; an already-bound proof is refused before GET. Genuine committed binding returns without postcommit timeout/authority rejection, and later METHOD authenticates independently.
+
+The hosted browser branch retains the original consumed receipt/context/token, actual METHOD writer, separate lifecycle authentication, observer/FactService and retained-ACK lifecycle rollback controls. Malformed-evidence, pre-read-refusal, read-uncertainty, competing final binding and actual binding-write failure/revocation/expiry rollback cases leave debt, cash, events, callbacks and original SETUP evidence unchanged on refusal. Non-browser manual binding remains intact. Local verification was limited to root-audited cached socket-free pure JUnit with actual service and in-memory official-SDK transport plus compilation; hosted additions were **compile-only locally**, then passed the binding baseline's exact-source hosted gate above. No local Docker/SQL/Spring/application/server/browser/socket/provider or native operation occurs.
+
+Native binding/runtime integration, exact-owner time/readiness and later grace/G+1 lineage, tax compatibility/decline strategy, native method confirmation/recovered-payment production and delivered callbacks remain outstanding. Native failed-renewal/binding/method/recovery are **NOT_RUN**, full Stage 5B **NOT_ACCEPTED**.
+
+### Original owned recovery preparation (2026-11-07)
+
+The [testing guide](testing/billing-failed-renewal-recovery.md#original-owned-recovery-preparation--2026-11-07) and [design](superpowers/specs/2026-11-07-owned-recovery-preparation-design.md) describe fresh inspection after genuine METHOD observer completion and separate `reserveRecovery`. One new transaction authenticates the exact original completion, recovery association, original live management session/context/key, still-open same debt, isolated sample, failure+1 sequence, SUCCEEDED SETUP and still-RESERVED RECOVER. JDBC retains existing locks, requires the committed historical browser permit, checks fresh database UTC after blocking work and exact original session identity/scopes/expiry. The service revalidates management authority and raw Java UTC before returning a redacted description. A consumed root's former confirmation window is not a new recovery expiry; no root is renewed, reissued, rewritten or consumed again.
+
+Before locking, recovery inspection compares the original owner to the validated context and binds exact immutable stored reservation/enrollment locators using ordinary SELECTs. It discovers RECOVER through scoped unresolved operations in canonical order, never using a caller Recovery UUID as a lock target. Preflight grants no live authority; final live checks and equality to original enrollment remain.
+
+Hosted cases follow actual SETUP producer/unbound proof+ACK → original browser controller/service issuance/selection/consumption with original context/token → independent binding → METHOD writer → lifecycle save → observer/FactService completion → reserveRecovery → fresh inspection. They seed no successful proof/ACK/completion. Repeated inspections compare all retained business/provider/receipt/event/outbox state and make zero additional SDK calls. Replacement/foreign/dead original authority, missing/partial/uncommitted evidence, changed lineage/debt, existing foreign operation/session locators and actual lock-wait expiry/revocation refuse. New hosted sources are compile-only locally; exact-head remote CI remains required. The historical-root expiry distinction is source-reviewed; no ten-minute wait or hosted expired-root acceptance is claimed.
+
+Root alone may execute cached explicit socket-free pure selectors and compile hosted sources locally. Workers read/edit/report only; no local database, Spring, Docker, server, browser, provider, installation or native financial operation is part of this slice. The new exact published-source full and dedicated renewal CI gate is **PENDING**; the verified binding baseline `394f4a4` does not cover it. Native failed-renewal/recovery is **NOT_RUN** and full Stage 5B **NOT_ACCEPTED**.
+
+This descriptive context is never financial dispatch authority. A later financial producer needs a separate explicit precise remote mutation and persistence contract and must authenticate again at every boundary. V34 forbids dispatched `INVOICE_PAY` on this owned branch, and ordinary invoice-pay fallback cannot supply the missing authority. This slice adds no adapter, operation/claim, fact, cash, callback, route, bean, migration, dependency, browser permission or native command.

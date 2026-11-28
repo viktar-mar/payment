@@ -1,8 +1,14 @@
+import { guardSubscriptionHandoff, type SubscriptionHandoff } from './subscription-handoff.js';
+import { supportsPaymentV2 } from './confirmation-v2.js';
+import { mountStripePaymentAttempt, type StripePaymentAttemptHandle } from './stripe-payment-attempt-driver.js';
+import type { SubscriptionAttemptStatus } from './contracts.js';
 import type { GenericPaymentClient } from '../contracts.js';
 import type { CustomerSession } from '../customer/contracts.js';
 import { validateCustomerSession } from '../customer/contracts.js';
 import { isAbort, PaymentSdkError, problemError } from '../errors.js';
-import { SubscriptionFakeActionDriver } from './action-driver.js';
+import { SubscriptionFakeActionDriver, watchSubscriptionOperation } from './action-driver.js';
+import { mountStripeSubscription, type StripeSubscriptionHandle } from './stripe-subscription-driver.js';
+import { createProviderMount, ownedProviderHost, type OwnedProviderMount } from '../widget/provider-mount.js';
 import type { SubscriptionAction, SubscriptionBillingPage, SubscriptionBillingView, SubscriptionEvent, SubscriptionHistory, SubscriptionMutation, SubscriptionOffer, SubscriptionOperation, SubscriptionQuote, SubscriptionTiming, SubscriptionView } from './contracts.js';
 import { acceptManagerResult, type ManagerState } from './manager-state.js';
 import { subscriptionCopy, type SubscriptionCopyKey } from './copy.js';
@@ -14,6 +20,9 @@ const ElementBase = (typeof HTMLElement === 'undefined' ? class {} : HTMLElement
 const identity = (s?: CustomerSession): string => s ? JSON.stringify([s.apiBaseUrl, s.siteKey, s.siteId, s.origin, s.customer.id, s.customer.status, s.customer.maskedEmail, s.sessionToken, s.expiresAt, [...s.scopes].sort()]) : '';
 const unresolved = (op: SubscriptionOperation | null): boolean => !!op && !['SUCCEEDED', 'FAILED'].includes(op.status);
 const safeOperation = (op: SubscriptionOperation): SubscriptionOperation => ({ operationId: op.operationId, subscriptionId: op.subscriptionId, status: op.status, actionAvailable: op.actionAvailable });
+function assertStatusOnlyOperation(op: SubscriptionOperation): void {
+  if (op.status === 'REQUIRES_ACTION' || op.actionAvailable || op.nextAction) throw new PaymentSdkError('INVALID_RESPONSE');
+}
 
 export class GenericSubscriptionManager extends ElementBase {
   static observedAttributes = ['locale'];
@@ -30,6 +39,15 @@ export class GenericSubscriptionManager extends ElementBase {
   #loaded = false;
   #uncertain = false;
   #action?: SubscriptionAction;
+  #statusOnlyOperation?: Pick<SubscriptionOperation, 'operationId' | 'subscriptionId'>;
+  #providerMount?: OwnedProviderMount;
+  #stripeHandle?: StripeSubscriptionHandle | StripePaymentAttemptHandle;
+  #v2?: { subscriptionId:string; operationId:string; attemptId?:string; status?:SubscriptionAttemptStatus; retrySent:boolean; attempted?:boolean };
+  #formController?: AbortController;
+  #formReady = false;
+  #formOperation?: string;
+  #spentOperations = new Set<string>();
+  #polling = false;
   #offers: SubscriptionOffer[] = [];
   #billing: SubscriptionBillingPage = { items: [], nextCursor: null };
   #history: SubscriptionHistory = { items: [], nextCursor: null };
@@ -109,6 +127,9 @@ export class GenericSubscriptionManager extends ElementBase {
     button('recover', () => { const debt = this.#state.subscription?.debt; if (debt) void this.#mutate(i => this.#client!.subscriptions.recover({ ...i, billingRecordId: debt.billingRecordId }), 'RECOVER_INVOICE'); });
     button('resume', () => { if (this.#requireConsent()) void this.#mutate(i => this.#client!.subscriptions.resume({ ...i, recurringConsent: true }), 'RESUME'); });
     button('complete', () => { const action = this.#action, op = this.#state.operation; if (!action || !op) return; this.#action = undefined; void this.#mutate(i => new SubscriptionFakeActionDriver(this.#client!.subscriptions).complete(action, { ...i, operationId: op.operationId }), undefined, true); });
+    button('pay', () => { void this.#pay(); });
+    button('retryPayment', () => { void this.#retryPayment(); });
+    button('continuePayment', () => { void this.#retryPayment(); });
     button('portal', () => { void this.#portal(); });
     this.#section.append(this.#billingTitle, this.#billingList); button('moreBilling', () => { void this.#more('billing'); });
     this.#section.append(this.#historyTitle, this.#historyList); button('moreHistory', () => { void this.#more('history'); }); this.#section.append(this.#protected);
@@ -122,6 +143,8 @@ export class GenericSubscriptionManager extends ElementBase {
   disconnectedCallback(): void { this.#reset(); this.#render(); }
   attributeChangedCallback(name: string, old: string | null, value: string | null): void { if (name === 'locale' && old !== value) this.locale = value === 'pt' ? 'pt' : 'en'; }
   #reset(): void {
+    this.#retireForm(); this.#v2=undefined; this.#spentOperations.clear(); this.#polling = false;
+    this.#statusOnlyOperation = undefined;
     this.#controller?.abort(); this.#controller = undefined; if (this.#expiry !== undefined) clearTimeout(this.#expiry); this.#expiry = undefined;
     this.#state = { authorityRevision: this.#state.authorityRevision + 1, phase: 'idle', subscription: null, operation: null };
     this.#fingerprint = identity(this.#session); this.#busy = this.#loaded = this.#uncertain = false; this.#action = undefined; this.#offers = []; this.#quote = undefined; this.#cancelMode = undefined; this.#error = undefined;
@@ -130,7 +153,7 @@ export class GenericSubscriptionManager extends ElementBase {
   }
   #configure(): void {
     this.#reset(); this.#render(); if (!this.isConnected || !this.#client || !this.#session || !this.#productId) return;
-    try { validateCustomerSession(this.#session); if (!this.#session.siteId || !this.#session.scopes.includes('SUBSCRIPTION_READ')) throw new PaymentSdkError('INVALID_SESSION'); }
+    try { supportsPaymentV2(this.#client.subscriptions); validateCustomerSession(this.#session); if (!this.#session.siteId || !this.#session.scopes.includes('SUBSCRIPTION_READ')) throw new PaymentSdkError('INVALID_SESSION'); }
     catch (e) { this.#state.phase = e instanceof PaymentSdkError && e.code === 'SESSION_EXPIRED' ? 'expired' : 'error'; this.#error = 'login'; this.#render(); return; }
     this.#controller = new AbortController(); const revision = this.#state.authorityRevision;
     const expire = () => { const left = Date.parse(this.#session!.expiresAt) - Date.now(); if (left > 0) { this.#expiry = setTimeout(expire, Math.min(left, 2147483647)); return; } this.#reset(); this.#state.phase = 'expired'; this.#render(); this.#emit(); };
@@ -147,12 +170,12 @@ export class GenericSubscriptionManager extends ElementBase {
     this.dispatchEvent(new CustomEvent('generic-subscription-state', { detail, bubbles: true, composed: true }));
   }
   #accept(revision: number, next: Partial<ManagerState>): void { if (!this.#current(revision)) return; this.#state = acceptManagerResult(this.#state, revision, { ...this.#state, ...next }); this.#render(); this.#emit(); }
-  #failure(error: unknown, revision: number, mutation = false): void {
+  #failure(error: unknown, revision: number, mutation = false, preparation = false): void {
     if (!this.#current(revision) || isAbort(error)) return;
-    this.#action = undefined; this.#quote = undefined; this.#cancelMode = undefined;
+    this.#retireForm(); if(this.#v2)this.#v2.status=undefined; this.#action = undefined; this.#quote = undefined; this.#cancelMode = undefined;
     const code = problemError(error instanceof PaymentSdkError ? { code: error.code } : {}).code;
     if (['SESSION_EXPIRED', 'INVALID_SESSION', 'AUTHENTICATION_FAILED'].includes(code)) { this.#reset(); this.#state.phase = 'expired'; this.#error = 'login'; }
-    else { if (mutation) this.#uncertain = true; this.#state.phase = mutation || unresolved(this.#state.operation) ? 'unknown' : 'error'; this.#error = mutation ? 'unknown' : 'error'; }
+    else { if (mutation) this.#uncertain = true; this.#state.phase = preparation ? 'error' : mutation || unresolved(this.#state.operation) ? 'unknown' : 'error'; this.#error = mutation ? 'unknown' : 'error'; }
     this.#render(); this.#alert.focus(); this.#emit(); this.dispatchEvent(new CustomEvent('generic-subscription-error', { detail: Object.freeze({ code }), bubbles: true, composed: true }));
   }
   async #load(revision: number): Promise<void> {
@@ -170,22 +193,160 @@ export class GenericSubscriptionManager extends ElementBase {
       const billing = await client.billingRecords(input); if (!this.#current(revision)) return;
       const history = await client.history(input); if (!this.#current(revision)) return;
       this.#billing = billing; this.#history = history; this.#loaded = true;
-      this.#accept(revision, { subscription });
       const pointer = subscription.pendingOperation;
+      this.#statusOnlyOperation = pointer && (pointer.kind === 'CANCEL' || pointer.kind === 'WITHDRAW_CANCEL')
+        ? { operationId: pointer.operationId, subscriptionId: subscription.subscriptionId } : undefined;
+      this.#accept(revision, { subscription });
       if (pointer) { await this.#readOperation(revision, pointer.operationId, subscription.subscriptionId); return; }
-    } else { this.#billing = { items: [], nextCursor: null }; this.#history = { items: [], nextCursor: null }; }
+    } else {
+      this.#statusOnlyOperation = undefined;
+      this.#billing = { items: [], nextCursor: null }; this.#history = { items: [], nextCursor: null };
+    }
     this.#loaded = true; this.#action = undefined; this.#accept(revision, { subscription, phase: this.#uncertain ? 'unknown' : 'ready', operation: this.#uncertain ? this.#state.operation : null });
   }
   async #readOperation(revision: number, operationId: string, subscriptionId: string): Promise<void> {
     const input = { session: this.#session!, signal: this.#controller!.signal, subscriptionId, operationId }, client = this.#client!.subscriptions;
     const op = await client.operation(input); if (!this.#current(revision)) return;
+    const statusOnly = this.#statusOnlyOperation?.operationId === operationId && this.#statusOnlyOperation.subscriptionId === subscriptionId;
+    if (statusOnly) {
+      if (op.operationId !== operationId || op.subscriptionId !== subscriptionId) throw new PaymentSdkError('INVALID_RESPONSE');
+      assertStatusOnlyOperation(op);
+    }
+    if (['SUCCEEDED','FAILED','UNKNOWN'].includes(op.status)) this.#retireForm();
+    if (['SUCCEEDED','FAILED'].includes(op.status)) this.#v2=undefined;
     this.#action = undefined;
-    if (op.status === 'REQUIRES_ACTION' && op.actionAvailable && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) { const action = await client.action(input); if (!this.#current(revision)) return; this.#action = action; }
+    if (!statusOnly && !this.#v2 && ['PROCESSING','REQUIRES_ACTION'].includes(op.status) && this.#formOperation!==operationId && !this.#spentOperations.has(operationId) && this.#session!.scopes.includes('SUBSCRIPTION_MANAGE')) {
+      let action: SubscriptionAction | undefined;
+      try {
+        action = await client.action(input); if (!this.#current(revision)) return;
+      } catch (error) {
+        if (isAbort(error) || error instanceof PaymentSdkError && ['INVALID_SESSION','SESSION_EXPIRED','AUTHENTICATION_FAILED'].includes(error.code)) throw error;
+        // An unavailable original action is still pending; a read never retries a write.
+        this.#error = 'processing';
+      }
+      if ((!action || action.kind==='PROVIDER_CLIENT') && supportsPaymentV2(client)) {
+        const status=await client.currentConfirmationAttempt!(input); if(!this.#current(revision))return;
+        if(status){this.#v2={subscriptionId,operationId,attemptId:status.attemptId,status,retrySent:false};action=undefined;}
+      }
+      if (action?.kind === 'PROVIDER_CLIENT') { this.#accept(revision, { operation:safeOperation(op),phase:this.#phase(op) }); if (!await this.#prepareStripe(revision,op,action)) return; }
+      else if (action && op.status === 'REQUIRES_ACTION' && op.actionAvailable) this.#action = action;
+    }
     this.#uncertain = op.status === 'UNKNOWN'; this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
+  }
+  #retireForm(): void {
+    const controller=this.#formController, handle=this.#stripeHandle, mount=this.#providerMount;
+    this.#formReady=false; this.#formOperation=undefined; this.#formController=undefined; this.#stripeHandle=undefined; this.#providerMount=undefined;
+    controller?.abort(); handle?.destroy(); mount?.destroy();
+  }
+  async #prepareStripe(revision:number, op:SubscriptionOperation, action?:SubscriptionAction, successor?:SubscriptionAttemptStatus, handoffSignal?:AbortSignal):Promise<boolean> {
+    if ((!successor && this.#spentOperations.has(op.operationId)) || this.#formOperation===op.operationId) return false;
+    this.#retireForm(); this.#formOperation=op.operationId;
+    const form = new AbortController(); this.#formController=form;
+    let handoff:SubscriptionHandoff|undefined;
+    try {
+      const mount = createProviderMount(this,this.#buttons.get('pay')!,'STRIPE');
+      // Reserve actual light-DOM geometry before the provider creates its iframe.
+      mount.host.style.minHeight='3rem'; this.#providerMount=mount; this.#render();
+      const client=this.#client!.subscriptions;
+      handoff=guardSubscriptionHandoff({container:mount.host,
+        signal:AbortSignal.any([this.#controller!.signal,form.signal,...(handoffSignal?[handoffSignal]:[])]),
+        expiresAt:successor?.expiresAt??action?.expiresAt??this.#session!.expiresAt,
+        isCurrent:()=>this.#current(revision)&&this.#providerMount===mount&&ownedProviderHost(this)===mount.host,
+        onRetire:()=>{if(this.#providerMount===mount){this.#retireForm();if(this.#current(revision))this.#render();}}});
+      const input={session:this.#session!,subscriptionId:op.subscriptionId,operationId:op.operationId,signal:handoff.signal};
+      const options={client,input,container:mount.host,locale:this.#locale,
+        isCurrent:()=>this.#current(revision) && this.#providerMount===mount && ownedProviderHost(this)===mount.host,
+        onRetire:()=>{ if (this.#providerMount===mount) { this.#retireForm(); if(this.#current(revision)) this.#render(); } } };
+      let handle:StripeSubscriptionHandle|StripePaymentAttemptHandle;
+      if(supportsPaymentV2(client)){
+        this.#v2 ??= {subscriptionId:op.subscriptionId,operationId:op.operationId,retrySent:false};
+        const context=successor
+          ? await handoff.wait(client.paymentAttemptSession!({...input,attemptId:successor.attemptId,expiresAt:successor.expiresAt,idempotencyKey:crypto.randomUUID()}))
+          : await handoff.wait(client.confirmationSession!({...input,action:action!,idempotencyKey:crypto.randomUUID()}));
+        if(!options.isCurrent()||input.signal.aborted)return false;
+        if(context.protocol==='SERVER_CONFIRM_V2'){
+          this.#v2={subscriptionId:op.subscriptionId,operationId:op.operationId,attemptId:context.attemptId,retrySent:false,status:{protocol:'SERVER_CONFIRM_V2',attemptId:context.attemptId,state:'READY',retryAllowed:false,successorAttemptId:null,expiresAt:context.expiresAt}};
+          handle=await mountStripePaymentAttempt({...options,context});
+        }else{this.#v2=undefined;handle=await mountStripeSubscription({...options,action:action!,selectedSession:context});}
+      }else{handle=await mountStripeSubscription({...options,action:action!});}
+      if (!this.#current(revision) || this.#providerMount!==mount) { handle.destroy(); return false; }
+      this.#stripeHandle=handle; this.#formReady=true; this.#render(); return true;
+    } catch(error) { if (this.#formController===form) this.#retireForm(); this.#failure(error,revision,false,true); return false; }
+    finally { handoff?.release(); }
+  }
+  async #pay():Promise<void> {
+    const revision=this.#state.authorityRevision, handle=this.#stripeHandle, op=this.#state.operation;
+    if (this.#busy || !this.#formReady || !handle || !op || !this.#current(revision)) return;
+    const v2='protocol' in handle && handle.protocol==='SERVER_CONFIRM_V2';
+    if(!v2)this.#spentOperations.add(op.operationId);
+    this.#formReady=false; this.#busy=true; this.#error=undefined; this.#render();
+    let validationFailed=false;
+    try { const result=await handle.confirm(); if(v2 && 'validationFailed' in result){validationFailed=true;if(this.#current(revision)){this.#formReady=true;this.#error='paymentDetails';}} }
+    catch(error) { if (this.#current(revision) && !isAbort(error)) this.#error='unknown'; }
+    finally { if (this.#current(revision)) {
+      if(!validationFailed){if(v2&&this.#v2)this.#v2.attempted=true;this.#retireForm();if(v2){try{await this.#recoverAttempt(revision);}catch(error){this.#failure(error,revision);}}}
+      if(this.#current(revision)){
+        const attempt=this.#v2?.status;
+        // An authoritative decline leaves the next action to the explicit Retry control.
+        const awaitingRetry=v2&&attempt?.state==='DECLINED'&&attempt.retryAllowed&&
+          !attempt.successorAttemptId&&!this.#v2?.retrySent&&Date.parse(attempt.expiresAt)>Date.now();
+        this.#busy=false;
+        this.#render();
+        if(!validationFailed&&!awaitingRetry)void this.#observe(revision,op);
+      }
+    } }
+  }
+  async #recoverAttempt(revision:number):Promise<void>{
+    const locator=this.#v2;if(!locator)return;
+    const input={session:this.#session!,signal:this.#controller!.signal,subscriptionId:locator.subscriptionId,operationId:locator.operationId};
+    const client=this.#client!.subscriptions;
+    const status=locator.attemptId?await client.confirmationAttempt!({...input,attemptId:locator.attemptId}):await client.currentConfirmationAttempt!(input);
+    if(!this.#current(revision)||this.#v2!==locator)return;
+    locator.status=status??undefined;if(status)locator.attemptId=status.attemptId;
+    this.#error=status?.state==='DECLINED'?'paymentDeclined':status?.state==='UNKNOWN'?'unknown':undefined;
+  }
+  async #retryPayment():Promise<void>{
+    const revision=this.#state.authorityRevision,locator=this.#v2,status=locator?.status;
+    if(this.#busy||this.#polling||!locator||!status||!this.#current(revision)||Date.parse(status.expiresAt)<=Date.now()||!this.#session!.scopes.includes('SUBSCRIPTION_MANAGE'))return;
+    if(status.state==='READY'&&locator.attempted)return;
+    if(!status.successorAttemptId&&status.state!=='READY'&&(!status.retryAllowed||locator.retrySent))return;
+    this.#busy=true;this.#error=undefined;this.#retireForm();this.#render();
+    let handoff:SubscriptionHandoff|undefined;
+    try{
+      handoff=guardSubscriptionHandoff({container:this,signal:this.#controller!.signal,expiresAt:status.expiresAt,
+        isCurrent:()=>this.#current(revision),onRetire:()=>{if(this.#v2===locator)locator.status=undefined;}});
+      const client=this.#client!.subscriptions,input={session:this.#session!,signal:handoff.signal,subscriptionId:locator.subscriptionId,operationId:locator.operationId};
+      let prepared=status;
+      if(!status.successorAttemptId&&status.state!=='READY'){
+        locator.retrySent=true;
+        prepared=await handoff.wait(client.retryPaymentAttempt!({...input,attemptId:status.attemptId,idempotencyKey:crypto.randomUUID()}));
+        if(!this.#current(revision)||this.#v2!==locator)return;
+        locator.status=prepared;
+        if(prepared.state!=='DECLINED'||!prepared.successorAttemptId)throw new PaymentSdkError('INVALID_RESPONSE');
+      }
+      const attemptId=prepared.successorAttemptId??prepared.attemptId;
+      const successor=await handoff.wait(client.confirmationAttempt!({...input,attemptId}));
+      if(!this.#current(revision)||this.#v2!==locator)return;
+      if(successor.state!=='READY'||Date.parse(successor.expiresAt)<=Date.now())throw new PaymentSdkError('INVALID_RESPONSE');
+      const op=this.#state.operation??{subscriptionId:locator.subscriptionId,operationId:locator.operationId,status:'REQUIRES_ACTION' as const,actionAvailable:true};
+      this.#accept(revision,{operation:op});await this.#prepareStripe(revision,op,undefined,successor,handoff.signal);
+    }catch(error){this.#failure(error,revision,true);}
+    finally{handoff?.release();if(this.#current(revision)){this.#busy=false;this.#render();}}
+  }
+  async #observe(revision:number, original:SubscriptionOperation):Promise<void> {
+    if (!this.#current(revision) || this.#polling) return; this.#polling=true; this.#render();
+    try {
+      for await (const op of watchSubscriptionOperation(this.#client!.subscriptions,{session:this.#session!,signal:this.#controller!.signal,subscriptionId:original.subscriptionId,operationId:original.operationId})) {
+        if (!this.#current(revision)) return;
+        this.#uncertain=op.status==='UNKNOWN'; this.#accept(revision,{operation:safeOperation(op),phase:this.#phase(op)});
+        if (['SUCCEEDED','FAILED'].includes(op.status)) { this.#v2=undefined; this.#error=undefined; this.#consent.checked=false; await this.#load(revision); }
+      }
+    } catch(error) { this.#failure(error,revision); }
+    finally { if (this.#current(revision)) { this.#polling=false; this.#render(); } }
   }
   #phase(op: SubscriptionOperation): ManagerState['phase'] { return op.status === 'UNKNOWN' ? 'unknown' : op.status === 'REQUIRES_ACTION' ? 'requires_action' : ['RESERVED', 'PROCESSING'].includes(op.status) ? 'processing' : op.status === 'FAILED' ? 'error' : 'ready'; }
   async #refresh(revision = this.#state.authorityRevision): Promise<void> {
-    if (this.#busy || !this.#current(revision) || !this.#controller) return;
+    if (this.#busy || this.#polling || !this.#current(revision) || !this.#controller) return;
     this.#busy = true; this.#error = undefined; this.#quote = undefined; this.#cancelMode = undefined;
     this.#changeConfirmed.checked = this.#cancelConfirmed.checked = false; this.#render();
     try {
@@ -196,6 +357,7 @@ export class GenericSubscriptionManager extends ElementBase {
         await this.#readOperation(revision, operation!.operationId, operation!.subscriptionId);
         if (this.#current(revision) && !unresolved(this.#state.operation)) await this.#load(revision);
       } else await this.#load(revision);
+      if(this.#current(revision)&&this.#v2)await this.#recoverAttempt(revision);
     } catch (e) { this.#failure(e, revision); }
     finally { if (this.#current(revision)) { this.#busy = false; this.#render(); } }
   }
@@ -212,11 +374,19 @@ export class GenericSubscriptionManager extends ElementBase {
     this.#busy = true; this.#error = undefined; this.#quote = undefined; this.#cancelMode = undefined; this.#action = undefined; this.#accept(revision, { phase: 'processing' });
     let outcomeKnown = false;
     try {
-      const op = await call(this.#mutationInput()); if (!this.#current(revision)) return;
+      const input = this.#mutationInput();
+      const op = await call(input); if (!this.#current(revision)) return;
+      const statusOnly = permission === 'CANCEL_PERIOD_END' || permission === 'CANCEL_IMMEDIATE' || permission === 'WITHDRAW_CANCELLATION';
+      if (statusOnly) {
+        if (op.subscriptionId !== input.subscriptionId) throw new PaymentSdkError('INVALID_RESPONSE');
+        assertStatusOnlyOperation(op);
+      }
+      this.#statusOnlyOperation = statusOnly ? { operationId: op.operationId, subscriptionId: op.subscriptionId } : undefined;
       outcomeKnown = true;
       this.#action = op.nextAction; this.#uncertain = op.status === 'UNKNOWN';
       this.#accept(revision, { operation: safeOperation(op), phase: this.#phase(op) });
-      if (op.status === 'REQUIRES_ACTION' && op.actionAvailable && !this.#action) await this.#readOperation(revision, op.operationId, op.subscriptionId);
+      if (this.#action?.kind==='PROVIDER_CLIENT') { const action=this.#action; this.#action=undefined; if (!await this.#prepareStripe(revision,op,action)) return; }
+      else if (['PROCESSING','REQUIRES_ACTION'].includes(op.status) && !this.#action) await this.#readOperation(revision, op.operationId, op.subscriptionId);
       if (['SUCCEEDED', 'FAILED'].includes(op.status)) { this.#consent.checked = false; await this.#load(revision); }
       if (this.#current(revision)) this.#status.focus();
     } catch (e) { this.#failure(e, revision, !outcomeKnown); }
@@ -248,7 +418,7 @@ export class GenericSubscriptionManager extends ElementBase {
   #renderTimings(): void { const old = this.#timing.value; const timings = this.#offers.find(o => o.price.priceId === this.#plan.value)?.allowedTimings ?? []; this.#timing.replaceChildren(...timings.map(value => { const option = document.createElement('option'); option.value = value; return option; })); this.#timing.value = timings.includes(old as SubscriptionTiming) ? old : timings[0] ?? ''; }
   #render(): void {
     const t = subscriptionCopy[this.#locale], s = this.#state.subscription, op = this.#state.operation, authenticated = !!this.#session && !!this.#client && !!this.#controller, canCreate = authenticated && this.#canCreate();
-    this.#section.lang = this.#locale; this.#section.setAttribute('aria-label', t.title); this.#section.setAttribute('aria-busy', String(this.#busy)); this.#title.textContent = t.title; this.#simulation.textContent = t.simulated;
+    this.#section.lang = this.#locale; this.#section.setAttribute('aria-label', t.title); this.#section.setAttribute('aria-busy', String(this.#busy)); this.#title.textContent = t.title; this.#simulation.textContent = t.simulated; this.#simulation.hidden=!this.#action?.kind.startsWith('FAKE_');
     this.#status.textContent = this.#state.phase === 'expired' ? t.expired : !authenticated ? t.login : this.#busy ? t.loading : this.#state.phase === 'unknown' ? t.unknown : this.#state.phase === 'processing' ? t.processing : this.#state.phase === 'requires_action' ? t.requiresAction : this.#state.phase === 'error' ? t.error : s ? t.ready : t.idle;
     this.#alert.hidden = !this.#error; this.#alert.textContent = this.#error ? t[this.#error] : '';
     const rows: [string, string][] = [];
@@ -269,7 +439,17 @@ export class GenericSubscriptionManager extends ElementBase {
     this.#cancelText.hidden = this.#cancelLabel.hidden = !this.#cancelMode; this.#cancelConfirmed.disabled = this.#busy;
     this.#cancelText.textContent = this.#cancelMode ? `${t.effective}: ${this.#cancelMode === 'PERIOD_END' ? s?.period?.end ?? t.none : t.immediate}. ${t.cancelNote}` : '';
     const visible: Partial<Record<SubscriptionCopyKey, boolean>> = { refresh: authenticated, create: canCreate, preview: this.#can('CHANGE_PLAN'), apply: !!q && this.#can('CHANGE_PLAN'), cancelEnd: this.#can('CANCEL_PERIOD_END'), cancelNow: this.#can('CANCEL_IMMEDIATE'), submitCancel: !!this.#cancelMode, dismiss: !!q || !!this.#cancelMode, clear: this.#can('CLEAR_CHANGE'), withdraw: this.#can('WITHDRAW_CANCELLATION'), setup: this.#can('SETUP_METHOD'), recover: this.#can('RECOVER_INVOICE') && !!s?.debt, resume: this.#can('RESUME'), complete: authenticated && !!this.#action && op?.status === 'REQUIRES_ACTION', portal: this.#can('OPEN_PORTAL'), moreBilling: authenticated && !!this.#billing.nextCursor, moreHistory: authenticated && !!this.#history.nextCursor };
-    for (const [key, button] of this.#buttons) { button.textContent = t[key]; button.hidden = !visible[key]; button.disabled = this.#busy; }
+    visible.pay=authenticated && !!this.#providerMount;
+    const attempt=this.#v2?.status,live=!!attempt&&Date.parse(attempt.expiresAt)>Date.now()&&!!this.#session?.scopes.includes('SUBSCRIPTION_MANAGE')&&!this.#providerMount;
+    visible.retryPayment=authenticated&&live&&attempt?.retryAllowed===true&&!attempt.successorAttemptId&&!this.#v2?.retrySent;
+    visible.continuePayment=authenticated&&live&&!!(attempt?.successorAttemptId||attempt?.state==='READY'&&!this.#v2?.attempted);
+    if(!this.#busy&&attempt?.state==='DECLINED')this.#status.textContent=t.paymentDeclined;
+    for (const [key, button] of this.#buttons) {
+      button.textContent=t[key];
+      button.hidden=!visible[key];
+      const waitsForPoll=key==='refresh'||key==='retryPayment'||key==='continuePayment';
+      button.disabled=this.#busy||(key==='pay'&&!this.#formReady)||(waitsForPoll&&this.#polling);
+    }
     const list = (element: HTMLUListElement, items: string[]) => element.replaceChildren(...(items.length ? items : [t.noRecords]).map(text => { const li = document.createElement('li'); li.textContent = text; return li; }));
     this.#billingTitle.textContent = t.billing; this.#historyTitle.textContent = t.history;
     list(this.#billingList, this.#billing.items.map((b: SubscriptionBillingView) => `${b.kind} · ${this.#money(b.amountDueMinor, b.currency)} · ${b.settlement} · ${b.period.start} – ${b.period.end}`));

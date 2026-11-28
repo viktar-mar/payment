@@ -10,6 +10,17 @@ public record ProviderOperation(UUID id, PaymentAccountId accountId,
         UUID resourceId, String operationKey, String fingerprint,
         Status status, String providerReference, Instant firstDispatchedAt,
         Instant retryBefore, String leaseOwner, Instant leaseExpiresAt, long version) {
-    public enum Kind { PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE }
+    public enum Kind {
+        PRODUCT_CREATE, PRICE_CREATE, PAYMENT_PREPARE, REFUND_CREATE,
+        TEST_CLOCK_CREATE, TEST_CLOCK_ADVANCE, CUSTOMER_CREATE, SUBSCRIPTION_CREATE, SUBSCRIPTION_UPDATE, SUBSCRIPTION_CANCEL,
+        SETUP_INTENT_CREATE, INVOICE_PAY, SCHEDULE_CREATE, SCHEDULE_UPDATE, SCHEDULE_RELEASE,
+        PORTAL_CONFIGURATION_CREATE, PORTAL_SESSION_CREATE, OWNED_RECOVERY_INTENT_CONFIRM, OWNED_GRACE_CLOCK_ADVANCE,
+        OWNED_GRACE_AT_CLOCK_ADVANCE, OWNED_GRACE_AFTER_CLOCK_ADVANCE;
+
+        public boolean dedicatedDispatch(){
+            return this==OWNED_RECOVERY_INTENT_CONFIRM||this==OWNED_GRACE_CLOCK_ADVANCE
+                    ||this==OWNED_GRACE_AT_CLOCK_ADVANCE||this==OWNED_GRACE_AFTER_CLOCK_ADVANCE;
+        }
+    }
     public enum Status { RESERVED, DISPATCHING, ACKNOWLEDGED, UNKNOWN, FAILED }
 }

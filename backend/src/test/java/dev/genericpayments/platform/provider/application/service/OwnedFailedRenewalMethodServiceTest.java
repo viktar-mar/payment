@@ -1,0 +1,486 @@
+package dev.genericpayments.platform.provider.application.service;
+
+import dev.genericpayments.platform.provider.application.model.*;
+import dev.genericpayments.platform.provider.application.model.OwnedFailedRenewalMethod.*;
+import dev.genericpayments.platform.provider.application.port.out.*;
+import dev.genericpayments.platform.customers.application.model.CustomerSessionContext;
+import dev.genericpayments.platform.provider.adapter.out.persistence.*;
+import dev.genericpayments.platform.subscriptions.application.model.*;
+import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
+import dev.genericpayments.platform.subscriptions.application.port.out.*;
+import dev.genericpayments.platform.subscriptions.application.service.*;
+import dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Fence;
+import dev.genericpayments.platform.subscriptions.domain.*;
+import java.time.*;
+import java.util.*;
+import java.util.function.Supplier;
+import org.junit.jupiter.api.Test;
+import static org.assertj.core.api.Assertions.*;
+import static dev.genericpayments.platform.provider.application.service.OwnedFailedRenewalServiceTest.*;
+
+/** Stateful caller transactions and actual FactService; all provider/persistence ports are inert. */
+class OwnedFailedRenewalMethodServiceTest {
+    @Test void taggedCleanupRequiresOriginalReturnedReadAndOwnerEvenAfterItsPositiveWindowExpires(){
+        var h=new Harness(300000);var r=h.taggedPrepared();var owner=SuccessorOwner.create();
+        var q=h.service.beginMethodRead(r,UUID.randomUUID(),owner);var reason=OwnedFailedRenewal.Reason.AUTHORITY_DRIFT;
+        assertThatThrownBy(()->h.service.stop(r,reason)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.stopped).isFalse();h.authorized=false;h.b.utc=q.deadlineAt().plusSeconds(1);
+        var borrowed=new ReadClaim(UUID.randomUUID(),q.reservationId(),q.phase(),q.invocation(),q.startedAt(),q.deadlineAt(),q.fence(),q.billingSample());
+        h.b.trace.clear();h.service.terminateSuccessorRead(r,borrowed,reason,owner);
+        h.service.terminateSuccessorRead(r,q,reason,SuccessorOwner.create());
+        assertThat(h.terminal).isNull();assertThat(h.b.stopped).isFalse();
+        h.service.terminateSuccessorRead(r,q,reason,owner);h.service.terminateSuccessorRead(r,q,reason,owner);
+        assertThat(h.terminal).isEqualTo(q.id());assertThat(h.terminalWrites).isEqualTo(1);
+        assertThat(h.b.stopped).isTrue();assertThat(h.b.trace).doesNotContain("authority","account","stop","facts");
+        assertThat(h.b.cash).containsExactly("pi_initial");assertThat(h.completion).isNull();
+    }
+    @Test void taggedReadOwnersGuardBothInspectionsFactsAndReceipts() {
+        var h=new Harness(300000);var r=h.taggedPrepared();
+        var owner=SuccessorOwner.create();var copied=SuccessorOwner.create();var invocation=UUID.randomUUID();
+        assertThatThrownBy(()->h.service.beginMethodRead(r,invocation)).isInstanceOf(RuntimeException.class);
+        var q=h.service.beginMethodRead(r,invocation,owner);var c=h.service.inspectMethodRead(r,q,owner);
+        for(Runnable bypass:List.<Runnable>of(()->h.service.inspectMethodRead(r,q),()->h.service.inspectMethodRead(r,q,copied),
+            ()->h.service.publishMethod(r,q,h.evidence(),c),()->h.service.publishMethod(r,q,h.evidence(),c,copied))){
+            long seq=h.b.sequence;assertThatThrownBy(bypass::run).isInstanceOf(RuntimeException.class);
+            assertThat(h.b.sequence).isEqualTo(seq);assertThat(h.completion).isNull();assertThat(h.b.stopped).isFalse();
+        }
+        // A caller can copy the exact command, APPLIED marker and every persisted claim field.
+        var raw=h.evidence().snapshot();String key=c.operation().providerOperationKey();String factKey=OwnedFailedRenewalMethod.factKey(q);
+        var marked=new Snapshot(raw.subscriptionReference(),raw.status(),raw.billingPrice(),raw.period(),raw.trial(),raw.cancellationAt(),
+            raw.invoices(),key,true,raw.providerRevision(),raw.observedAt(),new OperationObservation(key,OperationState.APPLIED),raw.recoveryObservations(),raw.trialEvidence(),raw.externalWithdrawalEvidence());
+        var cmd=new dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command(h.b.account,h.b.s.id(),
+            marked,SubscriptionEvent.Source.RECONCILIATION,factKey,factKey,q.fence(),r.billingSample());
+        var before=h.b.effects;
+        assertThatThrownBy(()->h.b.transactionPort.required(()->{h.b.factsPort.apply(cmd);return null;})).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.effects).isEqualTo(before);
+        h.failReceipt=true;assertThatThrownBy(()->h.service.publishMethod(r,q,h.evidence(),c,owner)).hasMessage("receipt failed");
+        assertThat(h.scope).isNull();assertThat(h.b.effects).isEqualTo(before);assertThat(h.b.stopped).isFalse();
+        h.failReceipt=false;var completed=h.service.publishMethod(r,q,h.evidence(),c,owner);
+        assertThat(h.scope).isNull();assertThat(h.completion).isEqualTo(completed);
+        var recovery=h.service.reserveRecovery(r,completed);h.b.recovery=recovery.association();
+        var observer=SuccessorOwner.create();var readInvocation=UUID.randomUUID();
+        assertThatThrownBy(()->h.service.beginRecoveredRead(r,recovery,readInvocation,observer)).isInstanceOf(RuntimeException.class);
+        assertThat(h.b.stopped).isFalse();assertThat(h.claims).doesNotContainKey(Phase.RECOVERED);h.confirmAck=true;
+        var read=h.service.beginRecoveredRead(r,recovery,readInvocation,observer);var expected=h.service.inspectRecoveredRead(r,read,observer);
+        assertThatThrownBy(()->h.service.inspectRecoveredRead(r,read,owner)).isInstanceOf(RuntimeException.class);
+        var evidence=h.recoveredEvidence();
+        assertThatThrownBy(()->h.service.publishRecovery(r,read,evidence,expected,owner)).isInstanceOf(RuntimeException.class);
+        assertThat(h.b.cash).containsExactly("pi_initial");assertThat(h.publication).isNull();assertThat(h.b.stopped).isFalse();
+        assertThat(h.service.publishRecovery(r,read,evidence,expected,observer)).isEqualTo(h.publication);
+        assertThat(h.b.cash).containsExactly("pi_initial","pi_renewal");assertThat(h.scope).isNull();
+    }
+    @Test void onlyExactOwnedSuccessorClockCanExplainRecoveryCashAfterUtcObservation(){
+        var h=new Harness(300000);var reservation=h.taggedPrepared();var methodOwner=SuccessorOwner.create();
+        var read=h.service.beginMethodRead(reservation,UUID.randomUUID(),methodOwner);
+        var completion=h.service.publishMethod(reservation,read,h.evidence(),h.service.inspectMethodRead(reservation,read,methodOwner),methodOwner);
+        h.b.recovery=h.service.reserveRecovery(reservation,completion).association();
+        var raw=h.recoveredEvidence().snapshot();
+        var clockAt=Instant.ofEpochSecond(reservation.remoteClock().frozenTime());
+        var observedAt=clockAt.minusSeconds(30);
+        assertThatCode(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+            cashTimes(raw,observedAt,observedAt.minusSeconds(1),clockAt),true)).doesNotThrowAnyException();
+        for(var wrong:List.of(clockAt.minusSeconds(1),clockAt.plusSeconds(1)))
+            assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+                cashTimes(raw,observedAt,observedAt.minusSeconds(1),wrong),true)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(reservation,
+            cashTimes(raw,observedAt,clockAt,clockAt),true)).isInstanceOf(IllegalStateException.class);
+        var legacy=new Reservation(reservation.id(),reservation.admission(),reservation.failure(),reservation.setupOperationId(),
+            reservation.requestFingerprint(),reservation.initialOperationVersion(),reservation.binding(),reservation.billingSample(),reservation.reservedAt());
+        assertThatThrownBy(()->OwnedFailedRenewalMethodService.requireSnapshot(legacy,
+            cashTimes(raw,observedAt,observedAt.minusSeconds(1),clockAt),true)).isInstanceOf(IllegalStateException.class);
+    }
+    private static Snapshot cashTimes(Snapshot s,Instant observedAt,Instant initial,Instant renewal){
+        var invoices=new ArrayList<Invoice>();
+        for(var value:s.invoices()){
+            var cash=value.cashObjects().getFirst();
+            var paidAt=value.kind()==BillingRecord.Kind.INITIAL?initial:renewal;
+            invoices.add(new Invoice(value.reference(),value.kind(),value.price(),value.previousPrice(),value.period(),value.amountDueMinor(),
+                value.currency(),value.settlement(),List.of(new CashObject(cash.reference(),cash.amountMinor(),cash.currency(),cash.status(),paidAt))));
+        }
+        return new Snapshot(s.subscriptionReference(),s.status(),s.billingPrice(),s.period(),s.trial(),s.cancellationAt(),invoices,s.operationKey(),
+            s.paymentMethodReady(),s.providerRevision(),observedAt,s.operationObservation(),s.recoveryObservations(),s.trialEvidence(),s.externalWithdrawalEvidence());
+    }
+    static GraceSuccessor after(Harness h,long target,String reference,Instant observed) {
+        var old=h.b.ready.observation();
+        return new GraceSuccessor(id(210),id(211),new OwnedFirstRenewal.TestClockReady(reference,old.object(),old.livemode(),
+            old.name(),target,old.status(),old.created(),old.deletesAfter(),null),observed);
+    }
+    @Test void successorPinsOriginalClockWholeSecondGraceAndPeriodEndWhileWriterKeepsReadyTwo() {
+        var h=new Harness(300000);var old=h.reserve();
+        assertThat(old.successor()).isNull();assertThat(old.remoteClock()).isEqualTo(h.b.ready.observation());
+        assertThat(h.b.failure.graceDeadline()).isEqualTo(Instant.ofEpochSecond(260300));
+        var expected=after(h,260301,"clock_owned",h.b.utc);
+        java.util.function.Function<GraceSuccessor,Reservation> describe=s->new Reservation(old.id(),old.admission(),old.failure(),
+            old.setupOperationId(),old.requestFingerprint(),0,old.binding(),old.billingSample(),old.reservedAt(),s);
+        var tagged=describe.apply(expected);
+        assertThat(tagged.remoteClock()).isEqualTo(expected.clock());assertThat(tagged.billingSample().billingAt()).isEqualTo(Instant.ofEpochSecond(4700));
+        for(var wrong:List.of(after(h,260300,"clock_owned",h.b.utc),after(h,260301,"clock_other",h.b.utc),
+                after(h,260301,"clock_owned",h.b.utc.plusSeconds(1)))) {
+            assertThatThrownBy(()->describe.apply(wrong)).isInstanceOf(IllegalArgumentException.class);
+        }
+        assertThatThrownBy(()->describe.apply(after(h,260301,"clock_owned",h.b.utc.minusNanos(1)))).isInstanceOf(IllegalArgumentException.class);
+        var shortPeriod=new Harness(260301);var r=shortPeriod.reserve();
+        assertThatThrownBy(()->new Reservation(r.id(),r.admission(),r.failure(),r.setupOperationId(),r.requestFingerprint(),0,
+            r.binding(),r.billingSample(),r.reservedAt(),after(shortPeriod,260301,"clock_owned",shortPeriod.b.utc))).isInstanceOf(IllegalArgumentException.class);
+    }
+    @Test void explicitSuccessorChecksSavedAfterBeforeClaimAndRollsBackLosingEnrollment() {
+        for(String scenario:List.of("original","consent","foreign","current","insert")) {
+            var h=new Harness(300000);h.savedAfter=after(h,260301,"clock_owned",h.b.utc);
+            var selected=scenario.equals("foreign")?new GraceSuccessor(id(212),id(213),h.savedAfter.clock(),h.b.utc):h.savedAfter;
+            h.authorized=!scenario.equals("current");h.failReceipt=scenario.equals("insert");
+            Supplier<Reservation> entry=()->h.service.reserveBrowserMethodAfterGrace(h.b.admission,selected,h.context,!scenario.equals("consent"));
+            if(scenario.equals("original")){
+                var r=entry.get();assertThat(r.successor()).isEqualTo(selected);
+                assertThat(h.enrollment.sessionId()).isEqualTo(((SubscriptionActor.Customer)h.context.actor()).session().sessionId().value());
+                assertThat(h.b.trace).containsSubsequence("after-entry","claim","authority","lifecycle","after-reserve");
+                assertThatThrownBy(entry::get).isInstanceOf(RuntimeException.class);
+                assertThat(h.reservation).isEqualTo(r);assertThat(h.b.ops).hasSize(2);
+            }else{
+                assertThatThrownBy(entry::get).isInstanceOf(RuntimeException.class);
+                if(scenario.equals("foreign")||scenario.equals("consent"))assertThat(h.b.trace).doesNotContain("claim");
+                assertThat(h.b.ops).hasSize(1);assertThat(h.reservation).isNull();assertThat(h.enrollment).isNull();
+            }
+            assertThat(h.b.stopped).isFalse();assertThat(h.b.trace).doesNotContain("reservation");
+        }
+    }
+    @Test void browserEnrollmentIsAtomicWithTheActualOriginalSetupAndGetNeedsNoReservationKey() {
+        var h=new Harness(true);var r=h.service.reserveBrowserMethod(h.b.admission,h.context,true);
+        var session=((SubscriptionActor.Customer)h.context.actor()).session();
+        assertThat(h.enrollment).isEqualTo(new OwnedMethodBrowser.Enrollment(session.sessionId().value(),session.origin(),session.expiresAt()));
+        assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+        h.acks=true;
+        var get=new SubscriptionCommandContext(h.context.actor(),h.context.siteId(),h.context.customerId(),h.context.origin(),null,"get");
+        var pending=h.service.browserPhase(r,get,p->p);
+        assertThat(pending.enrollment()).isEqualTo(h.enrollment);assertThat(pending.setup().method()).isNull();
+        assertThat(pending.operation()).isEqualTo(h.b.ops.get(r.setupOperationId()));assertThat(h.b.stopped).isFalse();
+    }
+    @Test void browserClientFailuresNeverStopTheAdmissionAndEnrollmentFailureRollsBackOriginalClaim() {
+        for(var bad:List.of("consent","admin","ambient","insert")) {
+            var h=new Harness(!bad.equals("admin"));h.failReceipt=bad.equals("insert");h.b.active=bad.equals("ambient");
+            assertThatThrownBy(()->h.service.reserveBrowserMethod(h.b.admission,h.context,!bad.equals("consent"))).isInstanceOf(RuntimeException.class);
+            assertThat(h.reservation).isNull();assertThat(h.enrollment).isNull();assertThat(h.b.ops).hasSize(1);assertThat(h.b.stopped).isFalse();
+        }
+    }
+    @Test void browserPhasePinsOriginalSessionAndOriginAndCannotEnrollAnOlderReservation() {
+        for(var bad:List.of("session","origin","late","acks","expired")) {
+            var h=new Harness(true);var r=bad.equals("late")?h.reserve():h.service.reserveBrowserMethod(h.b.admission,h.context,true);h.acks=!bad.equals("acks");
+            var s=((SubscriptionActor.Customer)h.context.actor()).session();
+            if(bad.equals("expired"))h.b.utc=s.expiresAt();
+            var changed=new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(
+                bad.equals("session")?new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()):s.sessionId(),s.siteId(),s.customerId(),
+                bad.equals("origin")?"https://other.example":s.origin(),s.scopes(),s.expiresAt());
+            var c=new SubscriptionCommandContext(new SubscriptionActor.Customer(changed),s.siteId(),s.customerId(),changed.origin(),null,"get");
+            assertThatThrownBy(()->h.service.browserPhase(r,c,p->p)).isInstanceOf(RuntimeException.class);assertThat(h.b.stopped).isFalse();
+        }
+    }
+    @Test void trueConsentReservationPinsPrincipalDebtSequenceAndClaimBeforeAuthorityLocks() {
+        var h=new Harness();var r=h.reserve();var f=h.b.failure;var o=h.b.ops.get(r.setupOperationId());
+        assertThat(o.authorityScope()).isEqualTo("owned-failed-renewal-method:"+h.b.admission.id());
+        assertThat(o.keyDigest()).isEqualTo("digest:"+h.context.idempotencyKey());
+        assertThat(o.fingerprint()).isEqualTo(SubscriptionInteractionTransaction.request(h.context,"owned-failed-renewal-method-v1",h.b.admission.id(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.revision(),f.observationSequence(),"SETUP",true));
+        assertThat(o.providerReference()).isNull();assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+        assertThat(h.b.trace).containsSubsequence("claim","operations","authority","lifecycle","account","subscription","bill","reservation");
+    }
+    @Test void falseConsentAndForeignContextCannotCreateReservation() {
+        var h=new Harness();assertThatThrownBy(()->h.service.reserveMethod(h.b.admission,h.context,false)).isInstanceOf(IllegalArgumentException.class);assertThat(h.reservation).isNull();
+        var f=new Harness();var c=new SubscriptionCommandContext(f.context.actor(),f.context.siteId(),new dev.genericpayments.platform.customers.domain.CustomerId(UUID.randomUUID()),f.context.origin(),"key","request");
+        assertThatThrownBy(()->f.service.reserveMethod(f.b.admission,c,true)).isInstanceOf(RuntimeException.class);assertThat(f.reservation).isNull();assertThat(f.b.ops).hasSize(1);
+    }
+    @Test void pendingRequiresFreshAuthorityAndBothAcksInTheSameTransaction() {
+        for(var bad:List.of("authority","acks")){
+            var h=new Harness();var r=h.reserve();h.authorized=!bad.equals("authority");h.acks=!bad.equals("acks");
+            assertThatThrownBy(()->h.service.recordMethodUpdateReply(r,h.context)).isInstanceOf(IllegalStateException.class);
+            assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(h.b.ops.get(r.setupOperationId()).version()).isZero();
+            assertThat(h.b.trace).containsSubsequence("rollback","begin","stop","commit");assertThat(h.b.trace.stream().filter("stop"::equals)).hasSize(1);
+        }
+        var h=new Harness();var r=h.reserve();h.acks=true;h.b.trace.clear();
+        var o=h.service.recordMethodUpdateReply(r,h.context);
+        assertThat(o.status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);assertThat(o.version()).isEqualTo(1);assertThat(o.providerReference()).isEqualTo("sub_owned");
+        assertThat(h.b.trace).containsSubsequence("begin","operations","authority","lifecycle","account","subscription","bill","prepared","commit");
+        assertThat(h.b.trace.stream().filter("begin"::equals)).hasSize(1);
+    }
+    @Test void changedPendingKeyOriginAndPrincipalCannotReuseTheCapturedConsent() {
+        for(var bad:List.of("key","origin","principal")){
+            var h=new Harness();var r=h.reserve();h.acks=true;
+            var actor=bad.equals("principal")?new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"other",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600))):h.context.actor();
+            var c=new SubscriptionCommandContext(actor,h.context.siteId(),h.context.customerId(),bad.equals("origin")?"https://other.example":h.context.origin(),bad.equals("key")?"other-key":h.context.idempotencyKey(),"request");
+            assertThatThrownBy(()->h.service.recordMethodUpdateReply(r,c)).isInstanceOf(IllegalStateException.class);
+            assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(h.b.trace).doesNotContain("prepared");
+        }
+    }
+    @Test void methodUsesActualFactsAndRecoveryPaysOriginalDebtWithUnchangedMapperIdentity() {
+        var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var c=h.service.inspectMethodRead(r,q);
+        var before=h.b.s;var records=new LinkedHashMap<>(h.b.records);var payments=new LinkedHashSet<>(h.b.cash);var events=new ArrayList<>(h.b.events);var callbacks=h.b.callbacks;var sequence=h.b.sequence;
+        var completion=h.service.publishMethod(r,q,h.evidence(),c);
+        assertThat(h.b.s).isEqualTo(before);assertThat(h.b.records).isEqualTo(records);assertThat(h.b.cash).isEqualTo(payments);assertThat(h.b.events).isEqualTo(events);assertThat(h.b.callbacks).isEqualTo(callbacks);
+        assertThat(h.b.sequence).isEqualTo(sequence+1);assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);assertThat(completion.setupFinalVersion()).isEqualTo(2);
+        var recovery=h.service.reserveRecovery(r,completion);h.b.recovery=recovery.association();var o=h.b.ops.get(recovery.association().operationId());var f=r.failure();
+        assertThat(o.authorityScope()).isEqualTo(OwnedFailedRenewal.recoveryAuthority(r.admission()));
+        assertThat(o.keyDigest()).isEqualTo(OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-key-v1",r.admission().id()));
+        assertThat(o.fingerprint()).isEqualTo("v1.recover."+f.billId()+"."+OwnedFirstRenewal.fingerprint("owned-failed-renewal-recover-v1",r.admission().id(),f.billId(),f.billVersion(),f.invoice(),f.allocation(),f.paymentIntent(),f.revision()));
+        var read=h.service.beginRecoveredRead(r,recovery,UUID.randomUUID());var expected=h.service.inspectRecoveredRead(r,read);
+        var raw=h.recoveredEvidence();assertThat(raw.snapshot().paymentMethodReady()).isFalse();assertThat(raw.snapshot().operationKey()).isNull();assertThat(raw.snapshot().operationObservation()).isNull();
+        var publication=h.service.publishRecovery(r,read,raw,expected);
+        assertThat(h.b.s.debt()).isNull();assertThat(h.b.s.revision()).isEqualTo(f.revision()+1);assertThat(h.b.sequence).isEqualTo(f.observationSequence()+2);
+        assertThat(h.b.cash).containsExactly("pi_initial","pi_renewal");assertThat(h.b.ops.get(o.id()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);assertThat(publication.publication().billId()).isEqualTo(f.billId());
+    }
+    @Test void receiptFailureRollsBackFactsBeforeExactlyOneSeparateStop() {
+        var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var c=h.service.inspectMethodRead(r,q);var s=h.b.s;var seq=h.b.sequence;var effects=h.b.effects;h.failReceipt=true;
+        assertThatThrownBy(()->h.service.publishMethod(r,q,h.evidence(),c)).hasMessage("receipt failed");
+        assertThat(h.b.s).isEqualTo(s);assertThat(h.b.sequence).isEqualTo(seq);assertThat(h.b.effects).isEqualTo(effects);assertThat(h.b.ops.get(r.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.PROCESSING);assertThat(h.completion).isNull();
+        assertThat(h.b.trace).containsSubsequence("completion","rollback","begin","stop","commit");assertThat(h.b.trace.stream().filter("stop"::equals)).hasSize(1);
+    }
+    @Test void successorPublicationReceiptFailureRestoresOpenDebtAndReservedRecoveryBeforeOneStop() {
+        var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var completion=h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q));
+        var recovery=h.service.reserveRecovery(r,completion);h.b.recovery=recovery.association();var read=h.service.beginRecoveredRead(r,recovery,UUID.randomUUID());var c=h.service.inspectRecoveredRead(r,read);
+        var s=h.b.s;var seq=h.b.sequence;var cash=new LinkedHashSet<>(h.b.cash);var records=new LinkedHashMap<>(h.b.records);var events=new ArrayList<>(h.b.events);var callbacks=h.b.callbacks;
+        h.failReceipt=true;
+        assertThatThrownBy(()->h.service.publishRecovery(r,read,h.recoveredEvidence(),c)).hasMessage("receipt failed");
+        assertThat(h.b.s).isEqualTo(s);assertThat(h.b.sequence).isEqualTo(seq);assertThat(h.b.cash).isEqualTo(cash);assertThat(h.b.records).isEqualTo(records);assertThat(h.b.events).isEqualTo(events);assertThat(h.b.callbacks).isEqualTo(callbacks);
+        assertThat(h.b.ops.get(recovery.association().operationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);assertThat(h.completion).isEqualTo(completion);assertThat(h.publication).isNull();
+        assertThat(h.b.trace).containsSubsequence("publication","rollback","begin","stop","commit");assertThat(h.b.trace.stream().filter("stop"::equals)).hasSize(1);
+    }
+    @Test void staleExpiredChangedContextAndSampleDenyWithoutFacts() {
+        for(var bad:List.of("expired","sequence","operation","context","billing","mode","ambient")) {
+            var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var c=h.service.inspectMethodRead(r,q);var e=h.evidence();var effects=h.b.effects;
+            if(bad.equals("expired"))h.b.utc=q.deadlineAt();if(bad.equals("sequence"))h.b.sequence++;if(bad.equals("billing"))h.b.billingSecond++;if(bad.equals("mode"))h.b.isolated=false;if(bad.equals("ambient"))h.b.active=true;
+            if(bad.equals("operation")){var o=h.b.ops.get(r.setupOperationId());h.b.ops.put(o.id(),new SubscriptionOperation(o.id(),o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),o.providerOperationKey(),o.expectedRevision(),o.policyVersion(),o.providerReference(),null,o.createdAt(),o.updatedAt(),o.version()+1));}
+            var expected=bad.equals("context")?new MethodReadContext(c.account(),c.subscription(),c.binding(),c.operation(),c.setupProof(),c.setupStep(),c.methodStep(),new SubscriptionBillingTimePort.Sample(c.billingSample().billingAt().plusSeconds(1),c.billingSample().mode())):c;
+            assertThatThrownBy(()->h.service.publishMethod(r,q,e,expected)).isInstanceOf(RuntimeException.class);assertThat(h.b.effects).isEqualTo(effects);assertThat(h.completion).isNull();
+        }
+    }
+    @Test void callerMarkerAndUnboundMethodEvidenceCannotAuthorizeMethodFacts() {
+        for(var bad:List.of("marker","setup","method")){
+            var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var c=h.service.inspectMethodRead(r,q);var v=h.b.snapshot(false);var effects=h.b.effects;
+            if(bad.equals("marker"))v=new Snapshot(v.subscriptionReference(),v.status(),v.billingPrice(),v.period(),null,null,v.invoices(),c.operation().providerOperationKey(),true,0,v.observedAt(),new OperationObservation(c.operation().providerOperationKey(),OperationState.APPLIED));
+            var e=new MethodEvidence(v,bad.equals("setup")?"seti_foreign":"seti_owned",bad.equals("method")?"pm_foreign":"pm_owned",h.b.utc);
+            assertThatThrownBy(()->h.service.publishMethod(r,q,e,c)).isInstanceOf(IllegalStateException.class);assertThat(h.b.effects).isEqualTo(effects);assertThat(h.completion).isNull();
+        }
+    }
+    @Test void callerInjectedRecoveredMarkerCannotAuthorizeSuccessorFacts() {
+        var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var completion=h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q));
+        var recovery=h.service.reserveRecovery(r,completion);h.b.recovery=recovery.association();var read=h.service.beginRecoveredRead(r,recovery,UUID.randomUUID());var expected=h.service.inspectRecoveredRead(r,read);
+        var before=h.b.s;var sequence=h.b.sequence;var effects=h.b.effects;var cash=new LinkedHashSet<>(h.b.cash);
+        assertThatThrownBy(()->h.service.publishRecovery(r,read,new OwnedFailedRenewal.RecoveredEvidence(h.b.snapshot(true),h.b.utc),expected)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.s).isEqualTo(before);assertThat(h.b.sequence).isEqualTo(sequence);assertThat(h.b.effects).isEqualTo(effects);assertThat(h.b.cash).isEqualTo(cash);assertThat(h.publication).isNull();
+        assertThat(h.b.ops.get(recovery.association().operationId()).status()).isEqualTo(SubscriptionOperation.Status.RESERVED);
+    }
+    @Test void forgedCompletionCannotLeaveAFreshRecoveryOperationOrAssociation() {
+        var h=new Harness();var r=h.prepared();var q=h.service.beginMethodRead(r,UUID.randomUUID());var c=h.service.publishMethod(r,q,h.evidence(),h.service.inspectMethodRead(r,q));
+        var forged=new Completion(c.reservationId(),UUID.randomUUID(),c.setupOperationId(),c.setupFinalVersion(),c.setupStepId(),c.setupStepVersion(),c.methodStepId(),c.methodStepVersion(),c.setupIntent(),c.method(),c.revision(),c.observationSequence(),c.completedAt());
+        var count=h.b.ops.size();assertThatThrownBy(()->h.service.reserveRecovery(r,forged)).isInstanceOf(IllegalStateException.class);
+        assertThat(h.b.ops).hasSize(count);assertThat(h.recovery).isNull();assertThat(h.completion).isEqualTo(c);assertThat(h.b.trace).containsSubsequence("rollback","begin","stop","commit");
+    }
+    static class Harness {
+        final OwnedFailedRenewalServiceTest.Harness b;
+        final SubscriptionCommandContext context;final OwnedFailedRenewalMethodService service;
+        Reservation reservation;OwnedMethodBrowser.Enrollment enrollment;Completion completion;Recovery recovery;Publication publication;Map<Phase,ReadClaim> claims=new HashMap<>();boolean acks,authorized=true,failReceipt,liveSession=true,failStop;
+        CustomerSessionContext secondLiveSession;
+        final List<SubscriptionCommandContext> authorityTargets=new ArrayList<>();
+        Runnable afterAccountLock=()->{},afterReplyEnrollment=()->{};
+        boolean providerEvidence,browserConsumed,boundSetupDenied,enforceSessionExpiry;BoundSetup returnedBoundSetup;Runnable afterBoundSetup=()->{},requireBoundEvidence=()->{};
+        // Binding-only controls are opt-in; older bound/METHOD fixtures keep their original behavior.
+        boolean bindingEnabled,browserConsumptionUncommitted,unboundSetupDenied,competingBind;
+        BoundSetup returnedUnboundSetup;Runnable afterUnboundSetup=()->{},beforeBindingWrite=()->{},afterBindingWrite=()->{},afterBindingCommit=()->{};
+        // Recovery-only controls do not relax older SETUP/METHOD fixtures.
+        boolean recoveryPreparationEnabled,recoveryEnrollmentDenied;
+        OwnedMethodBrowser.Enrollment returnedRecoveryEnrollment;
+        Runnable afterRecoveryIdentity=()->{},afterRecoveryEnrollment=()->{},afterAuthority=()->{},afterUnobservedRecovery=()->{};
+        final Map<String,ProviderOperation> providerSteps=new LinkedHashMap<>();
+        Harness(){this(false);}
+        Harness(boolean customerActor){this(customerActor,"alias");}
+        Harness(boolean customerActor,String credentialsRef){
+            this(customerActor,credentialsRef,UTC.plusSeconds(600));
+        }
+        Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry){
+            this(customerActor,credentialsRef,sessionExpiry,value->"digest:"+value);
+        }
+        Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest){
+            this(customerActor,credentialsRef,sessionExpiry,authenticationDigest,10000);
+        }
+        GraceSuccessor savedAfter;
+        final Map<UUID,String> readOwners=new HashMap<>();ReadClaim scope;boolean confirmAck;
+        UUID terminal;int terminalWrites;
+        final List<List<Object>> writeTerminalCalls=new ArrayList<>();
+        void owner(ReadClaim q,Object last){
+            if(reservation.successor()==null)return;
+            if(!(last instanceof SuccessorOwner owner)||!owner.commitment(q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id())
+                    .equals(readOwners.get(q.id()))||q.phase()==Phase.RECOVERED&&!confirmAck)throw new IllegalStateException("read owner unavailable");
+        }
+        Reservation taggedPrepared(){
+            savedAfter=after(this,260301,"clock_owned",b.utc);
+            var r=service.reserveBrowserMethodAfterGrace(b.admission,savedAfter,context,true);
+            acks=true;b.methodSetup=new SubscriptionBillingProofStore.Setup(r.setupOperationId(),b.s.id(),b.account.id(),id(91),"seti_owned","pm_owned");
+            service.recordMethodUpdateReply(r,context);return r;
+        }
+        Harness(long periodEnd){this(true,"alias",UTC.plusSeconds(600),value->"digest:"+value,periodEnd);}
+        Harness(boolean customerActor,String credentialsRef,Instant sessionExpiry,dev.genericpayments.platform.shared.application.port.out.DigestPort authenticationDigest,long periodEnd){
+            b=new OwnedFailedRenewalServiceTest.Harness(true,credentialsRef,periodEnd);
+            b.fail();b.trace.clear();
+            SubscriptionActor actor=customerActor?new SubscriptionActor.Customer(new dev.genericpayments.platform.customers.application.model.CustomerSessionContext(new dev.genericpayments.platform.customers.domain.CustomerSessionId(UUID.randomUUID()),b.owner.site(),b.owner.customer(),"https://test.example",Set.of(dev.genericpayments.platform.customers.domain.CustomerSessionScope.SUBSCRIPTION_MANAGE),sessionExpiry)):new SubscriptionActor.Admin(new dev.genericpayments.platform.admin.application.port.in.AuthenticatedAdmin(new dev.genericpayments.platform.admin.domain.AdminUserId(UUID.randomUUID()),"admin",new dev.genericpayments.platform.admin.domain.AdminSessionId(UUID.randomUUID()),UTC.plusSeconds(600)));
+            context=new SubscriptionCommandContext(actor,b.owner.site(),b.owner.customer(),"https://test.example","setup-key","test");
+            var tx=new SubscriptionTransactionPort(){public boolean active(){return b.active;}public <T>T required(Supplier<T> work){return requiresNew(work);}public <T>T requiresNew(Supplier<T> work){
+                var oldR=reservation;var oldE=enrollment;var oldC=completion;var oldX=recovery;var oldP=publication;var oldClaims=new HashMap<>(claims);var oldSetup=b.methodSetup;T result;
+                try{result=b.transactionPort.requiresNew(work);}catch(RuntimeException e){reservation=oldR;enrollment=oldE;completion=oldC;recovery=oldX;publication=oldP;claims=oldClaims;if(bindingEnabled)b.methodSetup=oldSetup;throw e;}
+                // Opt-in adapter boundary: real inert transaction has completed and cannot roll back.
+                if(bindingEnabled&&oldSetup!=null&&oldSetup.method()==null&&b.methodSetup!=null&&b.methodSetup.method()!=null)afterBindingCommit.run();
+                return result;
+            }};
+            var store=port(OwnedFailedRenewalMethodStore.class,(m,a)->{assertThat(b.active).isTrue();
+                if(reservation!=null&&reservation.successor()!=null){
+                    if(List.of("requireReadInTransaction","requireMethodContextInTransaction","requireRecoveredContextInTransaction",
+                        "recordCompletionInTransaction","recordPublicationInTransaction").contains(m))owner((ReadClaim)a[1],a[a.length-1]);
+                    if(List.of("recordCompletionInTransaction","recordPublicationInTransaction").contains(m)&&!a[1].equals(scope))
+                        throw new IllegalStateException("receipt outside fact scope");
+                }
+                return switch(m){
+                case "withSuccessorFactInTransaction"->{
+                    var q=(ReadClaim)a[1];same((Reservation)a[0]);read(q);owner(q,a[2]);
+                    if(scope!=null)throw new IllegalStateException("nested scope");scope=q;
+                    try{yield ((Supplier<?>)a[3]).get();}finally{scope=null;}
+                }
+                case "terminateSuccessorWriteInTransaction"->{writeTerminalCalls.add(List.of(a[0],a[1],a[2]));yield null;}
+                case "terminateSuccessorConfirmationInTransaction"->{
+                    // C's default-deny terminal port. D owns the atomic transition matrix.
+                    b.trace.add("typed-confirm-cleanup");throw new IllegalStateException("terminal unavailable");
+                }
+                case "terminateSuccessorReadInTransaction"->{
+                    var r=(Reservation)a[0];var q=(ReadClaim)a[1];var privateOwner=(SuccessorOwner)a[3];
+                    if(!reservation.equals(r)||!q.equals(claims.get(q.phase()))||terminal!=null||publication!=null||q.phase()==Phase.METHOD&&completion!=null)yield null;
+                    String digest=privateOwner.commitment(q.phase()==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id());
+                    if(digest.equals(readOwners.get(q.id()))){terminal=q.id();terminalWrites++;b.stopped=true;}
+                    yield null;
+                }
+                case "requireGraceSuccessorEntryInTransaction"->{
+                    b.trace.add("after-entry");
+                    if(!b.admission.equals(a[0])||savedAfter==null||!savedAfter.equals(a[1])||reservation!=null)throw new IllegalStateException("invalid AFTER");
+                    yield null;
+                }
+                case "reserveBrowserAfterGraceInTransaction"->{
+                    b.trace.add("after-reserve");
+                    if(!b.admission.equals(a[0])||!b.failure.equals(a[1])||!savedAfter.equals(a[7])||reservation!=null)throw new IllegalStateException("invalid handoff");
+                    var op=(SubscriptionOperation)a[2];enrollment=(OwnedMethodBrowser.Enrollment)a[6];
+                    reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,op.id(),op.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5],savedAfter);
+                    if(failReceipt)throw new IllegalStateException("enrollment failed");
+                    yield reservation;
+                }
+                case "reserveInTransaction","reserveBrowserInTransaction"->{b.trace.add("reservation");if(reservation!=null)throw new IllegalStateException("duplicate");var o=(SubscriptionOperation)a[2];reservation=new Reservation(UUID.randomUUID(),b.admission,b.failure,o.id(),o.fingerprint(),0,b.binding,(SubscriptionBillingTimePort.Sample)a[4],(Instant)a[5]);if(m.equals("reserveBrowserInTransaction")){enrollment=(OwnedMethodBrowser.Enrollment)a[6];if(failReceipt)throw new IllegalStateException("enrollment failed");}yield reservation;}
+                case "requireBrowserPendingInTransaction"->{same((Reservation)a[0]);var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];if(!acks||enrollment==null||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser unavailable");var o=b.ops.get(reservation.setupOperationId());yield new OwnedMethodBrowser.Pending(reservation,enrollment,b.account,b.s,o,b.binding,new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned",null),step(o,false));}
+                case "requireBrowserSetupEnrollmentInTransaction","requireReplyEnrollmentInTransaction"->{
+                    same((Reservation)a[0]);boolean reply=m.equals("requireReplyEnrollmentInTransaction");
+                    if(reply&&enrollment==null)yield Optional.empty();
+                    b.trace.add(reply?"reply-enrollment":"setup-enrollment");
+                    var s=(CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();var now=(Instant)a[2];
+                    if(!liveSession||enrollment==null||!original.equals(s)||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");
+                    if(reply)afterReplyEnrollment.run();yield reply?Optional.of(enrollment):enrollment;
+                }
+                case "requireBrowserRecoveryIdentityInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-identity");var s=(CustomerSessionContext)a[1];
+                    if(enrollment==null||!b.owner.site().equals(s.siteId())||!b.owner.customer().equals(s.customerId())
+                            ||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())
+                            ||!enrollment.sessionExpiresAt().equals(s.expiresAt()))throw new IllegalStateException("browser identity unavailable");
+                    var original=enrollment;afterRecoveryIdentity.run();yield original;
+                }
+                case "requireBrowserRecoveryEnrollmentInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-enrollment");
+                    var s=(CustomerSessionContext)a[1];var now=(Instant)a[2];
+                    var original=((SubscriptionActor.Customer)context.actor()).session();
+                    if(!recoveryPreparationEnabled||recoveryEnrollmentDenied||!browserConsumed||browserConsumptionUncommitted
+                            ||completion==null||recovery==null||enrollment==null||!liveSession||!original.equals(s)
+                            ||!enrollment.sessionId().equals(s.sessionId().value())||!enrollment.origin().equals(s.origin())
+                            ||!enrollment.sessionExpiresAt().equals(s.expiresAt())||!now.isBefore(s.expiresAt())
+                            ||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("recovery browser unavailable");
+                    var result=returnedRecoveryEnrollment==null?enrollment:returnedRecoveryEnrollment;
+                    afterRecoveryEnrollment.run();yield result;
+                }
+                case "requireBrowserBoundSetupInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("bound-setup");
+                    var s=(dev.genericpayments.platform.customers.application.model.CustomerSessionContext)a[1];var original=((SubscriptionActor.Customer)context.actor()).session();
+                    var now=(Instant)a[2];var proof=b.methodSetup;var o=b.ops.get(reservation.setupOperationId());var setup=providerSteps.get(o.providerOperationKey()+":SETUP");
+                    if(!providerEvidence||!browserConsumed||boundSetupDenied||proof==null||proof.method()==null||setup==null||!liveSession||enrollment==null||!s.equals(original)||!now.isBefore(s.expiresAt())||!b.utc.isBefore(s.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("browser unavailable");
+                    requireBoundEvidence.run();var result=returnedBoundSetup==null?new BoundSetup(enrollment,proof,setup):returnedBoundSetup;afterBoundSetup.run();yield result;
+                }
+                case "requireBrowserUnboundSetupInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("unbound-setup");
+                    var session=(CustomerSessionContext)a[1];var now=(Instant)a[2];
+                    requireUnbound(session,now);requireBoundEvidence.run();
+                    var result=returnedUnboundSetup==null?new BoundSetup(enrollment,b.methodSetup,providerSteps.get(b.ops.get(reservation.setupOperationId()).providerOperationKey()+":SETUP")):returnedUnboundSetup;
+                    afterUnboundSetup.run();yield result;
+                }
+                case "bindBrowserSetupInTransaction"->{
+                    b.trace.add("binding-write");beforeBindingWrite.run();var expected=(BindingPreparationContext)a[0];
+                    requireUnbound((CustomerSessionContext)a[1],(Instant)a[3]);
+                    var step=providerSteps.get(b.ops.get(reservation.setupOperationId()).providerOperationKey()+":SETUP");
+                    if(competingBind||!expected.original().reservation().equals(reservation)||!expected.original().enrollment().equals(enrollment)
+                            ||!expected.setupProof().equals(b.methodSetup)||!expected.setupStep().equals(step))throw new IllegalStateException("conditional binding unavailable");
+                    var p=b.methodSetup;b.methodSetup=new SubscriptionBillingProofStore.Setup(p.operation(),p.subscription(),p.account(),p.step(),p.reference(),(String)a[2]);
+                    var result=new BoundSetup(enrollment,b.methodSetup,step);afterBindingWrite.run();yield result;
+                }
+                case "requireReservationInTransaction"->{same((Reservation)a[0]);yield reservation;}
+                case "requirePreparedMethodInTransaction"->{same((Reservation)a[0]);b.trace.add("prepared");var o=b.ops.get(reservation.setupOperationId());
+                    if(providerEvidence){var setup=providerSteps.get(o.providerOperationKey()+":SETUP");var method=providerSteps.get(o.providerOperationKey()+":METHOD");
+                        if(setup==null||method==null||setup.status()!=ProviderOperation.Status.ACKNOWLEDGED||method.status()!=ProviderOperation.Status.ACKNOWLEDGED||b.methodSetup==null||b.methodSetup.method()==null)throw new IllegalStateException("not prepared");
+                    }else if(!acks)throw new IllegalStateException("not prepared");
+                    if(o.status()!=SubscriptionOperation.Status.RESERVED)throw new IllegalStateException("not prepared");yield methodContext();}
+                case "claimReadInTransaction"->{same((Reservation)a[0]);var phase=(Phase)a[1];if(claims.containsKey(phase))throw new IllegalStateException("duplicate claim");var q=new ReadClaim(UUID.randomUUID(),reservation.id(),phase,(UUID)a[2],(Instant)a[5],((Instant)a[5]).plusSeconds(30),(Fence)a[3],(SubscriptionBillingTimePort.Sample)a[4]);
+                    if(reservation.successor()!=null){if(a.length!=7||!(a[6] instanceof SuccessorOwner owner)||phase==Phase.RECOVERED&&!confirmAck)throw new IllegalStateException("claim owner/ACK required");
+                        readOwners.put(q.id(),owner.commitment(phase==Phase.METHOD?Origin.METHOD_READ:Origin.RECOVERED_READ,q.id()));}
+                    claims.put(phase,q);yield q;}
+                case "requireReadInTransaction"->{read((ReadClaim)a[1]);yield a[1];}
+                case "requireMethodContextInTransaction"->{read((ReadClaim)a[1]);yield methodContext();}
+                case "requireRecoveredContextInTransaction"->{read((ReadClaim)a[1]);yield new RecoveredReadContext(b.account,b.s,b.binding,b.ops.get(recovery.association().operationId()),completion,recovery,reservation.billingSample());}
+                case "recordCompletionInTransaction"->{b.trace.add("completion");if(failReceipt)throw new IllegalStateException("receipt failed");var q=(ReadClaim)a[1];assertThat(b.sequence).isEqualTo(reservation.failure().observationSequence()+1);assertThat(b.ops.get(reservation.setupOperationId()).status()).isEqualTo(SubscriptionOperation.Status.SUCCEEDED);completion=new Completion(reservation.id(),q.id(),reservation.setupOperationId(),2,id(91),2,id(92),2,"seti_owned","pm_owned",b.s.revision(),b.sequence,b.utc);yield completion;}
+                case "requireCompletionInTransaction"->{same((Reservation)a[0]);if(completion==null||!completion.equals(a[1]))throw new IllegalStateException("completion unavailable");yield completion;}
+                case "associateRecoveryInTransaction"->{if(!Objects.equals(completion,a[1]))throw new IllegalStateException("completion unavailable");var o=(SubscriptionOperation)a[2];recovery=new Recovery(reservation.id(),new OwnedFailedRenewal.Recovery(b.admission.id(),o.id(),b.failure.billId(),b.failure.allocation(),b.failure.paymentIntent(),b.failure.revision(),0,b.utc),b.sequence);yield recovery;}
+                case "requireRecoveryInTransaction"->{if(recovery==null||!recovery.equals(a[1]))throw new IllegalStateException("recovery unavailable");yield recovery;}
+                case "requireUnobservedRecoveryInTransaction"->{
+                    same((Reservation)a[0]);b.trace.add("recovery-unobserved");
+                    if(recovery==null||!recovery.equals(a[1])||claims.containsKey(Phase.RECOVERED)||publication!=null)throw new IllegalStateException("recovery already observed");
+                    afterUnobservedRecovery.run();
+                    yield null;
+                }
+                case "requireRecoveryConfirmationIdentityInTransaction"->{
+                    var expected=(RecoveryPreparationContext)a[0];same(expected.reservation());b.trace.add("recovery-confirm-identity");
+                    if(!Objects.equals(expected.completion(),completion)||!Objects.equals(expected.recovery(),recovery)
+                            ||!Objects.equals(expected.enrollment(),enrollment)||!expected.binding().equals(reservation.binding()))throw new IllegalStateException("recovery identity unavailable");
+                    yield null;
+                }
+                case "requireMethodFactInTransaction","requireRecoveryFactInTransaction"->{var c=(dev.genericpayments.platform.subscriptions.application.port.in.ApplySubscriptionSnapshotUseCase.Command)a[0];var phase=m.equals("requireMethodFactInTransaction")?Phase.METHOD:Phase.RECOVERED;var q=claims.get(phase);read(q);assertThat(c.factKey()).isEqualTo(OwnedFailedRenewalMethod.factKey(q));assertThat(c.fence()).isEqualTo(q.fence());
+                    if(reservation.successor()!=null&&!q.equals(scope))throw new IllegalStateException("facts outside owner scope");
+                    if(phase==Phase.RECOVERED){assertThat(c.snapshot().paymentMethodReady()).isFalse();assertThat(c.snapshot().operationKey()).isEqualTo(b.ops.get(recovery.association().operationId()).providerOperationKey());assertThat(c.snapshot().operationObservation()).isEqualTo(new OperationObservation(c.snapshot().operationKey(),OperationState.APPLIED));}yield null;}
+                case "recordPublicationInTransaction"->{b.trace.add("publication");if(failReceipt)throw new IllegalStateException("receipt failed");assertThat(b.s.debt()).isNull();publication=new Publication(reservation.id(),new OwnedFailedRenewal.Publication(b.admission.id(),((ReadClaim)a[1]).id(),recovery.association().operationId(),b.failure.billId(),UUID.randomUUID(),b.s.revision(),b.utc),b.sequence);yield publication;}
+                default->throw new AssertionError(m);
+            };});
+            b.methodProof=new OwnedFailedRenewalMethodFactProof(store,tx,b.timePort);b.successorProof=new OwnedFailedRenewalMethodRecoveryFactProof(store,tx,b.timePort);
+            var failed=port(OwnedFailedRenewalStore.class,(m,a)->{assertThat(b.active).isTrue();return switch(m){case "requireFailureInTransaction"->b.failure;case "stopInTransaction"->{b.trace.add("stop");if(failStop)throw new IllegalStateException("private stop failure");b.stopped=true;yield null;}default->throw new AssertionError(m);};});
+            service=new OwnedFailedRenewalMethodService(store,failed,tx,b.operationsPort,(site,customer)->b.trace.add("lifecycle"),id->{b.trace.add("account");afterAccountLock.run();return Optional.of(b.account);},b.subscriptionsPort,b.billsPort,new SubscriptionReadPreparation(b.operationsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty())),b.observationsPort,b.factsPort,port(TrialEligibilityStore.class,(m,a)->Optional.empty()),b.timePort,b.clockPort,port(StripeBillingBindingPort.class,(m,a)->Optional.of(b.binding)),port(SubscriptionAuthorityPort.class,(m,a)->{
+                assertThat(b.active).isTrue();b.trace.add("authority");authorityTargets.add((SubscriptionCommandContext)a[0]);
+                var supplied=((SubscriptionCommandContext)a[0]).actor();
+                boolean second=supplied instanceof SubscriptionActor.Customer actorCustomer&&actorCustomer.session().equals(secondLiveSession);
+                afterAuthority.run();
+                if(!authorized||!liveSession&&!second)throw new IllegalStateException("authority revoked");
+                // New bound SDK fixtures model production lockedSession.activeAt(current UTC).
+                // Older fixtures retain their existing explicitly selected authority behavior.
+                if(enforceSessionExpiry&&((SubscriptionCommandContext)a[0]).actor() instanceof SubscriptionActor.Customer customer
+                        &&!b.utc.isBefore(customer.session().expiresAt()))throw new IllegalStateException("authority expired");
+                return null;
+            }),authenticationDigest);
+        }
+        Reservation reserve(){return service.reserveMethod(b.admission,context,true);}
+        void requireUnbound(CustomerSessionContext supplied,Instant now){
+            var original=((SubscriptionActor.Customer)context.actor()).session();
+            if(!bindingEnabled||!providerEvidence||!browserConsumed||browserConsumptionUncommitted||unboundSetupDenied||b.methodSetup==null||b.methodSetup.method()!=null
+                    ||providerSteps.get(b.ops.get(reservation.setupOperationId()).providerOperationKey()+":SETUP")==null
+                    ||!liveSession||enrollment==null||!supplied.equals(original)||!enrollment.sessionId().equals(supplied.sessionId().value())
+                    ||!enrollment.origin().equals(supplied.origin())||!enrollment.sessionExpiresAt().equals(supplied.expiresAt())
+                    ||!now.isBefore(supplied.expiresAt())||!b.utc.isBefore(supplied.expiresAt())||now.isAfter(b.utc))throw new IllegalStateException("unbound browser unavailable");
+        }
+        Reservation prepared(){var r=reserve();acks=true;b.methodSetup=new SubscriptionBillingProofStore.Setup(r.setupOperationId(),b.s.id(),b.account.id(),id(91),"seti_owned","pm_owned");service.recordMethodUpdateReply(r,context);return r;}
+        void same(Reservation r){if(reservation==null||!reservation.equals(r)||b.stopped)throw new IllegalStateException("reservation unavailable");}
+        void read(ReadClaim q){same(reservation);if(q==null||!q.equals(claims.get(q.phase()))||!b.utc.isBefore(q.deadlineAt())||q.fence().observationSequence()!=b.sequence)throw new IllegalStateException("read unavailable");}
+        MethodReadContext methodContext(){var o=b.ops.get(reservation.setupOperationId());var setup=b.methodSetup==null?new SubscriptionBillingProofStore.Setup(o.id(),b.s.id(),b.account.id(),id(91),"seti_owned","pm_owned"):b.methodSetup;return new MethodReadContext(b.account,b.s,b.binding,o,setup,providerEvidence?providerSteps.get(o.providerOperationKey()+":SETUP"):step(o,false),providerEvidence?providerSteps.get(o.providerOperationKey()+":METHOD"):step(o,true),reservation.billingSample());}
+        ProviderOperation step(SubscriptionOperation o,boolean method){return new ProviderOperation(id(method?92:91),b.account.id(),b.account.externalAccountId(),b.account.credentialsRef(),method?ProviderOperation.Kind.SUBSCRIPTION_UPDATE:ProviderOperation.Kind.SETUP_INTENT_CREATE,o.id(),o.providerOperationKey()+(method?":METHOD":":SETUP"),"fingerprint",ProviderOperation.Status.ACKNOWLEDGED,method?"sub_owned":"seti_owned",b.utc,b.utc.plusSeconds(100),null,null,2);}
+        MethodEvidence evidence(){return new MethodEvidence(b.snapshot(false),"seti_owned","pm_owned",b.utc);}
+        OwnedFailedRenewal.RecoveredEvidence recoveredEvidence(){var v=b.snapshot(true);var raw=new Snapshot(v.subscriptionReference(),v.status(),v.billingPrice(),v.period(),v.trial(),v.cancellationAt(),v.invoices(),null,false,v.providerRevision(),v.observedAt(),null,v.recoveryObservations(),v.trialEvidence(),v.externalWithdrawalEvidence());return new OwnedFailedRenewal.RecoveredEvidence(raw,b.utc);}
+    }
+}

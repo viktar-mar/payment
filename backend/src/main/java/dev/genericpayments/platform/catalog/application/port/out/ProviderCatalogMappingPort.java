@@ -11,5 +11,10 @@ import java.util.Optional;
 public interface ProviderCatalogMappingPort {
     Optional<ProviderProductRef> findProduct(PaymentAccountId accountId, ProductId productId);
     Optional<ProviderPriceRef> findPrice(PaymentAccountId accountId, PriceId priceId);
+    /** Bounded immutable recurring history, including archived Prices; never truncate on overflow. */
+    default java.util.List<ProviderCatalogMapping> findPricesForProduct(PaymentAccountId accountId,
+            dev.genericpayments.platform.sites.domain.SiteId siteId, ProductId productId) {
+        throw new UnsupportedOperationException("Bounded catalog mapping unavailable");
+    }
     ProviderCatalogMapping save(ProviderCatalogMapping mapping);
 }

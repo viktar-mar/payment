@@ -1,0 +1,61 @@
+import type {BillingBinding,BillingLimits} from './stripe-billing-acceptance.mjs';
+export type {BillingLimits};
+export interface FirstPaymentIdentity {phase:string;code:'OK';run_id:string;account_id:string;site_id:string;customer_id:string;price_id:string;subscription_id:string;operation_id:string}
+export interface FirstPaymentPrepared extends FirstPaymentIdentity {
+ phase:'PREPARED';
+ action:{kind:'PROVIDER_CLIENT';secret:string;expires_at:string};
+ session:{protocol:'SERVER_CONFIRM_V2';provider:'stripe';flow:'PAYMENT';publishable_key:string;client_secret:string;action_token:null;attempt_id:string;capability:string;expires_at:string};
+}
+/** Values come from the original SDK request body/path/header, never a harness-generated key. */
+export interface FirstPaymentConfirmRequest {attempt_id:string;capability:string;confirmation_token:string;idempotency_key:string}
+export interface FirstPaymentConfirmed extends FirstPaymentIdentity {phase:'OBSERVE';protocol:'SERVER_CONFIRM_V2';attempt_id:string;state:'OBSERVE';retry_allowed:false;successor_attempt_id:null;next_action_allowed:false;expires_at:string}
+export interface BillingFirstPaymentPort {
+ resources():BillingBinding;
+ withOtpCode(callback:(code:string)=>true|Promise<true>,limits:BillingLimits):Promise<true>;
+ acknowledgeCustomer(value:{customerId:string;siteId:string}):Promise<true>;
+ prepare(customerSession:{token:string;origin:string},createKey:string,limits:BillingLimits):Promise<FirstPaymentPrepared>;
+ confirm(originalSDKRequest:FirstPaymentConfirmRequest,limits:BillingLimits):Promise<FirstPaymentConfirmed>;
+}
+export type BillingFirstPaymentCleanupFailure='BROWSER_UNSETTLED'|'BROWSER_CLOSE'|'RUNTIME_CLOSE'|'LISTENER_STOP'|'START_SETTLEMENT'|'BOOTSTRAP_STOP'|'FIXTURE_CLOSE';
+export interface BillingFirstPaymentResult {runId:string;expectedSource:string;scope:'OWNED_INITIAL_PAYMENT';initialAccepted:boolean;full5bAccepted:false;cleanupConfirmed:boolean;cleanupFailure:BillingFirstPaymentCleanupFailure|null;status:string;phase:string;code:string|null;diagnostic:string|null}
+export function createOwnedBillingFirstPayment(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstPaymentResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstPaymentResult>;close():Promise<BillingFirstPaymentResult>}>;
+
+export function formatBillingFirstPaymentDiagnostic(result:BillingFirstPaymentResult):string|null;
+export function parseBillingFirstPaymentDiagnosticLine(line:unknown):string|null;
+
+export interface BillingFirstRenewalResult extends Omit<BillingFirstPaymentResult,'scope'> {scope:'OWNED_INITIAL_AND_FIRST_RENEWAL';renewalAccepted:boolean}
+export function createOwnedBillingFirstRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{resources():BillingFirstRenewalResult;run(journey:(port:BillingFirstPaymentPort,limits:BillingLimits)=>Promise<unknown>,limits:BillingLimits):Promise<BillingFirstRenewalResult>;close():Promise<BillingFirstRenewalResult>}>;
+export function formatBillingFirstRenewalDiagnostic(result:BillingFirstRenewalResult):string|null;
+export function parseBillingFirstRenewalDiagnosticLine(line:unknown):string|null;
+export function formatBillingFirstPaymentCleanupDiagnostic(result:BillingFirstPaymentResult):string|null;
+export function parseBillingFirstPaymentCleanupDiagnosticLine(line:unknown):string|null;
+export function formatBillingFirstRenewalCleanupDiagnostic(result:BillingFirstRenewalResult):string|null;
+export function parseBillingFirstRenewalCleanupDiagnosticLine(line:unknown):string|null;
+
+export type FailedMethodAction=FirstPaymentPrepared['action'];
+export interface FailedMethodSession {
+ protocol:'BROWSER_CONFIRM_V1';provider:'stripe';flow:'SETUP';publishable_key:string;client_secret:string;
+ action_token:string;attempt_id:null;capability:null;expires_at:string;
+}
+export interface FailedMethodPermit {browser_confirm_allowed:true;state:'RESERVED'}
+export interface BillingFailedRenewalMethodPort {
+ prepareMethod(limits:BillingLimits):Promise<{subscriptionId:string;operationId:string;action:FailedMethodAction}>;
+ selectMethod(limits:BillingLimits):Promise<FailedMethodSession>;
+ confirmMethod(limits:BillingLimits):Promise<FailedMethodPermit>;
+}
+export interface BillingFailedRenewalJourney {
+ initial(port:BillingFirstPaymentPort,limits:BillingLimits):Promise<unknown>;
+ method(port:BillingFailedRenewalMethodPort,limits:BillingLimits):Promise<true>;
+ close(limits:BillingLimits):Promise<true>;
+}
+export interface BillingFailedRenewalResult extends Omit<BillingFirstPaymentResult,'scope'> {
+ scope:'OWNED_FAILED_RENEWAL_GRACE_RECOVERY';failedRenewalAccepted:boolean;
+}
+/** Failed-renewal terminal checkpoint and independent cleanup witness. */
+export function formatBillingFailedRenewalDiagnostic(result:BillingFailedRenewalResult):string|null;
+export function parseBillingFailedRenewalDiagnosticLine(line:unknown):string|null;
+export function createOwnedBillingFailedRenewal(options:unknown,dependencies?:Record<string,unknown>):Promise<{
+ resources():BillingFailedRenewalResult;
+ run(journey:BillingFailedRenewalJourney,limits:BillingLimits):Promise<BillingFailedRenewalResult>;
+ close():Promise<BillingFailedRenewalResult>;
+}>;

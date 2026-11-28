@@ -2,13 +2,84 @@ package dev.genericpayments.platform.webhooks.application.service;
 import static org.assertj.core.api.Assertions.*;
 import dev.genericpayments.platform.subscriptions.application.service.SubscriptionFactFixture;
 import dev.genericpayments.platform.webhooks.application.port.out.*;
-import java.time.Duration;
+import java.time.*;
+import java.sql.Timestamp;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionCallbackPort;
+import dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionEventStore;
+import dev.genericpayments.platform.subscriptions.domain.*;
+import dev.genericpayments.platform.shared.application.port.out.EncryptedSecretPort;
 import java.util.*;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.junit.jupiter.api.Test;
 class SubscriptionCallbackIntegrationTest extends SubscriptionFactFixture {
     @Autowired CallbackConfigurationPort config;@Autowired CallbackPayloadPort payload;@Autowired OutboxPort outbox;
+    @Autowired SubscriptionCallbackPort callbacks;
+    @Autowired SubscriptionEventStore events;
+    @Autowired EncryptedSecretPort encryption;
+
+    /** Hosted CI only: this fixture starts Spring/PostgreSQL; never select it in local pure runs. */
+    @Test void futureBillingSnapshotEnqueuesImmediatelyWhileLeaseRetryAndSigningStayUtc() throws Exception {
+        price=price(90);var r=start();apply(r.subscriptionId(),retrieve(r),"long-trial");
+        var subscription=sub(r.subscriptionId());var utc=INITIAL_TIME;var billing=utc.plus(Duration.ofDays(35));
+        var reveal=config.configure(site.value(),"https://example.com/callback",true);
+        var access=new SubscriptionAccessPolicy().evaluate(subscription,billing);
+        assertThat(access.allowed()).isTrue();
+        var event=new SubscriptionEvent(UUID.randomUUID(),site,subscription.id(),account.id(),0,subscription.revision(),SubscriptionEvent.Type.CONFIRMED,SubscriptionEvent.Source.RECONCILIATION,billing,utc,null,null,null,null,"future-billing-callback","billing-boundary");
+        assertThatThrownBy(()->tx.required(()->{
+            assertThat(events.append(event)).isTrue();callbacks.snapshot(subscription,event,access,utc);
+            throw new IllegalStateException("rollback future snapshot");
+        })).hasMessage("rollback future snapshot");
+        assertThat(count("outbox_events")).isZero();
+        assertThat(events.list(site,subscription.id(),100,0)).noneMatch(e->e.id().equals(event.id()));
+        tx.required(()->{assertThat(events.append(event)).isTrue();callbacks.snapshot(subscription,event,access,utc);return null;});
+        var stored=jdbc.queryForMap("select payload::text,next_attempt_at,created_at,updated_at from outbox_events where id=?",event.id());
+        tx.required(()->{if(events.append(event))callbacks.snapshot(subscription,event,access,utc.plusSeconds(1));return null;});
+        assertThat(jdbc.queryForMap("select payload::text,next_attempt_at,created_at,updated_at from outbox_events where id=?",event.id())).isEqualTo(stored);
+        for(var column:List.of("next_attempt_at","created_at","updated_at"))assertThat(((Timestamp)stored.get(column)).toInstant()).isEqualTo(utc);
+        var journal=events.list(site,subscription.id(),100,0).stream().filter(e->e.id().equals(event.id())).findFirst().orElseThrow();
+        assertThat(journal.occurredAt()).isEqualTo(billing);assertThat(journal.receivedAt()).isEqualTo(utc);
+
+        var claims=outbox.claimAutomatic("first-utc",1,utc,Duration.ofSeconds(30));assertThat(claims).hasSize(1);
+        var first=claims.getFirst();assertThat(first.createdAt()).isEqualTo(utc);
+        var bytes=payload.bytes(first);var mapper=new ObjectMapper();
+        var expected=new TreeMap<String,Object>();
+        expected.put("schema_version",4);expected.put("event_id",event.id().toString());expected.put("event_type","subscription.updated");expected.put("site_id",site.value().toString());
+        expected.put("subscription_id",subscription.id().toString());expected.put("customer_id",customer.id().value().toString());expected.put("product_id",subscription.productId().value().toString());expected.put("revision",subscription.revision());
+        expected.put("state","TRIALING");expected.put("access_allowed",true);expected.put("access_valid_until",billing.plusSeconds(300).toString());expected.put("occurred_at",billing.toString());expected.put("billing_record_id",null);expected.put("payment_id",null);
+        assertThat(bytes).isEqualTo(mapper.writeValueAsBytes(expected));
+        // A later billing evaluation leaves the live UTC lease and retry window alone.
+        assertThat(new SubscriptionAccessPolicy().evaluate(subscription,billing.plus(Duration.ofDays(1))).allowed()).isTrue();
+        assertThat(outbox.claimAutomatic("before-lease",1,utc.plusSeconds(29),Duration.ofSeconds(30))).isEmpty();
+        var reclaimed=outbox.claimAutomatic("reclaimed-utc",1,utc.plusSeconds(30),Duration.ofSeconds(30));assertThat(reclaimed).hasSize(1);
+        assertThat(reclaimed.getFirst().attempt()).isEqualTo(2);
+        assertThat(outbox.complete(first,CallbackHttpPort.Result.success(204),utc.plusSeconds(30))).isFalse();
+        byte[] secret=Base64.getUrlDecoder().decode(reveal.secret());
+        var posts=new ArrayList<Instant>();
+        try {
+            var failed=new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,body)->{
+                assertThat(endpoint).isEqualTo("https://example.com/callback");assertThat(body).isEqualTo(bytes);
+                assertThat(headers.get("Payment-Timestamp")).isEqualTo(Long.toString(utc.plusSeconds(30).getEpochSecond()));
+                assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(secret,utc.plusSeconds(30).getEpochSecond(),body));
+                posts.add(utc.plusSeconds(30));return CallbackHttpPort.Result.failed(null,CallbackHttpPort.ErrorCategory.NETWORK);
+            },Clock.fixed(utc.plusSeconds(30),ZoneOffset.UTC));
+            failed.deliver(reclaimed.getFirst());assertThat(posts).containsExactly(utc.plusSeconds(30));
+            assertThat(jdbc.queryForObject("select next_attempt_at from outbox_events where id=?",Timestamp.class,event.id()).toInstant()).isEqualTo(utc.plusSeconds(330));
+            assertThat(outbox.claimAutomatic("before-retry",1,utc.plusSeconds(329),Duration.ofSeconds(30))).isEmpty();
+            var retry=outbox.claimAutomatic("retry-utc",1,utc.plusSeconds(330),Duration.ofSeconds(30));assertThat(retry).hasSize(1);
+            assertThat(retry.getFirst().payload()).isEqualTo(first.payload());
+            var success=new CallbackDeliveryService(outbox,encryption,payload,(endpoint,headers,body)->{
+                assertThat(body).isEqualTo(bytes);assertThat(headers.get("Payment-Timestamp")).isEqualTo(Long.toString(utc.plusSeconds(330).getEpochSecond()));
+                assertThat(headers.get("Payment-Signature")).isEqualTo("v1="+new CallbackSigner().sign(secret,utc.plusSeconds(330).getEpochSecond(),body));
+                posts.add(utc.plusSeconds(330));return CallbackHttpPort.Result.success(204);
+            },Clock.fixed(utc.plusSeconds(330),ZoneOffset.UTC));
+            success.deliver(retry.getFirst());assertThat(posts).containsExactly(utc.plusSeconds(30),utc.plusSeconds(330));
+        } finally {Arrays.fill(secret,(byte)0);}
+        assertThat(jdbc.queryForObject("select status from outbox_events where id=?",String.class,event.id())).isEqualTo("DELIVERED");
+        assertThat(jdbc.queryForObject("select updated_at from outbox_events where id=?",Timestamp.class,event.id()).toInstant()).isEqualTo(utc.plusSeconds(330));
+        assertThat(jdbc.queryForList("select finished_at from outbox_deliveries where outbox_event_id=? order by attempt_number",Timestamp.class,event.id())).containsExactly(Timestamp.from(utc.plusSeconds(30)),Timestamp.from(utc.plusSeconds(330)));
+    }
+
     @Test void failedCashFactRollsBackBothCallbackFamiliesAndRetryDeduplicates() {
         config.configure(site.value(),"https://example.com/callback",true);
         var r=start();var snapshot=retrieve(r);

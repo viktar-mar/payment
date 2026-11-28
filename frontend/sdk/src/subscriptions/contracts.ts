@@ -29,12 +29,28 @@ export interface SubscriptionQuote { quoteId: string; subscriptionId: string; fr
 /** Secret-bearing memory-only capability. Never serialize, log, emit, or attach to the DOM. */
 export interface SubscriptionAction { kind: 'FAKE_CONFIRM_PAYMENT' | 'FAKE_CONFIRM_SETUP' | 'PROVIDER_CLIENT'; secret: string; expiresAt: string; }
 export interface SubscriptionOperation { operationId: string; subscriptionId: string; status: typeof operationStatuses[number]; actionAvailable: boolean; nextAction?: SubscriptionAction; }
+/** Ephemeral mutation receipt. Never project permission into operation GETs or UI state. */
+export interface SubscriptionMutationReceipt extends SubscriptionOperation { readonly browserConfirmAllowed: boolean; }
+/** Memory-only provider context bound to the original action and Customer session. */
+export interface SubscriptionClientSession { readonly flow: 'PAYMENT' | 'SETUP'; readonly publishableKey: string; readonly clientSecret: string; readonly actionToken: string; readonly expiresAt: string; }
 /** Short-lived server navigation result; keep only in memory. */
 export interface SubscriptionPortal { navigationUrl: string; expiresAt: string; simulated: boolean; }
 export interface SubscriptionRequest { session: CustomerSession; signal?: AbortSignal; }
 export interface SubscriptionIdRequest extends SubscriptionRequest { subscriptionId: string; }
 export interface SubscriptionMutation extends SubscriptionIdRequest { idempotencyKey: string; }
+export interface SubscriptionPaymentSession { readonly protocol: 'SERVER_CONFIRM_V2'; readonly flow: 'PAYMENT'; readonly publishableKey: string; readonly clientSecret: string; readonly attemptId: string; readonly capability: string; readonly expiresAt: string; }
+export type SubscriptionConfirmationSession = SubscriptionPaymentSession | (SubscriptionClientSession & { readonly protocol: 'BROWSER_CONFIRM_V1' });
+export interface SubscriptionAttemptStatus { readonly protocol: 'SERVER_CONFIRM_V2'; readonly attemptId: string; readonly state: 'READY' | 'DISPATCHING' | 'REQUIRES_ACTION' | 'OBSERVE' | 'DECLINED' | 'UNKNOWN'; readonly retryAllowed: boolean; readonly successorAttemptId: string | null; readonly expiresAt: string; }
+export interface SubscriptionConfirmReceipt extends SubscriptionAttemptStatus { readonly nextActionAllowed: boolean; }
+export type SubscriptionAttemptInput = SubscriptionIdRequest & { operationId: string; attemptId: string };
 export interface SubscriptionClient {
+  /** Optional only for compatibility with custom legacy clients. The shipped client implements the entire family. */
+  confirmationSession?(input: SubscriptionMutation & { operationId: string; action: SubscriptionAction }): Promise<SubscriptionConfirmationSession>;
+  confirmationAttempt?(input: SubscriptionAttemptInput): Promise<SubscriptionAttemptStatus>;
+  currentConfirmationAttempt?(input: SubscriptionIdRequest & { operationId: string }): Promise<SubscriptionAttemptStatus | null>;
+  confirmPaymentAttempt?(input: SubscriptionMutation & { operationId: string; context: SubscriptionPaymentSession; confirmationToken: string }): Promise<SubscriptionConfirmReceipt>;
+  retryPaymentAttempt?(input: SubscriptionAttemptInput & { idempotencyKey: string }): Promise<SubscriptionAttemptStatus>;
+  paymentAttemptSession?(input: SubscriptionAttemptInput & { idempotencyKey: string; expiresAt: string }): Promise<SubscriptionPaymentSession>;
   list(input: SubscriptionRequest & { limit?: number; cursor?: string }): Promise<SubscriptionPage>;
   offers(input: SubscriptionRequest & { productId: string }): Promise<SubscriptionOffer[]>;
   get(input: SubscriptionIdRequest): Promise<SubscriptionView>;
@@ -51,8 +67,9 @@ export interface SubscriptionClient {
   resume(input: SubscriptionMutation & { recurringConsent: boolean }): Promise<SubscriptionOperation>;
   operation(input: SubscriptionIdRequest & { operationId: string }): Promise<SubscriptionOperation>;
   action(input: SubscriptionIdRequest & { operationId: string }): Promise<SubscriptionAction>;
-  confirmAction(input: SubscriptionMutation & { operationId: string; actionToken: string }): Promise<SubscriptionOperation>;
+  clientSession(input: SubscriptionMutation & { operationId: string; action: SubscriptionAction }): Promise<SubscriptionClientSession>;
+  confirmAction(input: SubscriptionMutation & { operationId: string; actionToken: string }): Promise<SubscriptionMutationReceipt>;
   portal(input: SubscriptionMutation & { returnUrl: string }): Promise<SubscriptionPortal>;
 }
 /** Internal bridge: Customer authority is checked before send and after completion. */
-export type SubscriptionAuthorizedRequest = (session: CustomerSession, path: string, method: 'GET' | 'POST', body: object | undefined, signal: AbortSignal | undefined, expected: readonly number[], idempotency: string | undefined, scope: Extract<CustomerScope, 'SUBSCRIPTION_READ' | 'SUBSCRIPTION_MANAGE'>, rule?: ResponseRule, cap?: number) => Promise<unknown>;
+export type SubscriptionAuthorizedRequest = (session: CustomerSession, path: string, method: 'GET' | 'POST', body: object | undefined, signal: AbortSignal | undefined, expected: readonly number[], idempotency: string | undefined, scope: Extract<CustomerScope, 'SUBSCRIPTION_READ' | 'SUBSCRIPTION_MANAGE'>, rule?: ResponseRule, cap?: number, parseSuccess?: (raw: string) => unknown) => Promise<unknown>;

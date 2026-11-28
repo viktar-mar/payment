@@ -27,7 +27,7 @@ public class SubscriptionEventPersistenceAdapter implements SubscriptionEventSto
         jdbc.update("""
             insert into subscription_events(id,site_id,subscription_id,payment_account_id,sequence_number,revision,event_type,source,occurred_at,received_at,operation_id,billing_record_id,payment_id,provider_reference,fact_key,request_id)
             values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,e.id(),e.siteId().value(),e.subscriptionId(),e.accountId().value(),sequence,e.revision(),e.type().name(),e.source().name(),time(e.occurredAt()),time(e.receivedAt()),e.operationId(),e.billingRecordId(),e.paymentId()==null?null:e.paymentId().value(),e.providerReference(),e.factKey(),e.requestId());
+            """,e.id(),e.siteId().value(),e.subscriptionId(),e.accountId().value(),sequence,e.revision(),e.type().name(),e.source().name(),time(e.occurredAt()),auditTime(e.receivedAt()),e.operationId(),e.billingRecordId(),e.paymentId()==null?null:e.paymentId().value(),e.providerReference(),e.factKey(),e.requestId());
         jdbc.update("update subscription_event_sequences set next_sequence=? where subscription_id=?",sequence,e.subscriptionId());
         return true;
     }

@@ -68,6 +68,10 @@ public class PendingProviderRecoveryPersistenceAdapter implements PendingProvide
                 """
             select o.id from provider_operations o join payment_accounts a on a.id=o.payment_account_id
             where a.provider='STRIPE' and a.account_mode='SANDBOX' and a.account_status='ACTIVE'
+              and o.kind<>'OWNED_RECOVERY_INTENT_CONFIRM'
+              and o.kind<>'OWNED_GRACE_CLOCK_ADVANCE'
+              and o.kind<>'OWNED_GRACE_AT_CLOCK_ADVANCE'
+              and o.kind<>'OWNED_GRACE_AFTER_CLOCK_ADVANCE'
               and o.status in ('DISPATCHING','UNKNOWN','ACKNOWLEDGED')
               and o.next_attempt_at<=clock_timestamp()
               and (o.lease_expires_at is null or o.lease_expires_at<=clock_timestamp())
@@ -118,8 +122,9 @@ public class PendingProviderRecoveryPersistenceAdapter implements PendingProvide
 
     public void finish(Claim claim, Outcome outcome) {
         var row = jdbc.queryForMap(
-                "select recovery_attempts,next_attempt_at from provider_operations where id=? for update",
+                "select kind,recovery_attempts,next_attempt_at from provider_operations where id=? for update",
                 claim.operation().id());
+        if(ProviderOperation.Kind.valueOf((String)row.get("kind")).dedicatedDispatch())throw new IllegalStateException("RECOVERY_CLAIM_LOST");
         var now = clock.instant();
         if (((Number) row.get("recovery_attempts")).intValue() != claim.attempt()
                 || !((Timestamp) row.get("next_attempt_at")).toInstant().equals(claim.expiresAt())

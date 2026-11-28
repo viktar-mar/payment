@@ -37,6 +37,11 @@ export function subscribeCheckoutCustomer(session: CheckoutSession, callback: ()
   const callbacks = binding.callbacks; let activeCallback: (() => void) | undefined = callback; callbacks.add(callback);
   return () => { if (activeCallback) callbacks.delete(activeCallback); activeCallback = undefined; };
 }
+/** Subscription forms share accepted Customer replacement/logout notifications. */
+export function subscribeSubscriptionCustomer(session: CustomerSession, callback: () => void): () => void {
+  const binding: Binding = { namespace: namespace(session), token: session.sessionToken, invalidated: false, callbacks: new Set([callback]) };
+  return register(binding);
+}
 function notify(session: CustomerSession, replaced: boolean): void {
   if (session.origin !== browserOrigin()) return;
   const name = namespace(session), entries = registry.get(name);

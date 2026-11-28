@@ -1,4 +1,5 @@
 const en = {
+  retryPayment: 'Retry payment', continuePayment: 'Continue payment', paymentDeclined: 'Your payment was declined. You can try again.', paymentDetails: 'Check your payment details and try Pay again.',
   title: 'Subscriptions', simulated: 'Local Fake simulation — not a real payment',
   setup: 'Update payment method', recover: 'Pay the existing invoice',
   unknown: 'The result is not confirmed. Refresh the operation status.',
@@ -18,7 +19,7 @@ const en = {
   cancelEnd: 'Cancel at period end', cancelNow: 'Cancel immediately', confirmCancel: 'I confirm cancellation',
   submitCancel: 'Confirm cancellation', dismiss: 'Dismiss confirmation', clear: 'Clear pending change',
   withdraw: 'Withdraw cancellation', resume: 'Resume subscription', portal: 'Open customer portal',
-  complete: 'Complete Fake action', invalidPlan: 'Choose an available published plan.',
+  complete: 'Complete Fake action', pay: 'Pay', invalidPlan: 'Choose an available published plan.',
   state: 'Subscription status', paidThrough: 'Paid through', month: 'month', year: 'year', allowed: 'Allowed', denied: 'Not allowed',
   access: 'Access status', moreBilling: 'More billing records', moreHistory: 'More lifecycle history',
   protected: 'Protected content requires backend or serverless verification of subscription access.',
@@ -27,6 +28,7 @@ type Copy = { [K in keyof typeof en]: string };
 export const subscriptionCopy = {
   en,
   pt: {
+    retryPayment: 'Tentar pagar novamente', continuePayment: 'Continuar pagamento', paymentDeclined: 'O pagamento foi recusado. Pode tentar novamente.', paymentDetails: 'Verifique os dados de pagamento e tente pagar novamente.',
     title: 'Subscrições', simulated: 'Simulação Fake local — não é um pagamento real',
     setup: 'Atualizar método de pagamento', recover: 'Pagar a fatura existente',
     unknown: 'O resultado não está confirmado. Atualize o estado da operação.',
@@ -46,7 +48,7 @@ export const subscriptionCopy = {
     cancelEnd: 'Cancelar no fim do período', cancelNow: 'Cancelar imediatamente', confirmCancel: 'Confirmo o cancelamento',
     submitCancel: 'Confirmar cancelamento', dismiss: 'Fechar confirmação', clear: 'Remover alteração pendente',
     withdraw: 'Retirar cancelamento', resume: 'Retomar subscrição', portal: 'Abrir portal do cliente',
-    complete: 'Concluir ação Fake', invalidPlan: 'Escolha um plano publicado disponível.',
+    complete: 'Concluir ação Fake', pay: 'Pagar', invalidPlan: 'Escolha um plano publicado disponível.',
     state: 'Estado da subscrição', paidThrough: 'Pago até', month: 'mês', year: 'ano', allowed: 'Permitido', denied: 'Não permitido',
     access: 'Estado do acesso', moreBilling: 'Mais registos de faturação', moreHistory: 'Mais histórico da subscrição',
     protected: 'O conteúdo protegido exige verificação do acesso à subscrição no backend ou numa função serverless.',

@@ -3,6 +3,7 @@ import dev.genericpayments.platform.catalog.domain.*;
 import dev.genericpayments.platform.subscriptions.domain.*;
 import java.sql.*;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.*;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
@@ -11,6 +12,10 @@ import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 final class SubscriptionPersistenceValues {
     private SubscriptionPersistenceValues() {}
     static Timestamp time(Instant v){return v==null?null:Timestamp.from(v);}
+    // A row read back at the same clock instant must never appear to have been created in the future.
+    static Timestamp auditTime(Instant value) {
+        return Timestamp.from(value.truncatedTo(ChronoUnit.MICROS));
+    }
     static Instant instant(ResultSet r,String key)throws SQLException {var t=r.getTimestamp(key);return t==null?null:t.toInstant();}
     static UUID uuid(ResultSet r,String key)throws SQLException{return r.getObject(key,UUID.class);}
     static Subscription.Period period(ResultSet r,String prefix)throws SQLException {var start=instant(r,prefix+"_start");return start==null?null:new Subscription.Period(start,instant(r,prefix+"_end"));}

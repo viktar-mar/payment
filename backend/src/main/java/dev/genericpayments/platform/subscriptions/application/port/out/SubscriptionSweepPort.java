@@ -9,7 +9,7 @@ public interface SubscriptionSweepPort {
     List<Claim> expiredGrace(int batch,Instant now);
     /** Mandatory transaction, after the standard operation/Site/Customer/account/Subscription locks. */
     void requireCurrent(Claim claim,Instant now);
-    /** Advance the lease fence only in the same transaction as an accepted fact apply. */
+    /** Advance after an accepted fact or an explicitly recorded original-setup continuation receipt. */
     Claim advanceRevision(Claim claim,long revision,Instant now);
     int attempts(Claim claim);
 }

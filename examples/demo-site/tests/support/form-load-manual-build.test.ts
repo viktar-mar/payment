@@ -15,12 +15,13 @@ test('actual Vite graph shares SDK across manual/automatic entries and excludes 
     await build({root,configFile:root+'/vite.config.ts',mode:'form-diagnostic',logLevel:'silent',build:{outDir:directory}});
     const assets=await readdir(join(directory,'assets')),manual=assets.find(name=>/^formManual-.*\.js$/.test(name)),automatic=assets.find(name=>/^formDiagnostic-.*\.js$/.test(name));
     assert.ok(manual);assert.ok(automatic);
+    assert.equal((await readdir(directory)).includes('subscription-return.html'),false);
     const manualCode=await readFile(join(directory,'assets',manual),'utf8'),automaticCode=await readFile(join(directory,'assets',automatic),'utf8');
     const shared=assets.filter(name=>name.endsWith('.js')&&manualCode.includes(name)&&automaticCode.includes(name));assert.ok(shared.length>0);
     for(const name of assets)assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/node:http|node:crypto|createManualFormGateway/);
     for(const scenario of ['no-click','synchronous-ready','delayed-ready','frame-only','late-session'])await t.test(scenario,()=>exercise(pathToFileURL(join(directory,'assets',manual)).href,scenario,true));
     await build({root,configFile:root+'/vite.config.ts',mode:'production',logLevel:'silent',build:{outDir:directory,emptyOutDir:true}});
-    const documents=await readdir(directory);assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));
+    const documents=await readdir(directory);assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
     assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
     for(const name of await readdir(join(directory,'assets')))assert.doesNotMatch(await readFile(join(directory,'assets',name),'utf8'),/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
   }finally{await rm(directory,{recursive:true,force:true});}
@@ -28,7 +29,7 @@ test('actual Vite graph shares SDK across manual/automatic entries and excludes 
 
 // Catch omitted Docker COPY inputs (including transitive runtime/declaration
 // imports), not just successful builds with the entire checkout available.
-test('Docker COPY filesystem typechecks and builds diagnostic and production entries offline',async t=>{
+test('Docker COPY filesystem typechecks and builds dedicated and production entries offline',async t=>{
   const root=fileURLToPath(new URL('../..',import.meta.url)),repository=resolve(root,'../..');
   const directory=await mkdtemp(join(tmpdir(),'payment-manual-docker-'));
   const publicInfrastructure=[
@@ -41,8 +42,9 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     'frontend/package.json','frontend/pnpm-lock.yaml','frontend/pnpm-workspace.yaml',
     'frontend/sdk/package.json','frontend/sdk',
     'examples/demo-site/package.json','examples/demo-site/pnpm-lock.yaml',
-    'examples/demo-site/index.html','examples/demo-site/payment-return.html',
+    'examples/demo-site/index.html','examples/demo-site/payment-return.html','examples/demo-site/subscription-return.html',
     'examples/demo-site/form-load-diagnostic.html','examples/demo-site/form-load-manual.html','examples/demo-site/manual-payment.html',
+    'examples/demo-site/billing-first-payment.html','examples/demo-site/billing-failed-renewal.html',
     'examples/demo-site/tsconfig.json','examples/demo-site/vite.config.ts','examples/demo-site/src',
     ...publicInfrastructure.map(name=>'infrastructure/'+name),
   ]);
@@ -112,7 +114,7 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
     // stale SDK installation or source files outside the staged COPY tree.
     typecheck('frontend/sdk',['-p','tsconfig.json']);
     typecheck('examples/demo-site',['--noEmit']);
-    for(const mode of ['manual-payment','form-diagnostic','production'])await t.test(mode,async()=>{
+    for(const mode of ['manual-payment','form-diagnostic','billing-first-payment','billing-failed-renewal','production'])await t.test(mode,async()=>{
       assert.deepEqual((await readdir(join(directory,'infrastructure'))).sort(),[...publicInfrastructure].sort());
       const demo=join(directory,'examples/demo-site');
       await build({root:demo,configFile:join(demo,'vite.config.ts'),mode,logLevel:'silent'});
@@ -121,16 +123,31 @@ test('Docker COPY filesystem typechecks and builds diagnostic and production ent
         assert.deepEqual(documents.sort(),['.vite','assets','manual-payment.html']);
         const manifest=JSON.parse(await readFile(join(demo,'dist/.vite/manifest.json'),'utf8'));
         assert.equal(manifest['manual-payment.html'].isEntry,true);
+      }else if(mode==='billing-first-payment'){
+        assert.deepEqual(documents.sort(),['assets','billing-first-payment.html','health']);
+        assert.equal(await readFile(join(demo,'dist/health'),'utf8'),'ok\n');
+      }else if(mode==='billing-failed-renewal'){
+        assert.deepEqual(documents.sort(),['assets','billing-failed-renewal.html','health']);
+        assert.equal(await readFile(join(demo,'dist/health'),'utf8'),'ok\n');
+        const html=await readFile(join(demo,'dist/billing-failed-renewal.html'),'utf8');
+        const entry=html.match(/<script[^>]*src="\/(assets\/[\w.-]+\.js)"/)?.[1];
+        assert.ok(entry);assert.ok((await readFile(join(demo,'dist',entry))).length>0);
       }else if(mode==='form-diagnostic'){
         assert.ok(documents.includes('form-load-manual.html'));assert.ok(documents.includes('form-load-diagnostic.html'));
-        assert.equal(documents.includes('index.html'),false);
+        assert.equal(documents.includes('index.html'),false);assert.equal(documents.includes('subscription-return.html'),false);
       }else{
-        assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));
+        assert.ok(documents.includes('index.html'));assert.ok(documents.includes('payment-return.html'));assert.ok(documents.includes('subscription-return.html'));
         assert.equal(documents.includes('form-load-manual.html'),false);assert.equal(documents.includes('form-load-diagnostic.html'),false);
+      }
+      if(mode!=='billing-first-payment')assert.equal(documents.includes('billing-first-payment.html'),false);
+      if(mode!=='billing-failed-renewal')assert.equal(documents.includes('billing-failed-renewal.html'),false);
+      if(mode!=='billing-first-payment'&&mode!=='billing-failed-renewal'){
+        assert.equal(documents.includes('health'),false);
       }
       for(const name of await readdir(join(demo,'dist/assets'))){
         const code=await readFile(join(demo,'dist/assets',name),'utf8');
         assert.doesNotMatch(code,/node:http|node:crypto|createManualFormGateway|PAYMENT_STRIPE_SANDBOX_SECRET_KEY/);
+        if(mode!=='billing-first-payment')assert.doesNotMatch(code,/__firstPaymentConfigure|__firstPaymentPrepare/);
         if(mode==='production')assert.doesNotMatch(code,/manual-session|manual-observation|Ручная проверка|__formLoadDiagnostic|__formDiagnosticSession/);
       }
     });
