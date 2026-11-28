@@ -26,6 +26,6 @@ public class TrialEligibilityPersistenceAdapter implements TrialEligibilityStore
             where subscription_trial_eligibility.consumed_at is null and (subscription_trial_eligibility.reserved_by_operation is null or subscription_trial_eligibility.reserved_by_operation=excluded.reserved_by_operation)
             """,site.value(),customer.value(),product.value(),operation)==1;
     }
-    public void consume(UUID operation,Instant at){Objects.requireNonNull(operation);Objects.requireNonNull(at);jdbc.update("update subscription_trial_eligibility set consumed_at=?,version=version+1 where reserved_by_operation=? and consumed_at is null",SubscriptionPersistenceValues.time(at),operation);}
+    public void consume(UUID operation,Instant at){Objects.requireNonNull(operation);Objects.requireNonNull(at);jdbc.update("update subscription_trial_eligibility set consumed_at=?,version=version+1 where reserved_by_operation=? and consumed_at is null",SubscriptionPersistenceValues.auditTime(at),operation);}
     public void releaseConfirmedFailure(UUID operation){Objects.requireNonNull(operation);jdbc.update("update subscription_trial_eligibility set reserved_by_operation=null,version=version+1 where reserved_by_operation=? and consumed_at is null",operation);}
 }

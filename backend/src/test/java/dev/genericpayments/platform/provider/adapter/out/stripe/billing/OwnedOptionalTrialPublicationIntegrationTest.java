@@ -198,6 +198,8 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
         "confirmation wrong reply","confirmation wrong charge","confirmation late substituted allocation"})
     void setupAndExplicitResumeKeepTheOriginalLedgerAndNeverReplay(String fault) throws Exception {
         var a=start(true,CASH_RUN);
+        // The SQL proof orders the pause receipt and subsequent setup even when both share a clock instant.
+        TestClock.set(operationalClock.instant().plusSeconds(1).truncatedTo(ChronoUnit.MICROS).plusNanos(900));
         callbacks.configure(site.value(),"http://127.0.0.1:8081/callback",true);
         var original=new OwnedOptionalTrialCreate.Created("sub_owned","si_owned","in_trial",a.frozen());
         OwnedOptionalTrialSdkReplies.observation(http,a,"");
