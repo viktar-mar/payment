@@ -234,7 +234,7 @@ The manager reserves a connected visible host, waits for the Payment Element's a
 
 The backend proves exact return-URL allowlist membership, original Account/Customer and Site policy/configuration compatibility. Its constrained Portal supports invoice history and policy-compatible period-end cancellation; customer-wide method update and arbitrary subscription changes stay disabled. The manager removes the Fake return markers before requesting navigation and assigns only the validated result. Portal URLs are short-lived in-memory navigation capabilities. The demo's separate subscription return page clears query/fragment before module boot, sets no-referrer and offers an explicit authenticated subscription-list read. Return data never confirms payment, cancellation or access.
 
-These behaviors have offline/synthetic browser and SDK consumer coverage. Actual Billing Elements, Portal, native test-clock and manual 3DS acceptance remain **NOT_RUN**; see the [Stage 5B acceptance matrix](../../docs/stage-5b-acceptance.md).
+Offline browser and SDK consumer tests cover these behaviors. Stage 5B also passed Stripe Sandbox acceptance for Billing Elements, Customer Portal return, Test Clock advances and manual 3DS. [Stage 5B acceptance matrix](../../docs/stage-5b-acceptance.md)
 
 ## Subscription manager Web Component
 
