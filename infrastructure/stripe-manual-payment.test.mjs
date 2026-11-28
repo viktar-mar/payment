@@ -166,6 +166,8 @@ test('inert imports neither read private credentials nor launch any subprocess o
       'stripe-billing-acceptance-options.mjs','stripe-billing-limits.mjs',
       'stripe-billing-first-payment-options.mjs','stripe-billing-first-renewal-options.mjs','stripe-billing-failed-renewal-options.mjs',
       'stripe-billing-first-payment-browser-diagnostic.mjs',
+      'stripe-billing-optional-trial-options.mjs','stripe-billing-optional-trial-source.mjs',
+      'stripe-billing-required-trial-evidence.mjs','stripe-billing-provision.mjs',
     ].map(name=>new URL('infrastructure/'+name,root).href));
     const readSource=fs.readFileSync;
     registerHooks({load(url,context,nextLoad){
@@ -181,13 +183,10 @@ test('inert imports neither read private credentials nor launch any subprocess o
     await import('./infrastructure/stripe-billing-first-payment-options.mjs');
     // Negative probes never read the filesystem, including an otherwise allowed
     // source path. No private path is exempted by suffix or repository prefix.
-    for(const file of ['infrastructure/.env','infrastructure/stripe-sandbox.env.local','infrastructure/stripe-sandbox-user-env.mjs',
+    for(const file of [...sources,'infrastructure/.env','infrastructure/stripe-sandbox.env.local',
       'infrastructure/fixtures/customer-issuer-private.jwks.json',
       'test-results/stripe-sandbox/synthetic/state.json','docs/local-development.md',
-      'infrastructure/stripe-manual-payment.mjs','infrastructure/stripe-billing-acceptance-options.mjs',
-      'infrastructure/stripe-billing-limits.mjs','infrastructure/stripe-billing-first-payment-options.mjs',
-      'infrastructure/stripe-billing-failed-renewal-options.mjs',
-      'infrastructure/stripe-billing-first-payment-browser-diagnostic.mjs']){
+      'infrastructure/stripe-billing-required-trial-proof.sql','infrastructure/stripe-billing-required-trial-seed.sql']){
       assert.throws(()=>fs.readFileSync(new URL(file,root)),/private boundary touched/);
       await assert.rejects(async()=>fsp.readFile(new URL(file,root)),/private boundary touched/);
     }
