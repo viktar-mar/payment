@@ -1353,6 +1353,66 @@ public class StripeBillingSteps {
         assertPlanTransitionCallback(SubscriptionEvent.Type.CHANGE_SCHEDULED);
     }
 
+    @When("the source period ends and the owned schedule bills its first target month")
+    public void firstScheduledRenewal() {
+        TestClock.set(end.minusSeconds(1));
+        assertOriginalPlanSettlement();
+        TestClock.set(end);
+        authenticate();
+        var targetEnd=end.atOffset(ZoneOffset.UTC).plusMonths(1).toInstant();
+        var targetRefs=new BillingRefs("sub_billing","si_billing","price_downgrade","prod_billing");
+        var renewal=invoice("scheduled","subscription_cycle",end,targetEnd,"CASH",targetRefs);
+        for(var name:List.of("amount_due","amount_paid","total","subtotal"))renewal.invoice().addProperty(name,1500);
+        renewal.line().addProperty("amount",1500);
+        renewal.line().remove("subscription"); // Current Stripe API supplies the nested parent association.
+        for(var name:List.of("amount_paid","amount_requested"))renewal.allocation().addProperty(name,1500);
+        for(var name:List.of("amount","amount_received"))renewal.intent().addProperty(name,1500);
+        for(var name:List.of("amount","amount_captured"))renewal.charge().addProperty(name,1500);
+        invoices.add(renewal);
+        setPeriod(end,targetEnd);
+        var target=remote.getAsJsonObject("items").getAsJsonArray("data").get(0).getAsJsonObject().getAsJsonObject("price");
+        target.addProperty("id","price_downgrade");
+        target.addProperty("unit_amount",1500);
+        target.getAsJsonObject("metadata").addProperty("local_price_id",downgradePrice.value().toString());
+        reconcile();
+    }
+
+    @Then("only the settled target month changes the existing subscription entitlement")
+    public void settledScheduledRenewal() {
+        var after=subscription();
+        var targetEnd=end.atOffset(ZoneOffset.UTC).plusMonths(1).toInstant();
+        assertThat(after.providerReference()).isEqualTo("sub_billing");
+        assertThat(after.currentPeriod()).isEqualTo(new Subscription.Period(end,targetEnd));
+        assertThat(after.paidThrough()).isEqualTo(targetEnd);
+        assertThat(after.billingPrice().priceId()).isEqualTo(downgradePrice);
+        assertThat(after.entitledPrice().priceId()).isEqualTo(downgradePrice);
+        assertThat(after.pendingChange()).isNull();
+        assertThat(access().reason()).isEqualTo(AccessDecision.Reason.PAID);
+        assertThat(cash()).isEqualTo(2);
+        assertThat(publishedCash("in_initial","pi_initial",BillingRecord.Kind.INITIAL,SubscriptionEvent.Source.PROVIDER_WEBHOOK))
+            .isEqualTo(originalPlanCash);
+        assertThat(jdbc.queryForObject("""
+            select count(*) from subscription_billing_records b
+              join payments p on p.billing_record_id=b.id and p.subscription_id=b.subscription_id
+              join payment_events pe on pe.payment_id=p.id and pe.event_type='PAYMENT_SUCCEEDED'
+              join outbox_events po on po.id=pe.id and po.callback_type='payment.succeeded'
+             where b.subscription_id=? and b.provider_invoice_reference='in_scheduled' and b.billed_price_id=?
+               and b.kind='RENEWAL' and b.settlement='CONFIRMED_CASH' and b.amount_due_minor=1500
+               and p.status='SUCCEEDED' and p.amount_minor=1500 and p.provider_payment_reference='pi_scheduled'
+               and b.period_start=? and b.period_end=?
+            """,Long.class,created.subscriptionId(),downgradePrice.value(),Timestamp.from(end),Timestamp.from(targetEnd))).isOne();
+        assertThat(jdbc.queryForList("""
+            select e.event_type from subscription_events e join subscription_billing_records b on b.id=e.billing_record_id
+              join outbox_events o on o.id=e.id and o.callback_type='subscription.updated'
+             where b.subscription_id=? and b.provider_invoice_reference='in_scheduled'
+             order by e.sequence_number
+            """,String.class,created.subscriptionId())).containsExactly("CHANGE_APPLIED","PERIOD_PAID");
+        var stable=financialEvidence();
+        reconcile();
+        assertThat(financialEvidence()).isEqualTo(stable);
+        deliverCallbacks(Set.of(created.subscriptionId()),bean(Clock.class));
+    }
+
     @When("the customer clears the original Stripe schedule before the paid boundary")
     public void clearScheduledDowngrade() {
         readHead();
@@ -1448,9 +1508,12 @@ public class StripeBillingSteps {
         evidence=financialEvidence();portalNavigation="https://billing.stripe.com/p/session?secret=test_"+UUID.randomUUID().toString().replace("-","");
         identity();respond("GET","/v1/customers/cus_billing",remoteCustomer);respondPage("/v1/subscriptions",List.of(remote));respondPage("/v1/invoices",List.of(invoices.getFirst().invoice()));
         var configuration=json("""
-            {"id":"bpc_billing","object":"billing_portal.configuration","active":true,"livemode":false,"default_return_url":"%s",
+            {"id":"bpc_billing","object":"billing_portal.configuration","active":true,"is_default":false,"livemode":false,"default_return_url":"%s",
              "login_page":{"enabled":false,"url":null},"features":{"invoice_history":{"enabled":true},"customer_update":{"enabled":false,"allowed_updates":[]},"payment_method_update":{"enabled":false},"subscription_update":{"enabled":false,"default_allowed_updates":[],"products":[]},"subscription_cancel":{"enabled":true,"mode":"at_period_end","proration_behavior":"none","cancellation_reason":{"enabled":false,"options":[]}}}}
             """.formatted(portalReturn));
+        respondPage("/v1/billing_portal/configurations",List.of(json("""
+            {"id":"bpc_default","object":"billing_portal.configuration","active":true,"is_default":true,"livemode":false}
+            """)));
         http.enqueue("POST","/v1/billing_portal/configurations",200,call->{long at=dispatchSecond(call);configuration.addProperty("created",at);configuration.addProperty("updated",at);return configuration.toString();});
         http.enqueue("GET","/v1/billing_portal/configurations/bpc_billing",200,ignored->configuration.toString());
         http.enqueue("POST","/v1/billing_portal/sessions",200,call->{

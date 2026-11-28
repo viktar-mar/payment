@@ -42,11 +42,19 @@ public final class StripeBillingMutationAdapter {
     private final StripeBillingOwnership ownership;private final StripeBillingBindingPort bindings;
     private final SubscriptionPlanProofStore proofs;private final StripeCredentialResolver credentials;private final StripeClientFactory clients;
     private final PaymentAccountVerificationPort verification;private final Clock clock;
+    private final StripeBillingScheduleClock scheduleClock;
     public StripeBillingMutationAdapter(StripeBillingOwnership ownership,StripeBillingBindingPort bindings,SubscriptionPlanProofStore proofs,
         StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,Clock clock){
+        this(ownership,bindings,proofs,credentials,clients,verification,clock,null);
+    }
+    StripeBillingMutationAdapter(StripeBillingOwnership ownership,StripeBillingBindingPort bindings,SubscriptionPlanProofStore proofs,
+        StripeCredentialResolver credentials,StripeClientFactory clients,PaymentAccountVerificationPort verification,Clock clock,
+        StripeBillingScheduleClock scheduleClock){
+        this.scheduleClock=scheduleClock;
         this.ownership=ownership;this.bindings=bindings;this.proofs=proofs;this.credentials=credentials;this.clients=clients;this.verification=verification;this.clock=clock;
     }
     public ProviderQuote preview(QuoteRequest request){
+        if(scheduleClock!=null&&request.timing()!=ChangeTiming.NEXT_PERIOD)throw mismatch();
         var c=request.command();var s=ownership.owned(c.account(),c.operation().subscriptionId());ownership.prices(c.account(),s);
         if(!Objects.equals(c.providerSubscriptionReference(),s.providerReference())||!s.billingPrice().equals(c.current())||!request.target().equals(c.target())||!s.billingPrice().equals(s.entitledPrice())||s.debt()!=null||s.cancellation()!=null||s.billingStatus()!=dev.genericpayments.platform.subscriptions.domain.Subscription.Status.ACTIVE||s.currentPeriod()==null||!s.currentPeriod().end().equals(s.paidThrough()))throw mismatch();
         var target=ownership.price(c.account(),s,request.target());var source=ownership.price(c.account(),s,s.billingPrice());
@@ -63,21 +71,21 @@ public final class StripeBillingMutationAdapter {
         try{
             var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());
             if(!customer.providerReference().equals(remoteCustomer.getId())||!"customer".equals(remoteCustomer.getObject())||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
-            var remote=client.v1().subscriptions().retrieve(s.providerReference());requireCurrentRemote(remote,s,customer,source);
+            var remote=client.v1().subscriptions().retrieve(s.providerReference());requirePlanHead(c,remoteCustomer,remote,s,customer,source);
             if(!"active".equals(remote.getStatus())||remote.getSchedule()!=null||remote.getPendingUpdate()!=null||remote.getCancelAt()!=null||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd()))throw mismatch();
             var item=remote.getItems().getData().getFirst();var period=new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(Instant.ofEpochSecond(item.getCurrentPeriodStart()),Instant.ofEpochSecond(item.getCurrentPeriodEnd()));
             if(!period.equals(s.currentPeriod())||saved!=null&&!saved.item().equals(item.getId()))throw mismatch();
             List<Line> lines=List.of();long due=0;
             if(request.timing()==ChangeTiming.IMMEDIATE){
                 if(s.billingPrice().interval()!=request.target().interval())throw mismatch();
-                var invoice=client.v1().invoices().createPreview(InvoiceCreatePreviewParams.builder().setCustomer(customer.providerReference()).setSubscription(s.providerReference())
+                var invoice=client.v1().invoices().createPreview(InvoiceCreatePreviewParams.builder().addExpand("amount_paid_off_stripe").setCustomer(customer.providerReference()).setSubscription(s.providerReference())
                     .setSubscriptionDetails(InvoiceCreatePreviewParams.SubscriptionDetails.builder().setProrationDate(anchor.getEpochSecond())
                         .setProrationBehavior(InvoiceCreatePreviewParams.SubscriptionDetails.ProrationBehavior.ALWAYS_INVOICE)
                         .addItem(InvoiceCreatePreviewParams.SubscriptionDetails.Item.builder().setId(item.getId()).setPrice(target.providerPriceReference()).setQuantity(1L).build()).build()).build());
                 if(!customer.providerReference().equals(invoice.getCustomer())||!Boolean.FALSE.equals(invoice.getLivemode())||!"invoice".equals(invoice.getObject())||invoice.getLines()==null||!Boolean.FALSE.equals(invoice.getLines().getHasMore()))throw mismatch();
                 lines=prorationLines(invoice.getLines().getData(),s.providerReference(),item.getId(),source.providerPriceReference(),target.providerPriceReference(),target.providerProductReference(),new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(anchor,s.paidThrough()),s.billingPrice().regularAmount().currency(),false);
                 due=Math.addExact(lines.get(0).amount(),lines.get(1).amount());
-                if(due<0||!Objects.equals(invoice.getAmountDue(),due)||!Objects.equals(invoice.getTotal(),due)||!Objects.equals(invoice.getSubtotal(),due)||!noAdjustments(invoice))throw mismatch();
+                if(due<0||!Objects.equals(invoice.getAmountDue(),due)||!Objects.equals(invoice.getTotal(),due)||!Objects.equals(invoice.getSubtotal(),due)||!noAdjustments(invoice,true))throw mismatch();
             }
             var quote=new Quote(saved==null?UUID.randomUUID():saved.id(),c.account().id(),s.siteId(),s.customerId(),s.id(),s.providerReference(),customer.providerReference(),s.billingPrice(),s.entitledPrice(),request.target(),source.providerPriceReference(),target.providerPriceReference(),target.providerProductReference(),item.getId(),period,s.paidThrough(),saved==null?s.revision():saved.revision(),c.operation().policyVersion(),request.timing(),anchor,expires,due,lines);
             StripeBillingSnapshotMapper.requireCreditedFunding(client,new StripeBillingSnapshotMapper.Ownership(c.account(),s,customer,ownership.prices(c.account(),s),null,null,ownership.planHistory(c.account(),s,proofs)),remote,quote,clock.instant());
@@ -114,10 +122,10 @@ public final class StripeBillingMutationAdapter {
             if(!s.providerReference().equals(response.getId())||!Boolean.FALSE.equals(response.getLivemode())||!q.customerReference().equals(response.getCustomer())||!q.period().equals(itemPeriod(response)))throw mismatch();
             String invoice=response.getLatestInvoice();if(invoice==null||!invoice.matches("in_[A-Za-z0-9]{1,252}"))throw mismatch();
             Long expiry=null;var pending=response.getPendingUpdate();if(pending!=null){if(pending.getExpiresAt()==null||pending.getExpiresAt()<=step.firstDispatchedAt().getEpochSecond()||pending.getSubscriptionItems()==null||pending.getSubscriptionItems().size()!=1)throw mismatch();var item=pending.getSubscriptionItems().getFirst();if(!q.item().equals(item.getId())||!Objects.equals(1L,item.getQuantity())||item.getPrice()==null||!q.targetPrice().equals(item.getPrice().getId()))throw mismatch();expiry=pending.getExpiresAt();}
-            var actual=client.v1().invoices().retrieve(invoice);requireInvoice(actual,q,invoice);
+            var actual=client.v1().invoices().retrieve(invoice,expandedPlanInvoice(),null);requireInvoice(actual,q,invoice);
             if(!StripeBillingOwnership.inWindow(actual.getCreated(),step))throw mismatch();
             var page=client.v1().invoices().lineItems().list(invoice,InvoiceLineItemListParams.builder().setLimit(10L).build());
-            if(page==null||!"list".equals(page.getObject())||!Boolean.FALSE.equals(page.getHasMore())||page.getData()==null||page.getData().stream().anyMatch(l->!invoice.equals(l.getInvoice())||!s.providerReference().equals(l.getSubscription())))throw mismatch();
+            if(page==null||!"list".equals(page.getObject())||!Boolean.FALSE.equals(page.getHasMore())||page.getData()==null||page.getData().stream().anyMatch(l->!invoice.equals(l.getInvoice())))throw mismatch();
             if(!q.lines().equals(prorationLines(page.getData(),q.subscriptionReference(),q.item(),q.sourcePrice(),q.targetPrice(),q.product(),new dev.genericpayments.platform.subscriptions.domain.Subscription.Period(q.anchor(),q.paidThrough()),q.target().regularAmount().currency(),true)))throw mismatch();
             var fresh=ownership.lookupOperation(new Lookup(c.account(),s.id(),s.providerReference(),o.providerOperationKey()));if(!fresh.equals(o))throw mismatch();
             var credit=page.getData().stream().filter(l->q.sourcePrice().equals(l.getPricing().getPriceDetails().getPrice())).findFirst().orElseThrow();
@@ -455,13 +463,23 @@ public final class StripeBillingMutationAdapter {
             ?WithdrawalWire.match(a,step.fingerprint(),legacyFp,receipt.observed()!=null)==null
             :!step.fingerprint().equals(legacyFp))throw mismatch();
     }
+    private void requirePlanHead(Command command,com.stripe.model.Customer customer,com.stripe.model.Subscription remote,
+            dev.genericpayments.platform.subscriptions.domain.Subscription local,StripeBillingBindingPort.CustomerBinding binding,
+            StripeBillingSnapshotMapper.PublishedPrice price){
+        if(scheduleClock==null){requireCurrentRemote(remote,local,binding,price);return;}
+        String expected=scheduleClock.requireScope(command.account(),local,binding);
+        if(!expected.equals(customer.getTestClock()))throw mismatch();
+        scheduleClock.requireRemote(remote,expected);
+        StripeBillingOwnership.requireRemoteStructure(remote,binding.providerReference(),price);
+        if(!scheduleClock.receipt().itemReference().equals(remote.getItems().getData().getFirst().getId()))throw mismatch();
+    }
     private void readScheduleSubscription(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,Quote q,StripeClient client,String allowedSchedule)throws StripeException{
         readScheduleSubscription(c,s,q,client,allowedSchedule,false);
     }
     private void readScheduleSubscription(Command c,dev.genericpayments.platform.subscriptions.domain.Subscription s,Quote q,StripeClient client,String allowedSchedule,boolean allowReleased)throws StripeException{
         verification.verify(c.account());var customer=bindings.findCustomer(c.account().id(),s.siteId(),s.customerId()).orElseThrow(StripeBillingOwnership::mismatch);requireBinding(c.account(),s,customer);
         var remoteCustomer=client.v1().customers().retrieve(customer.providerReference());if(!q.customerReference().equals(remoteCustomer.getId())||!Boolean.FALSE.equals(remoteCustomer.getLivemode())||Boolean.TRUE.equals(remoteCustomer.getDeleted()))throw mismatch();
-        var remote=client.v1().subscriptions().retrieve(q.subscriptionReference());requireCurrentRemote(remote,s,customer,ownership.price(c.account(),s,q.source()));
+        var remote=client.v1().subscriptions().retrieve(q.subscriptionReference());requirePlanHead(c,remoteCustomer,remote,s,customer,ownership.price(c.account(),s,q.source()));
         if(!"active".equals(remote.getStatus())||!q.period().equals(itemPeriod(remote))||!q.item().equals(remote.getItems().getData().getFirst().getId())||remote.getPendingUpdate()!=null||remote.getCancelAt()!=null||Boolean.TRUE.equals(remote.getCancelAtPeriodEnd())||!"original-key-replay".equals(allowedSchedule)&&!Objects.equals(remote.getSchedule(),allowedSchedule)&&!(allowReleased&&remote.getSchedule()==null))throw mismatch();
     }
     public static String scheduleFingerprint(dev.genericpayments.platform.paymentaccounts.domain.PaymentAccount a,SubscriptionOperation o,Quote q,SubscriptionPlanProofStore.Schedule binding,ProviderOperation.Kind kind){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,a,"SCHEDULE_V1",kind.name(),o.id().toString(),o.providerOperationKey(),o.fingerprint(),q.toString(),binding==null?null:binding.reference(),binding==null?null:Long.toString(binding.phaseStart()),binding==null?null:binding.creationStep().toString(),binding==null?null:binding.sourcePhase().toString(),"end:release","top_proration:none","target_proration:none","target_collection:inherit_auto","quantity:1","duration_count:1");}
@@ -525,7 +543,7 @@ public final class StripeBillingMutationAdapter {
         for(var line:input){
             if(line==null||!"line_item".equals(line.getObject())||!Boolean.FALSE.equals(line.getLivemode())||!Objects.equals(1L,line.getQuantity())||!currency.equalsIgnoreCase(line.getCurrency())||line.getAmount()==null||line.getPeriod()==null||!period.start().equals(Instant.ofEpochSecond(line.getPeriod().getStart()))||!period.end().equals(Instant.ofEpochSecond(line.getPeriod().getEnd()))||line.getParent()==null||!"subscription_item_details".equals(line.getParent().getType())||line.getPricing()==null||!"price_details".equals(line.getPricing().getType())||!empty(line.getDiscountAmounts())||!empty(line.getPretaxCreditAmounts())||nonempty(line.getTaxes())||nonempty(line.getDiscounts()))throw mismatch();
             var detail=line.getParent().getSubscriptionItemDetails();var pricing=line.getPricing().getPriceDetails();
-            if(detail==null||!subscription.equals(detail.getSubscription())||!item.equals(detail.getSubscriptionItem())||!Boolean.TRUE.equals(detail.getProration())||pricing==null||!product.equals(pricing.getProduct())||!(source.equals(pricing.getPrice())||target.equals(pricing.getPrice())))throw mismatch();
+            if(line.getSubscription()!=null&&!subscription.equals(line.getSubscription())||detail==null||!subscription.equals(detail.getSubscription())||!item.equals(detail.getSubscriptionItem())||!Boolean.TRUE.equals(detail.getProration())||pricing==null||!product.equals(pricing.getProduct())||!(source.equals(pricing.getPrice())||target.equals(pricing.getPrice())))throw mismatch();
             var credited=detail.getProrationDetails()==null?null:detail.getProrationDetails().getCreditedItems();
             result.add(new Line(pricing.getPrice(),product,item,line.getAmount(),period,credited==null?null:credited.getInvoice(),credited==null?List.of():credited.getInvoiceLineItems()));
         }
@@ -535,7 +553,16 @@ public final class StripeBillingMutationAdapter {
         var credit=credits.getFirst();if((credit.creditedInvoice()==null)!=credit.creditedLines().isEmpty()||credit.creditedLines().size()>1)throw mismatch();
         return List.copyOf(result);
     }
-    static boolean noAdjustments(Invoice i){return zeros(i.getAmountPaidOffStripe(),i.getAmountOverpaid(),i.getStartingBalance(),i.getEndingBalance(),i.getPrePaymentCreditNotesAmount(),i.getPostPaymentCreditNotesAmount())&&noNonAmountAdjustments(i);}
+    static com.stripe.param.InvoiceRetrieveParams expandedPlanInvoice() {
+        return com.stripe.param.InvoiceRetrieveParams.builder().addExpand("amount_paid_off_stripe").build();
+    }
+    static boolean noAdjustments(Invoice invoice) { return noAdjustments(invoice,false); }
+    private static boolean noAdjustments(Invoice invoice, boolean preview) {
+        return zeros(invoice.getAmountPaidOffStripe(),invoice.getAmountOverpaid(),invoice.getStartingBalance(),
+                invoice.getPrePaymentCreditNotesAmount(),invoice.getPostPaymentCreditNotesAmount())
+            && (Objects.equals(invoice.getEndingBalance(),0L) || preview && invoice.getEndingBalance()==null)
+            && noNonAmountAdjustments(invoice);
+    }
     static boolean noNonAmountAdjustments(Invoice i){return empty(i.getDiscounts())&&empty(i.getTotalDiscountAmounts())&&empty(i.getTotalPretaxCreditAmounts())&&empty(i.getTotalTaxes())
         &&(i.getAmountShipping()==null||i.getAmountShipping()==0)&&i.getShippingCost()==null&&i.getShippingDetails()==null
         &&!nonempty(i.getDefaultTaxRates())&&(i.getAutomaticTax()==null||!Boolean.TRUE.equals(i.getAutomaticTax().getEnabled()))

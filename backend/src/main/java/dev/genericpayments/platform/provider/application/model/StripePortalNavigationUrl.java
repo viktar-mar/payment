@@ -5,6 +5,6 @@ public final class StripePortalNavigationUrl {
     private StripePortalNavigationUrl() {}
     public static boolean valid(String value){
         return value!=null&&value.length()<=2048&&value.chars().noneMatch(Character::isWhitespace)
-            &&value.matches("https://billing\\.stripe\\.com/p/session\\?secret=test_[A-Za-z0-9_-]+");
+            &&value.matches("https://billing\\.stripe\\.com/p/session(?:/flow)?\\?secret=test_[A-Za-z0-9_-]+");
     }
 }

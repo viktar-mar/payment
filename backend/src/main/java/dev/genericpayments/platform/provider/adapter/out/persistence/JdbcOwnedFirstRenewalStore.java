@@ -227,20 +227,22 @@ public class JdbcOwnedFirstRenewalStore implements OwnedFirstRenewalStore {
                 ||!readClaimRow(admission,ready).filter(paid.claim()::equals).isPresent()
                 ||!boundaryRow(admission).filter(paid.boundary()::equals).isPresent())throw unavailable();
         requireBoundary(admission,paid.boundary(),readClaimRow(admission,paid.boundary().ready()).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable));
-        // The IDs and revision come exclusively from actual projected rows, never the caller.
-        var rows=jdbc.query("select * from owned_first_renewal_projected(?)",(r,n)->new Publication(admission.id(),ready,paid.boundary(),
-            r.getObject("renewal_bill",UUID.class),r.getObject("renewal_payment",UUID.class),r.getLong("projected_revision"),Instant.now().truncatedTo(ChronoUnit.MICROS)),admission.id());
-        if(rows.size()!=1)throw unavailable();var publication=rows.getFirst();
         var renewal=paid.snapshot().invoices().stream().filter(i->i.kind()==dev.genericpayments.platform.subscriptions.domain.BillingRecord.Kind.RENEWAL).toList();
         if(renewal.size()!=1||renewal.getFirst().cashObjects().size()!=1
-                ||!renewal.getFirst().reference().equals(paid.boundary().renewalInvoice())||!renewal.getFirst().period().equals(paid.boundary().period())
-                ||!Boolean.TRUE.equals(jdbc.queryForObject("select exists(select 1 from payments where id=? and provider_payment_reference=?)",Boolean.class,
-                    publication.payment(),renewal.getFirst().cashObjects().getFirst().reference())))throw unavailable();
-        jdbc.update("""
+                ||!renewal.getFirst().reference().equals(paid.boundary().renewalInvoice())||!renewal.getFirst().period().equals(paid.boundary().period()))throw unavailable();
+        // The database observes the publication time when it writes the exact projected cash receipt.
+        var rows=jdbc.query("""
             insert into stripe_billing_first_renewal_publications(admission_id,ready_id,boundary_id,renewal_bill,renewal_payment,projected_revision,published_at,graph_accepted_at)
-            values(?,?,?,?,?,?,?,?)
-            """,admission.id(),ready.id(),paid.boundary().id(),publication.bill(),publication.payment(),publication.projectedRevision(),
-            Timestamp.from(publication.publishedAt()),Timestamp.from(paid.graphAcceptedAt()));
+            select ?,?,?,s.renewal_bill,s.renewal_payment,s.projected_revision,clock_timestamp(),?
+              from owned_first_renewal_projected(?) s
+              join payments p on p.id=s.renewal_payment and p.provider_payment_reference=?
+            returning renewal_bill,renewal_payment,projected_revision,published_at
+            """,(r,n)->new Publication(admission.id(),ready,paid.boundary(),r.getObject("renewal_bill",UUID.class),
+                r.getObject("renewal_payment",UUID.class),r.getLong("projected_revision"),r.getTimestamp("published_at").toInstant()),
+            admission.id(),ready.id(),paid.boundary().id(),Timestamp.from(paid.graphAcceptedAt()),admission.id(),
+            renewal.getFirst().cashObjects().getFirst().reference());
+        if(rows.size()!=1)throw unavailable();
+        var publication=rows.getFirst();
         return publicationInTransaction(admission).filter(publication::equals).orElseThrow(JdbcOwnedFirstRenewalStore::unavailable);
     }
     @Transactional(propagation=Propagation.MANDATORY,readOnly=true)

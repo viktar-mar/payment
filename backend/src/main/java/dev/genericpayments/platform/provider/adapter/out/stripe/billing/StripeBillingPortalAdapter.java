@@ -63,16 +63,21 @@ public class StripeBillingPortalAdapter {
                 var expiry=clock.instant().truncatedTo(java.time.temporal.ChronoUnit.MICROS).plusSeconds(300);
                 proofs.record(intent,step.id(),response.getId(),expiry);
                 return new PortalNavigation(response.getUrl(),expiry,false);
-            }catch(StripeException|RuntimeException uncertain){retainUnknown(step);throw unavailable();}
-        }catch(StripeException uncertain){throw unavailable();}
+            }catch(StripeException|RuntimeException uncertain){retainUnknown(step);throw unavailable(uncertain);}
+        }catch(StripeException uncertain){throw unavailable(uncertain);}
     }
     private Configuration configuration(StripeClient client,Scope scope)throws StripeException{
         var id=UUID.randomUUID();var digest=policyDigest(scope.policy());var key="portal_config_"+id;
         var proposed=new Configuration(id,scope.account().id(),scope.policy().siteId(),scope.policy().version(),digest,scope.operation().id(),key,
             configFingerprint(scope,id,scope.operation().id(),key,digest),null,null);
         var intent=proofs.intent(proposed);
-        if(!intent.account().equals(scope.account().id())||!intent.site().equals(scope.policy().siteId())||intent.policy()!=scope.policy().version()||!intent.digest().equals(digest)
-            ||!intent.fingerprint().equals(configFingerprint(scope,intent.id(),intent.owner(),intent.key(),digest)))throw unavailable();
+        if(!intent.account().equals(scope.account().id())||!intent.site().equals(scope.policy().siteId())||intent.policy()!=scope.policy().version()||!intent.digest().equals(digest))throw unavailable();
+        boolean currentWire=intent.fingerprint().equals(configFingerprint(scope,intent.id(),intent.owner(),intent.key(),digest));
+        if(!currentWire){
+            // V1 used a different POST body. Its immutable key can only recover a known object by GET.
+            if(!intent.fingerprint().equals(configFingerprint(scope,intent.id(),intent.owner(),intent.key(),digest,"PORTAL_CONFIG_V1"))
+                ||steps.find(scope.account().id(),intent.key()).filter(s->s.status()==ProviderOperation.Status.ACKNOWLEDGED).isEmpty())throw unavailable();
+        }
         var reserved=steps.reserve(scope.account(),ProviderOperation.Kind.PORTAL_CONFIGURATION_CREATE,intent.id(),intent.key(),intent.fingerprint());
         if(reserved.status()==ProviderOperation.Status.ACKNOWLEDGED){
             if(intent.reference()!=null&&(!intent.reference().equals(reserved.providerReference())||!Objects.equals(intent.step(),reserved.id())))throw unavailable();
@@ -81,16 +86,35 @@ public class StripeBillingPortalAdapter {
             recognize(client.v1().billingPortal().configurations().retrieve(bound.reference()),bound,scope);
             return proofs.bind(intent,reserved.id(),reserved.providerReference());
         }
-        if(intent.reference()!=null)throw unavailable();
+        if(!currentWire||intent.reference()!=null)throw unavailable();
+        String accountDefault=requireAccountDefault(client);
         var owner=UUID.randomUUID().toString();var step=steps.claim(reserved.id(),owner,clock.instant(),Duration.ofSeconds(60)).orElseThrow(StripeBillingPortalAdapter::unavailable);
         try{
             proofs.authorize(scope);var original=new ProviderOperationGuard().requireDispatch(step,scope.account(),intent.fingerprint(),clock.instant());
             var response=client.v1().billingPortal().configurations().create(configurationParams(scope),RequestOptions.builder().setIdempotencyKey(original).build());
-            if(!inWindow(response.getCreated(),step)||response.getCreated()>clock.instant().getEpochSecond())throw unavailable();
+            if(accountDefault.equals(response.getId())||!inWindow(response.getCreated(),step)||response.getCreated()>clock.instant().getEpochSecond())throw unavailable();
             var bound=new Configuration(intent.id(),intent.account(),intent.site(),intent.policy(),intent.digest(),intent.owner(),intent.key(),intent.fingerprint(),response.getId(),step.id());
             recognize(response,bound,scope);steps.acknowledge(step.id(),owner,step.version(),response.getId());
             return proofs.bind(intent,step.id(),response.getId());
-        }catch(StripeException|RuntimeException uncertain){retainUnknown(step);throw unavailable();}
+        }catch(StripeException|RuntimeException uncertain){retainUnknown(step);throw unavailable(uncertain);}
+    }
+    /** Stripe makes the first configuration on an account its default. A site may only own a nondefault configuration. */
+    private static String requireAccountDefault(StripeClient client)throws StripeException{
+        var page=client.v1().billingPortal().configurations().list(ConfigurationListParams.builder().setIsDefault(true).setLimit(1L).build());
+        if(page==null||!"list".equals(page.getObject())||!Boolean.FALSE.equals(page.getHasMore())||page.getData()==null||page.getData().size()!=1)throw unavailable();
+        var envelope=raw(page);
+        flag(envelope,"has_more",false);
+        var rows=envelope.path("data");
+        if(!rows.isArray()||rows.size()!=1)throw unavailable();
+        var row=rows.get(0);
+        flag(row,"is_default",true);
+        flag(row,"active",true);
+        flag(row,"livemode",false);
+        var config=page.getData().getFirst();
+        if(config==null||!"billing_portal.configuration".equals(config.getObject())||!Boolean.FALSE.equals(config.getLivemode())
+            ||!Boolean.TRUE.equals(config.getIsDefault())||!Boolean.TRUE.equals(config.getActive())
+            ||config.getId()==null||!config.getId().matches("bpc_[A-Za-z0-9]{1,251}"))throw unavailable();
+        return config.getId();
     }
     private void retainUnknown(ProviderOperation step){
         var current=steps.findById(step.id()).orElseThrow(StripeBillingPortalAdapter::unavailable);
@@ -141,7 +165,8 @@ public class StripeBillingPortalAdapter {
         if(!complete)throw unavailable();
     }
     public static String policyDigest(SubscriptionPolicy p){return StripeBillingGrantTokens.hash(FEATURES+"|"+p.siteId()+"|"+p.version()+"|"+p.enabled()+"|"+p.graceDays()+"|"+p.allowImmediateCancellation()+"|"+p.portalEnabled()+"|"+p.deferUpgrades()+"|"+new TreeSet<>(p.portalReturnUrls()));}
-    public static String configFingerprint(Scope s,UUID id,UUID owner,String key,String digest){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,s.account(),"PORTAL_CONFIG_V1",id.toString(),owner.toString(),key,s.policy().siteId().value().toString(),Long.toString(s.policy().version()),digest);}
+    public static String configFingerprint(Scope s,UUID id,UUID owner,String key,String digest){return configFingerprint(s,id,owner,key,digest,"PORTAL_CONFIG_V2");}
+    private static String configFingerprint(Scope s,UUID id,UUID owner,String key,String digest,String wire){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,s.account(),wire,id.toString(),owner.toString(),key,s.policy().siteId().value().toString(),Long.toString(s.policy().version()),digest);}
     public static String sessionFingerprint(Scope s,Configuration c){return StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,s.account(),"PORTAL_SESSION_V1",s.operation().id().toString(),s.operation().providerOperationKey(),s.operation().fingerprint(),s.customer().id().toString(),s.customer().providerReference(),c.id().toString(),c.reference(),c.digest(),s.returnUrl(),"subscription_cancel:redirect",s.operation().providerReference(),s.members().stream().sorted(Comparator.comparing(Subscription::id)).map(Subscription::toString).toList().toString());}
     private static String defaultReturn(Scope s){return s.policy().portalReturnUrls().stream().sorted().findFirst().orElseThrow(StripeBillingPortalAdapter::unavailable);}
     private static ConfigurationCreateParams configurationParams(Scope s){
@@ -150,7 +175,7 @@ public class StripeBillingPortalAdapter {
                 .setCustomerUpdate(ConfigurationCreateParams.Features.CustomerUpdate.builder().setEnabled(false).build()).setPaymentMethodUpdate(ConfigurationCreateParams.Features.PaymentMethodUpdate.builder().setEnabled(false).build())
                 .setSubscriptionUpdate(ConfigurationCreateParams.Features.SubscriptionUpdate.builder().setEnabled(false).build())
                 .setSubscriptionCancel(ConfigurationCreateParams.Features.SubscriptionCancel.builder().setEnabled(true).setMode(ConfigurationCreateParams.Features.SubscriptionCancel.Mode.AT_PERIOD_END)
-                    .setProrationBehavior(ConfigurationCreateParams.Features.SubscriptionCancel.ProrationBehavior.NONE).setCancellationReason(ConfigurationCreateParams.Features.SubscriptionCancel.CancellationReason.builder().setEnabled(false).build()).build()).build()).build();
+                    .setProrationBehavior(ConfigurationCreateParams.Features.SubscriptionCancel.ProrationBehavior.NONE).build()).build()).build();
     }
     private static SessionCreateParams sessionParams(Scope s,Configuration c){return SessionCreateParams.builder().setCustomer(s.customer().providerReference()).setConfiguration(c.reference()).setReturnUrl(s.returnUrl())
         .setFlowData(SessionCreateParams.FlowData.builder().setType(SessionCreateParams.FlowData.Type.SUBSCRIPTION_CANCEL).setSubscriptionCancel(SessionCreateParams.FlowData.SubscriptionCancel.builder().setSubscription(s.operation().providerReference()).build())
@@ -161,31 +186,64 @@ public class StripeBillingPortalAdapter {
     private static void empty(JsonNode node,String field){var v=node.get(field);if(v!=null&&!v.isNull()&&(!v.isArray()||!v.isEmpty()))throw unavailable();}
     private static void recognize(com.stripe.model.billingportal.Configuration r,Configuration c,Scope s){
         if(r==null||c.reference()==null||!c.reference().matches("bpc_[A-Za-z0-9]{1,251}")||!c.reference().equals(r.getId())||!"billing_portal.configuration".equals(r.getObject())
-            ||!Boolean.TRUE.equals(r.getActive())||!Boolean.FALSE.equals(r.getLivemode())||!defaultReturn(s).equals(r.getDefaultReturnUrl()))throw unavailable();
-        var n=raw(r);var f=n.get("features");keys(f,"invoice_history","customer_update","payment_method_update","subscription_update","subscription_cancel");
+            ||!Boolean.FALSE.equals(r.getIsDefault())||!Boolean.TRUE.equals(r.getActive())||!Boolean.FALSE.equals(r.getLivemode())||!defaultReturn(s).equals(r.getDefaultReturnUrl()))throw unavailable();
+        var n=raw(r);flag(n,"is_default",false);var f=n.get("features");keys(f,"invoice_history","customer_update","payment_method_update","subscription_update","subscription_cancel","subscription_pause");
+        if(f.has("subscription_pause"))recognizeDisabledPause(f.get("subscription_pause"));
         keys(f.get("invoice_history"),"enabled");flag(f.get("invoice_history"),"enabled",true);
         keys(f.get("customer_update"),"enabled","allowed_updates");flag(f.get("customer_update"),"enabled",false);empty(f.get("customer_update"),"allowed_updates");
-        keys(f.get("payment_method_update"),"enabled");flag(f.get("payment_method_update"),"enabled",false);
-        var update=f.get("subscription_update");keys(update,"enabled","default_allowed_updates","products","proration_behavior");flag(update,"enabled",false);empty(update,"default_allowed_updates");empty(update,"products");
+        var method=f.get("payment_method_update");
+        keys(method,"enabled","payment_method_configuration");flag(method,"enabled",false);
+        if(method.hasNonNull("payment_method_configuration"))throw unavailable();
+        var update=f.get("subscription_update");keys(update,"enabled","default_allowed_updates","products","proration_behavior","billing_cycle_anchor","trial_update_behavior","schedule_at_period_end");flag(update,"enabled",false);empty(update,"default_allowed_updates");empty(update,"products");
         if(update.has("proration_behavior")&&!"none".equals(update.path("proration_behavior").textValue()))throw unavailable();
+        if(update.has("billing_cycle_anchor") && !"unchanged".equals(update.path("billing_cycle_anchor").textValue()))throw unavailable();
+        if(update.has("trial_update_behavior") && !"end_trial".equals(update.path("trial_update_behavior").textValue()))throw unavailable();
+        if(update.hasNonNull("schedule_at_period_end")) {
+            var schedule=update.get("schedule_at_period_end");keys(schedule,"conditions");empty(schedule,"conditions");
+        }
         var cancel=f.get("subscription_cancel");keys(cancel,"enabled","mode","proration_behavior","cancellation_reason");flag(cancel,"enabled",true);
         if(!"at_period_end".equals(cancel.path("mode").asText())||!"none".equals(cancel.path("proration_behavior").asText()))throw unavailable();
-        var reason=cancel.get("cancellation_reason");keys(reason,"enabled","options");flag(reason,"enabled",false);
+        var reason=cancel.get("cancellation_reason");keys(reason,"enabled","options","feedback_options");flag(reason,"enabled",false);empty(reason,"feedback_options");
         var options=reason.get("options");if(options!=null&&!options.isNull()){
             if(!options.isArray())throw unavailable();var seen=new HashSet<String>();
             for(var option:options)if(!option.isTextual()||!Set.of("too_expensive","missing_features","switched_service","unused","other").contains(option.textValue())||!seen.add(option.textValue()))throw unavailable();
         }
         keys(n.get("login_page"),"enabled","url");flag(n.get("login_page"),"enabled",false);if(!n.path("login_page").path("url").isMissingNode()&&!n.path("login_page").path("url").isNull())throw unavailable();
     }
+    private static void recognizeDisabledPause(JsonNode pause){
+        keys(pause,"enabled","duration");
+        flag(pause,"enabled",false);
+        if(!pause.has("duration"))return;
+        var duration=pause.get("duration");
+        keys(duration,"type","interval_options");
+        if(!"interval_options".equals(duration.path("type").textValue()))throw unavailable();
+        var options=duration.path("interval_options");
+        if(!options.isArray()||options.size()!=1)throw unavailable();
+        var option=options.get(0);
+        keys(option,"interval","interval_count");
+        var count=option.path("interval_count");
+        if(!"month".equals(option.path("interval").textValue())||!count.isIntegralNumber()||!count.bigIntegerValue().equals(java.math.BigInteger.ONE))throw unavailable();
+    }
     private void recognize(com.stripe.model.billingportal.Session r,Scope s,Configuration c,ProviderOperation step){
         if(r==null||r.getId()==null||!r.getId().matches("bps_[A-Za-z0-9]{1,251}")||!"billing_portal.session".equals(r.getObject())||!Boolean.FALSE.equals(r.getLivemode())
             ||!s.customer().providerReference().equals(r.getCustomer())||!c.reference().equals(r.getConfiguration())||!s.returnUrl().equals(r.getReturnUrl())||!inWindow(r.getCreated(),step)||r.getCreated()>clock.instant().getEpochSecond()||!validNavigation(r.getUrl()))throw unavailable();
-        var n=raw(r);if(!n.path("on_behalf_of").isMissingNode()&&!n.path("on_behalf_of").isNull()||!n.path("customer_account").isMissingNode()&&!n.path("customer_account").isNull())throw unavailable();
-        var flow=n.get("flow");keys(flow,"type","subscription_cancel","after_completion");if(!"subscription_cancel".equals(flow.path("type").asText()))throw unavailable();
+        var n=raw(r);if(n.hasNonNull("on_behalf_of")||n.hasNonNull("customer_account")||n.hasNonNull("after_expiration"))throw unavailable();
+        var flow=n.get("flow");keys(flow,"type","subscription_cancel","after_completion","customer_update","subscription_pause","subscription_update","subscription_update_confirm");
+        if(!"subscription_cancel".equals(flow.path("type").asText())||flow.hasNonNull("customer_update")||flow.hasNonNull("subscription_pause")
+            ||flow.hasNonNull("subscription_update")||flow.hasNonNull("subscription_update_confirm"))throw unavailable();
         var cancel=flow.get("subscription_cancel");keys(cancel,"subscription","retention");if(!s.operation().providerReference().equals(cancel.path("subscription").asText())||cancel.hasNonNull("retention"))throw unavailable();
-        var done=flow.get("after_completion");keys(done,"type","redirect");keys(done.get("redirect"),"return_url");if(!"redirect".equals(done.path("type").asText())||!s.returnUrl().equals(done.path("redirect").path("return_url").asText()))throw unavailable();
+        var done=flow.get("after_completion");keys(done,"type","redirect","hosted_confirmation");keys(done.get("redirect"),"return_url");if(done.hasNonNull("hosted_confirmation")||!"redirect".equals(done.path("type").asText())||!s.returnUrl().equals(done.path("redirect").path("return_url").asText()))throw unavailable();
     }
     /** Deliberately supported documented sandbox URL subset; never an arbitrary HTTPS redirect. */
     public static boolean validNavigation(String value){return dev.genericpayments.platform.provider.application.model.StripePortalNavigationUrl.valid(value);}
+    /** Keep the failing application location without retaining Stripe exception messages, bodies or causes. */
+    private static PaymentApplicationException unavailable(Exception failure){
+        var safe=unavailable();
+        var frames=Arrays.stream(failure.getStackTrace())
+            .filter(frame->frame.getClassName().startsWith("dev.genericpayments."))
+            .limit(12).toArray(StackTraceElement[]::new);
+        if(frames.length>0)safe.setStackTrace(frames);
+        return safe;
+    }
     private static PaymentApplicationException unavailable(){return new PaymentApplicationException("SUBSCRIPTION_PORTAL_UNAVAILABLE",409,"Portal unavailable");}
 }

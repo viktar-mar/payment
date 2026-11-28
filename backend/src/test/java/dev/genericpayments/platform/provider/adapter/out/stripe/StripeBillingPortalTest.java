@@ -13,6 +13,10 @@ import dev.genericpayments.platform.customers.domain.*;
 import dev.genericpayments.platform.paymentaccounts.application.port.out.LockPaymentAccountPort;
 import dev.genericpayments.platform.paymentaccounts.domain.*;
 import dev.genericpayments.platform.shared.application.PaymentApplicationException;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingGrantTokens;
+import dev.genericpayments.platform.provider.adapter.out.stripe.billing.StripeBillingPortalAdapter;
+import dev.genericpayments.platform.provider.application.model.ProviderOperation;
+import dev.genericpayments.platform.provider.application.port.out.StripePortalConfigurationPort.Configuration;
 import dev.genericpayments.platform.subscriptions.application.model.*;
 import dev.genericpayments.platform.subscriptions.application.model.SubscriptionProviderModels.*;
 import dev.genericpayments.platform.subscriptions.application.port.in.CreateSubscriptionPortalUseCase;
@@ -40,6 +44,33 @@ class StripeBillingPortalTest {
             assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isEqualTo(1);
         }
     }
+    @ParameterizedTest @ValueSource(strings={"ok","customer_update","subscription_pause","subscription_update","subscription_update_confirm","hosted_confirmation","after_expiration","unknown"})
+    void pinnedCancelFlowAdmitsOnlyNullAlternativeActions(String variant)throws Exception{
+        try(var f=new PortalCase()){
+            var json=com.google.gson.JsonParser.parseString(f.sessionJson()).getAsJsonObject();
+            json.addProperty("url",PortalCase.REAL_URL.replace("/p/session?","/p/session/flow?"));
+            var flow=json.getAsJsonObject("flow");
+            for(String key:List.of("customer_update","subscription_pause","subscription_update","subscription_update_confirm"))
+                flow.add(key,com.google.gson.JsonNull.INSTANCE);
+            var done=flow.getAsJsonObject("after_completion");
+            done.add("hosted_confirmation",com.google.gson.JsonNull.INSTANCE);
+            if(variant.equals("after_expiration"))json.add(variant,com.google.gson.JsonParser.parseString("{\"type\":\"customer_login\"}"));
+            else if(variant.equals("hosted_confirmation"))done.add(variant,new com.google.gson.JsonObject());
+            else if(variant.equals("unknown"))flow.add(variant,com.google.gson.JsonNull.INSTANCE);
+            else if(!variant.equals("ok"))flow.add(variant,new com.google.gson.JsonObject());
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());
+            f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,json.toString());
+            if(variant.equals("ok"))assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
+            else{
+                assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+                assertThat(f.saved).isNull();
+            }
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"/flow/","/flow%2f","/flows","/../flow","//flow","/flow#","/flow?secret=test_a&injected=1"})
+    void flowNavigationPathRefusesUnrecognizedSegmentsAndParameters(String suffix){
+        assertThat(StripeBillingPortalAdapter.validNavigation("https://billing.stripe.com/p/session"+suffix+"?secret=test_Owned")).isFalse();
+    }
     @Test void strictPortalAdapterStillRefusesPaymentConsent()throws Exception{
         try(var f=new PortalCase()){
             var ordinary=f.command();var consent=new Command(ordinary.account(),ordinary.operation(),ordinary.current(),null,ordinary.providerSubscriptionReference(),null,null,true,false);
@@ -57,21 +88,87 @@ class StripeBillingPortalTest {
     @Test void documentedDisabledFeatureDefaultsRemainCompatibleWithoutEnablingAnAction()throws Exception{
         try(var f=new PortalCase()){
             var response=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=response.getAsJsonObject("features");features.getAsJsonObject("subscription_update").addProperty("proration_behavior","none");features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason").add("options",com.google.gson.JsonParser.parseString("[\"too_expensive\",\"missing_features\",\"switched_service\",\"unused\",\"other\"]"));
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,response.toString());f.fixture.graph.http.respond("GET",CONFIGURATION,response.toString());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
-            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isEqualTo(1);assertThat(f.fixture.graph.http.calls().stream().filter(c->c.path().equals(CONFIGURATIONS)&&c.method().equals("POST")).toList().getFirst().form()).containsEntry("features[subscription_update][enabled]","false").containsEntry("features[subscription_cancel][cancellation_reason][enabled]","false");
+            features.add("subscription_pause",com.google.gson.JsonParser.parseString("""
+                {"enabled":false,"duration":{"type":"interval_options","interval_options":[{"interval":"month","interval_count":1}]}}
+                """));
+            var disabledUpdate=features.getAsJsonObject("subscription_update");
+            disabledUpdate.addProperty("billing_cycle_anchor","unchanged");
+            disabledUpdate.addProperty("trial_update_behavior","end_trial");
+            disabledUpdate.add("schedule_at_period_end",com.google.gson.JsonParser.parseString("{\"conditions\":[]}"));
+            features.getAsJsonObject("payment_method_update").add("payment_method_configuration",com.google.gson.JsonNull.INSTANCE);
+            features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason").add("feedback_options",new com.google.gson.JsonArray());
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,response.toString());f.fixture.graph.http.respond("GET",CONFIGURATION,response.toString());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isEqualTo(1);assertThat(f.fixture.graph.http.calls().stream().filter(c->c.path().equals(CONFIGURATIONS)&&c.method().equals("POST")).toList().getFirst().form()).containsEntry("features[subscription_update][enabled]","false").doesNotContainKey("features[subscription_cancel][cancellation_reason][enabled]");
         }
     }
-    @ParameterizedTest @ValueSource(strings={"proration","nullProration","enabledUpdate","enabledReason","unknownOption","nonStringOption","duplicateOption","unknownField"})
+    @ParameterizedTest @ValueSource(strings={"proration","nullProration","enabledUpdate","enabledReason","unknownOption","nonStringOption","duplicateOption","unknownField","resetAnchor","changeTrial","scheduleCondition","paymentConfig","feedbackOption"})
     void documentedDisabledDefaultsDoNotAdmitChangedActionsOrUnrecognizedValues(String fault)throws Exception{
         try(var f=new PortalCase()){
             var json=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=json.getAsJsonObject("features");var update=features.getAsJsonObject("subscription_update");var reason=features.getAsJsonObject("subscription_cancel").getAsJsonObject("cancellation_reason");update.addProperty("proration_behavior","none");reason.add("options",com.google.gson.JsonParser.parseString("[\"other\"]"));
-            switch(fault){case "proration"->update.addProperty("proration_behavior","create_prorations");case "nullProration"->update.add("proration_behavior",com.google.gson.JsonNull.INSTANCE);case "enabledUpdate"->update.addProperty("enabled",true);case "enabledReason"->reason.addProperty("enabled",true);case "unknownOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"unknown\"]"));case "nonStringOption"->reason.add("options",com.google.gson.JsonParser.parseString("[1]"));case "duplicateOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"other\",\"other\"]"));case "unknownField"->reason.addProperty("future_behavior",true);}
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,json.toString());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();assertThat(f.saved).isNull();
+            switch(fault){case "proration"->update.addProperty("proration_behavior","create_prorations");case "nullProration"->update.add("proration_behavior",com.google.gson.JsonNull.INSTANCE);case "enabledUpdate"->update.addProperty("enabled",true);case "enabledReason"->reason.addProperty("enabled",true);case "unknownOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"unknown\"]"));case "nonStringOption"->reason.add("options",com.google.gson.JsonParser.parseString("[1]"));case "duplicateOption"->reason.add("options",com.google.gson.JsonParser.parseString("[\"other\",\"other\"]"));case "unknownField"->reason.addProperty("future_behavior",true);
+                case "resetAnchor" -> update.addProperty("billing_cycle_anchor","now");
+                case "changeTrial" -> update.addProperty("trial_update_behavior","continue_trial");
+                case "scheduleCondition" -> update.add("schedule_at_period_end",com.google.gson.JsonParser.parseString("{\"conditions\":[{\"type\":\"shortening_interval\"}]}"));
+                case "paymentConfig" -> features.getAsJsonObject("payment_method_update").addProperty("payment_method_configuration","pmc_other");
+                case "feedbackOption" -> reason.add("feedback_options",com.google.gson.JsonParser.parseString("[\"other\"]"));}
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,json.toString());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();assertThat(f.saved).isNull();
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"missing","additionalPage","live","inactive","nondefault","untyped","coercedDefault","coercedLivemode","invalidReference"})
+    void accountDefaultMustBeProvedBeforeCreatingASiteConfiguration(String fault)throws Exception{
+        try(var f=new PortalCase()){
+            var candidate=com.google.gson.JsonParser.parseString(DEFAULT_CONFIG).getAsJsonObject();
+            switch(fault){
+                case "live" -> candidate.addProperty("livemode",true);
+                case "inactive" -> candidate.addProperty("active",false);
+                case "nondefault" -> candidate.addProperty("is_default",false);
+                case "untyped" -> candidate.remove("is_default");
+                case "coercedDefault" -> candidate.addProperty("is_default","true");
+                case "coercedLivemode" -> candidate.addProperty("livemode","false");
+                case "invalidReference" -> candidate.addProperty("id","bpc_");
+            }
+            f.remote();f.page(CONFIGURATIONS,fault.equals("additionalPage"),fault.equals("missing")?"":candidate.toString());
+            assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+            assertThat(f.fixture.graph.http.calls()).filteredOn(call->call.path().equals(CONFIGURATIONS)).singleElement().satisfies(call->{
+                assertThat(call.method()).isEqualTo("GET");
+                assertThat(call.query()).containsExactlyInAnyOrderEntriesOf(Map.of("is_default","true","limit","1"));
+            });
+            assertThat(f.fixture.steps.only().firstDispatchedAt()).isNull();
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={"createdDefault","retrievedDefault","missingDefaultFlag","aliasedDefault"})
+    void defaultOrAmbiguousConfigurationCannotPublishASession(String fault)throws Exception{
+        try(var f=new PortalCase()){
+            var invalid=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();
+            if(fault.equals("missingDefaultFlag"))invalid.remove("is_default");
+            else if(fault.equals("aliasedDefault"))invalid.addProperty("id","bpc_default");
+            else invalid.addProperty("is_default",true);
+            f.remote();f.existingDefault();
+            f.fixture.graph.http.respond("POST",CONFIGURATIONS,fault.equals("retrievedDefault")?f.config():invalid.toString());
+            if(fault.equals("retrievedDefault"))f.fixture.graph.http.respond("GET",CONFIGURATION,invalid.toString());
+            assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();
+        }
+    }
+    @ParameterizedTest @ValueSource(strings={
+        "{\"enabled\":true}",
+        "{\"enabled\":false,\"other\":true}",
+        "{\"enabled\":false,\"duration\":{\"type\":\"other\"}}",
+        "{\"enabled\":false,\"duration\":{\"type\":\"interval_options\",\"interval_options\":[{\"interval\":\"month\",\"interval_count\":3}]}}"
+    })
+    void onlyRecognizedInertPauseSettingsPass(String pause)throws Exception{
+        try(var f=new PortalCase()){
+            var invalid=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();
+            invalid.getAsJsonObject("features").add("subscription_pause",com.google.gson.JsonParser.parseString(pause));
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,invalid.toString());
+            assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+            assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();
         }
     }
     @Test void provedOwnedCustomerCreatesConfiguredRealNavigationOnlyOnce() throws Exception {
         try(var f=new PortalCase()){
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
             var before=f.fixture.local;var received=new java.util.concurrent.atomic.AtomicReference<PortalNavigation>();
             assertThatCode(()->received.set(f.adapter.create(f.command(),RETURN))).doesNotThrowAnyException();var navigation=received.get();
             assertThat(navigation.simulated()).isFalse();assertThat(navigation.navigationUrl()).isEqualTo(PortalCase.REAL_URL);assertThat(navigation.toString()).doesNotContain("test_fixture");
@@ -91,7 +188,7 @@ class StripeBillingPortalTest {
             if(fault.equals("incomplete"))f.hasMore="null";
             if(fault.equals("missingCancellationFlag")){var remote=com.google.gson.JsonParser.parseString(f.remoteSubscription).getAsJsonObject();remote.remove("cancel_at_period_end");f.remoteSubscription=remote.toString();}
             f.remote();var config=f.config();if(fault.equals("config"))config=config.replace("\"payment_method_update\":{\"enabled\":false}","\"payment_method_update\":{\"enabled\":true}");
-            f.fixture.graph.http.respond("POST",CONFIGURATIONS,config);f.fixture.graph.http.respond("GET",CONFIGURATION,config);
+            f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,config);f.fixture.graph.http.respond("GET",CONFIGURATION,config);
             var response=f.sessionJson();if(fault.equals("session"))response=response.replace("cus_owned","cus_foreign");if(fault.equals("url"))response=response.replace("billing.stripe.com","billing.stripe.com.evil");
             f.fixture.graph.http.respond("POST",SESSIONS,response);
             assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
@@ -114,32 +211,67 @@ class StripeBillingPortalTest {
         try(var f=new PortalCase()){
             var json=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();var features=json.getAsJsonObject("features");
             switch(fault){case "unknownFeature"->features.add("future_mutation",com.google.gson.JsonParser.parseString("{\"enabled\":true}"));case "missingFlag"->features.getAsJsonObject("customer_update").remove("enabled");case "inactive"->json.addProperty("active",false);case "live"->json.addProperty("livemode",true);case "immediate"->features.getAsJsonObject("subscription_cancel").addProperty("mode","immediately");case "prorating"->features.getAsJsonObject("subscription_cancel").addProperty("proration_behavior","create_prorations");case "retention"->features.getAsJsonObject("subscription_cancel").add("retention",com.google.gson.JsonParser.parseString("{\"type\":\"coupon_offer\"}"));case "login"->json.getAsJsonObject("login_page").addProperty("enabled",true);}
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,json.toString());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();assertThat(f.saved).isNull();
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,json.toString());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();assertThat(f.saved).isNull();
         }
     }
     @Test void cosmeticConfigChangesDoNotReplaceTheImmutableBinding()throws Exception{
         try(var f=new PortalCase()){
             var json=com.google.gson.JsonParser.parseString(f.config()).getAsJsonObject();json.addProperty("name","presentation only");json.add("metadata",com.google.gson.JsonParser.parseString("{\"note\":\"changed\"}"));
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,json.toString());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,json.toString());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
             assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();assertThat(f.fixture.graph.http.requestCount("POST",CONFIGURATIONS)).isEqualTo(1);
         }
     }
     @Test void lostConfigResponseUsesTheOriginalIntentStepKeyAndPayload()throws Exception{
         try(var f=new PortalCase()){
-            f.remote();f.fixture.graph.http.disconnectNext("POST",CONFIGURATIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);var first=f.fixture.steps.only();
+            f.remote();f.existingDefault();f.fixture.graph.http.disconnectNext("POST",CONFIGURATIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);var first=f.fixture.steps.only();
             f.successResponses();assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
             var posts=f.fixture.graph.http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals(CONFIGURATIONS)).toList();assertThat(posts).hasSize(2);assertThat(posts.get(0).form()).isEqualTo(posts.get(1).form());assertThat(posts).allSatisfy(p->assertThat(p.header("Idempotency-Key")).isEqualTo(first.operationKey()));assertThat(f.fixture.steps.findById(first.id()).orElseThrow().firstDispatchedAt()).isEqualTo(first.firstDispatchedAt());
         }
     }
+    @ParameterizedTest @ValueSource(strings={"unreserved","reserved","unknown","dispatching","acknowledged"})
+    void legacyConfigIntentsOnlyRecoverAlreadyAcknowledgedConfigurations(String state)throws Exception{
+        try(var f=new PortalCase()){
+            var id=UUID.randomUUID();
+            var owner=f.fixture.operation.id();
+            var key="portal_config_"+id;
+            var digest=StripeBillingPortalAdapter.policyDigest(f.policy);
+            var legacy=StripeRequestFingerprint.of(StripeBillingGrantTokens::hash,f.fixture.account,"PORTAL_CONFIG_V1",id.toString(),
+                owner.toString(),key,f.policy.siteId().value().toString(),Long.toString(f.policy.version()),digest);
+            f.configuration=new Configuration(id,f.fixture.account.id(),f.policy.siteId(),f.policy.version(),digest,owner,key,legacy,null,null);
+            ProviderOperation original=null;
+            if(!state.equals("unreserved")){
+                original=f.fixture.steps.reserve(f.fixture.account,ProviderOperation.Kind.PORTAL_CONFIGURATION_CREATE,id,key,legacy);
+                if(!state.equals("reserved")){
+                    original=f.fixture.steps.claim(original.id(),"legacy",f.now,Duration.ofSeconds(60)).orElseThrow();
+                    if(state.equals("unknown"))original=f.fixture.steps.unknown(original.id(),"legacy",original.version());
+                    if(state.equals("acknowledged"))original=f.fixture.steps.acknowledge(original.id(),"legacy",original.version(),"bpc_owned");
+                }
+            }
+            f.remote();
+            if(state.equals("acknowledged")){
+                f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());
+                f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());
+                f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
+                assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
+                assertThat(f.saved.configuration().fingerprint()).isEqualTo(legacy);
+            }else{
+                assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+                assertThat(f.fixture.graph.http.requestCount("POST",SESSIONS)).isZero();
+            }
+            assertThat(f.fixture.steps.find(f.fixture.account.id(),key)).isEqualTo(Optional.ofNullable(original));
+            assertThat(f.fixture.graph.http.requestCount("POST",CONFIGURATIONS)).isZero();
+            assertThat(f.fixture.graph.http.requestCount("GET",CONFIGURATIONS)).isZero();
+        }
+    }
     @Test void configAcknowledgementSurvivesBindingFailureWithoutAnotherCreate()throws Exception{
         try(var f=new PortalCase()){
-            f.failBind=true;f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.steps.only().status()).isEqualTo(dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED);
+            f.failBind=true;f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.fixture.steps.only().status()).isEqualTo(dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.ACKNOWLEDGED);
             f.remote();f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();assertThat(f.fixture.graph.http.requestCount("POST",CONFIGURATIONS)).isEqualTo(1);
         }
     }
     @Test void lostSessionResponseReusesOnlyOriginalSessionResourceAndKey()throws Exception{
         try(var f=new PortalCase()){
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.disconnectNext("POST",SESSIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.disconnectNext("POST",SESSIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
             var first=f.fixture.steps.rows.values().stream().filter(s->s.kind()==dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.PORTAL_SESSION_CREATE).findFirst().orElseThrow();
             f.remote();f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());assertThatCode(()->f.adapter.create(f.command(),RETURN)).doesNotThrowAnyException();
             var posts=f.fixture.graph.http.calls().stream().filter(c->c.method().equals("POST")&&c.path().equals(SESSIONS)).toList();assertThat(posts).hasSize(2).allSatisfy(p->assertThat(p.header("Idempotency-Key")).isEqualTo(first.operationKey()));assertThat(posts.get(0).form()).isEqualTo(posts.get(1).form());assertThat(f.fixture.steps.findById(first.id()).orElseThrow().firstDispatchedAt()).isEqualTo(first.firstDispatchedAt());
@@ -186,7 +318,7 @@ class StripeBillingPortalTest {
         try(var f=new PortalCase()){
             var json=com.google.gson.JsonParser.parseString(f.sessionJson()).getAsJsonObject();var flow=json.getAsJsonObject("flow");
             switch(fault){case "reference"->json.addProperty("id","bpc_wrong");case "object"->json.addProperty("object","customer");case "customer"->json.addProperty("customer","cus_foreign");case "configuration"->json.addProperty("configuration","bpc_foreign");case "live"->json.addProperty("livemode",true);case "createdBefore"->json.addProperty("created",f.now.minusSeconds(1).getEpochSecond());case "createdAfter"->json.addProperty("created",f.now.plusSeconds(1).getEpochSecond());case "flow"->flow.addProperty("type","payment_method_update");case "target"->flow.getAsJsonObject("subscription_cancel").addProperty("subscription","sub_foreign");case "topReturn"->json.addProperty("return_url","https://foreign.test");case "doneReturn"->flow.getAsJsonObject("after_completion").getAsJsonObject("redirect").addProperty("return_url","https://foreign.test");case "homepage"->flow.getAsJsonObject("after_completion").addProperty("type","portal_homepage");case "retention"->flow.getAsJsonObject("subscription_cancel").add("retention",com.google.gson.JsonParser.parseString("{\"type\":\"coupon_offer\"}"));case "unknownFlow"->flow.add("future_action",com.google.gson.JsonParser.parseString("{}"));}
-            f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,json.toString());
+            f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,json.toString());
             assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.saved).isNull();
             assertThat(f.fixture.steps.rows.values()).filteredOn(s->s.kind()==dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.PORTAL_SESSION_CREATE).singleElement().satisfies(s->assertThat(s.status()).isEqualTo(dev.genericpayments.platform.provider.application.model.ProviderOperation.Status.UNKNOWN));
         }
@@ -194,11 +326,11 @@ class StripeBillingPortalTest {
     @ParameterizedTest @ValueSource(strings={"configuration","session"})
     void expiredUnknownCannotDispatchAnotherCreateOrRotateItsKey(String kind)throws Exception{
         try(var f=new PortalCase()){
-            f.remote();if(kind.equals("session")){f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());}f.fixture.graph.http.disconnectNext("POST",kind.equals("session")?SESSIONS:CONFIGURATIONS);
+            f.remote();f.existingDefault();if(kind.equals("session")){f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());}f.fixture.graph.http.disconnectNext("POST",kind.equals("session")?SESSIONS:CONFIGURATIONS);
             assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
             var step=f.fixture.steps.rows.values().stream().filter(s->s.kind()==(kind.equals("session")?dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.PORTAL_SESSION_CREATE:dev.genericpayments.platform.provider.application.model.ProviderOperation.Kind.PORTAL_CONFIGURATION_CREATE)).findFirst().orElseThrow();
             var expired=f.fixture.steps.replace(step,step.status(),null,f.now.minus(Duration.ofHours(23)),f.now,null,null);
-            f.remote();if(kind.equals("session"))f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+            f.remote();if(kind.equals("session"))f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());else f.existingDefault();assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
             assertThat(f.fixture.steps.findById(step.id())).contains(expired);assertThat(f.fixture.graph.http.requestCount("POST",kind.equals("session")?SESSIONS:CONFIGURATIONS)).isEqualTo(1);assertThat(f.saved).isNull();
         }
     }
@@ -206,7 +338,7 @@ class StripeBillingPortalTest {
     void stolenWorkerCannotAcknowledgeOrPublishTheProviderResponse(String kind)throws Exception{
         try(var f=new PortalCase()){
             if(kind.equals("session")){
-                f.remote();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.disconnectNext("POST",SESSIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
+                f.remote();f.existingDefault();f.fixture.graph.http.respond("POST",CONFIGURATIONS,f.config());f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.disconnectNext("POST",SESSIONS);assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);
                 f.remote();f.fixture.graph.http.respond("GET",CONFIGURATION,f.config());f.fixture.graph.http.respond("POST",SESSIONS,f.sessionJson());
             }else f.successResponses();
             f.fixture.steps.stealBeforeAck=true;assertThatThrownBy(()->f.adapter.create(f.command(),RETURN)).isInstanceOf(PaymentApplicationException.class);assertThat(f.saved).isNull();
@@ -242,10 +374,11 @@ class StripeBillingPortalTest {
         }
         Command command(){return new Command(fixture.account,fixture.operation,fixture.local.billingPrice(),null,"sub_owned",null,null,false,false);}
         void newOperation(){var o=fixture.operation;var id=UUID.randomUUID();fixture.operation=new SubscriptionOperation(id,o.siteId(),o.customerId(),o.subscriptionId(),o.kind(),o.status(),o.authorityScope(),o.keyDigest(),o.fingerprint(),"subscription:"+fixture.account.id().value()+":"+id+":PORTAL",o.expectedRevision(),o.policyVersion(),o.providerReference(),null,now,now,0);}
-        void successResponses(){remote();fixture.graph.http.respond("POST",CONFIGURATIONS,config());fixture.graph.http.respond("GET",CONFIGURATION,config());fixture.graph.http.respond("POST",SESSIONS,sessionJson());}
+        void successResponses(){remote();creationResponses();}
         void prefix(){fixture.identity();fixture.graph.http.respond("GET","/v1/customers/cus_owned",fixture.graph.customer.toString());}
         void page(String path,boolean more,String data){fixture.graph.http.respond("GET",path,"{\"object\":\"list\",\"has_more\":"+more+",\"data\":["+data+"]}");}
-        void creationResponses(){fixture.graph.http.respond("POST",CONFIGURATIONS,config());fixture.graph.http.respond("GET",CONFIGURATION,config());fixture.graph.http.respond("POST",SESSIONS,sessionJson());}
+        void existingDefault(){page(CONFIGURATIONS,false,DEFAULT_CONFIG);}
+        void creationResponses(){existingDefault();fixture.graph.http.respond("POST",CONFIGURATIONS,config());fixture.graph.http.respond("GET",CONFIGURATION,config());fixture.graph.http.respond("POST",SESSIONS,sessionJson());}
         void remote(){fixture.identity();fixture.graph.http.respond("GET","/v1/customers/cus_owned",fixture.graph.customer.toString());fixture.graph.http.respond("GET","/v1/subscriptions","{\"object\":\"list\",\"has_more\":"+hasMore+",\"data\":["+remoteSubscription+"]}");fixture.graph.http.respond("GET","/v1/invoices","{\"object\":\"list\",\"has_more\":false,\"data\":["+invoice+"]}");}
         String config(){return configurationJson().replace("1793188800",Long.toString(now.getEpochSecond()));}
         String sessionJson(){return StripeBillingPortalTest.sessionJson().replace("1793188800",Long.toString(now.getEpochSecond())).replace(NAVIGATION,REAL_URL);}
@@ -253,6 +386,9 @@ class StripeBillingPortalTest {
     }
     static final Instant NOW = Instant.parse("2026-10-28T12:00:00Z");
     static final String RETURN = "https://shop.example/account";
+    static final String DEFAULT_CONFIG = """
+        {"id":"bpc_default","object":"billing_portal.configuration","active":true,"is_default":true,"livemode":false}
+        """;
     static final String CONFIGURATIONS = "/v1/billing_portal/configurations";
     static final String CONFIGURATION = CONFIGURATIONS + "/bpc_owned";
     static final String SESSIONS = "/v1/billing_portal/sessions";
@@ -278,7 +414,6 @@ class StripeBillingPortalTest {
                         Map.entry("features[subscription_cancel][enabled]", "true"),
                         Map.entry("features[subscription_cancel][mode]", "at_period_end"),
                         Map.entry("features[subscription_cancel][proration_behavior]", "none"),
-                        Map.entry("features[subscription_cancel][cancellation_reason][enabled]", "false"),
                         Map.entry("login_page[enabled]", "false"),
                         Map.entry("default_return_url", RETURN)));
                     assertThat(call.header("Idempotency-Key")).isEqualTo(CONFIG_KEY);
@@ -523,9 +658,7 @@ class StripeBillingPortalTest {
                 .setSubscriptionUpdate(ConfigurationCreateParams.Features.SubscriptionUpdate.builder().setEnabled(false).build())
                 .setSubscriptionCancel(ConfigurationCreateParams.Features.SubscriptionCancel.builder().setEnabled(true)
                     .setMode(ConfigurationCreateParams.Features.SubscriptionCancel.Mode.AT_PERIOD_END)
-                    .setProrationBehavior(ConfigurationCreateParams.Features.SubscriptionCancel.ProrationBehavior.NONE)
-                    .setCancellationReason(ConfigurationCreateParams.Features.SubscriptionCancel.CancellationReason.builder()
-                        .setEnabled(false).build()).build()).build()).build();
+                    .setProrationBehavior(ConfigurationCreateParams.Features.SubscriptionCancel.ProrationBehavior.NONE).build()).build()).build();
     }
 
     static SessionCreateParams sessionParams() {
@@ -568,7 +701,7 @@ class StripeBillingPortalTest {
 
     static String configurationJson() {
         return """
-            {"id":"bpc_owned","object":"billing_portal.configuration","active":true,"livemode":false,
+            {"id":"bpc_owned","object":"billing_portal.configuration","active":true,"is_default":false,"livemode":false,
              "created":1793188800,"updated":1793188800,"default_return_url":"https://shop.example/account",
              "login_page":{"enabled":false,"url":null},"features":{
                "invoice_history":{"enabled":true},"customer_update":{"enabled":false,"allowed_updates":[]},

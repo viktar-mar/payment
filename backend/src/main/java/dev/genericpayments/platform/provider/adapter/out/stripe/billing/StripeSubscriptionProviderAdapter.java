@@ -292,7 +292,7 @@ public class StripeSubscriptionProviderAdapter implements SubscriptionProviderPo
             o.providerOperationKey(),result.paymentMethodReady(),result.providerRevision(),result.observedAt(),
             new OperationObservation(o.providerOperationKey(),paid?OperationState.APPLIED:OperationState.PENDING),result.recoveryObservations(),result.trialEvidence(),result.externalWithdrawalEvidence());
     }
-    private Snapshot operationResult(Lookup lookup,Subscription s,CustomerBinding b,Snapshot result){
+    Snapshot operationResult(Lookup lookup,Subscription s,CustomerBinding b,Snapshot result){
         if(lookup.providerOperationKey()==null||proofs==null&&planProofs==null&&cancellationProofs==null&&recoveryProofs==null)return result;
         var matching=operations.unresolved(s.siteId(),s.id()).stream().filter(o->lookup.providerOperationKey().equals(o.providerOperationKey())).toList();
         if(matching.size()!=1)return result;var o=matching.getFirst();boolean applied=false,declined=false;

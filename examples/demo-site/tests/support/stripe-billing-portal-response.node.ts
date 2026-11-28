@@ -6,16 +6,17 @@ import {createPortal201Guard} from './stripe-billing-portal-response.ts';
 const backendOrigin='http://127.0.0.1:18080',demoOrigin='http://127.0.0.1:18081';
 const returnUrl=demoOrigin+'/?fixture=portal';
 const hostedUrl='https://billing.stripe.com/p/session?secret=test_syntheticPortal';
+const flowUrl=hostedUrl.replace('/p/session?', '/p/session/flow?');
 const refusal=/^Error: billing_BROWSER_PORTAL_RECEIPT$/;
 const id=(n:number)=>'00000000-0000-4000-8000-'+String(n).padStart(12,'0');
 
-function fixture({sizeOffset=0,readOffset=0,hasDeclaredLength=true}={}) {
+function fixture({sizeOffset=0,readOffset=0,hasDeclaredLength=true,navigationUrl=hostedUrl}={}) {
   const frame={},document={};
   const authority={customerId:id(1),siteId:id(2),subscriptionId:id(3),bearer:'Bearer '+'A'.repeat(43),
     revision:4,frame,document,returnUrl};
   const endpoint=backendOrigin+'/api/v1/customer/subscriptions/'+authority.subscriptionId+'/portal-sessions';
   const expiresAt=new Date(Date.now()+60000).toISOString();
-  const bytes=Buffer.from(JSON.stringify({navigation_url:hostedUrl,expires_at:expiresAt,simulated:false}));
+  const bytes=Buffer.from(JSON.stringify({navigation_url:navigationUrl,expires_at:expiresAt,simulated:false}));
   let current={...authority},continued=0,armed=0,read=0;
   let paired:typeof response|null=null;
   const request={
@@ -39,7 +40,7 @@ function fixture({sizeOffset=0,readOffset=0,hasDeclaredLength=true}={}) {
       return {bytes:bytes.subarray(0,bytes.length+readOffset),measured:bytes.length+sizeOffset};
     });
   const claim=async()=>{await guard.claimRequest(request);paired=response;};
-  const hosted=(url=hostedUrl)=>{
+  const hosted=(url=navigationUrl)=>{
     const navigation={...request,url:()=>url,method:()=>'GET',isNavigationRequest:()=>true,postDataBuffer:()=>null,existingResponse:()=>null};
     return {request:()=>navigation,continue:async()=>{continued++;}};
   };
@@ -79,14 +80,25 @@ test('a truncated capture is refused even when declared and measured sizes agree
   assert.equal(f.read(),1);
 });
 
-test('an exact receipt enables one GET and rejects a repeated GET before arming',async()=>{
-  const f=fixture();
+for(const [path,navigationUrl] of [['session',hostedUrl],['session/flow',flowUrl]]) {
+  test('an exact '+path+' receipt enables one GET and rejects a repeated GET before arming',async()=>{
+    const f=fixture({navigationUrl});
+    await f.claim();
+    assert.deepEqual(await f.guard.observe201(f.response),{expiresAt:f.expiresAt});
+    await f.guard.continueHostedNavigation(f.hosted(),f.arm);
+    await assert.rejects(f.guard.continueHostedNavigation(f.hosted(),f.arm),refusal);
+    assert.equal(f.armed(),1);
+    assert.equal(f.continued(),1);
+  });
+}
+
+test('a flow receipt cannot authorize the original session path with the same secret',async()=>{
+  const f=fixture({navigationUrl:flowUrl});
   await f.claim();
-  assert.deepEqual(await f.guard.observe201(f.response),{expiresAt:f.expiresAt});
-  await f.guard.continueHostedNavigation(f.hosted(),f.arm);
-  await assert.rejects(f.guard.continueHostedNavigation(f.hosted(),f.arm),refusal);
-  assert.equal(f.armed(),1);
-  assert.equal(f.continued(),1);
+  await f.guard.observe201(f.response);
+  await assert.rejects(f.guard.continueHostedNavigation(f.hosted(hostedUrl),f.arm),refusal);
+  assert.equal(f.armed(),0);
+  assert.equal(f.continued(),0);
 });
 
 test('a different capability on the same Stripe path cannot arm the original receipt',async()=>{

@@ -95,10 +95,10 @@ class StripeSubscriptionPlanChangeTest {
         assertThatThrownBy(()->fixture.adapter.preview(new QuoteRequest(withQuote(command,first.reference()),target,ChangeTiming.IMMEDIATE))).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
         assertThat(fixture.graph.http.calls()).hasSize(calls);
     }
-    @ParameterizedTest @ValueSource(strings={"currency","amount","extraLine","credit","foreignItem","period","foreignSchedule","pendingUpdate","tax"})
+    @ParameterizedTest @ValueSource(strings={"currency","amount","extraLine","credit","foreignItem","foreignFlatSubscription","period","foreignSchedule","pendingUpdate","tax"})
     void unsupportedPreviewCannotCreateAnExecutableQuote(String fault){
         var json=JsonParser.parseString(preview()).getAsJsonObject();var lines=json.getAsJsonObject("lines").getAsJsonArray("data");
-        switch(fault){case "currency"->lines.get(0).getAsJsonObject().addProperty("currency","usd");case "amount"->json.addProperty("amount_due",1);case "extraLine"->lines.add(lines.get(0).deepCopy());case "credit"->json.addProperty("pre_payment_credit_notes_amount",500);case "foreignItem"->lines.get(0).getAsJsonObject().getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_other");case "period"->lines.get(1).getAsJsonObject().getAsJsonObject("period").addProperty("end",NOW.plusSeconds(60).getEpochSecond());case "foreignSchedule"->fixture.graph.subscription.addProperty("schedule","sub_sched_foreign");case "pendingUpdate"->fixture.graph.subscription.add("pending_update",JsonParser.parseString("{\"expires_at\":1800001000}"));case "tax"->json.add("total_taxes",JsonParser.parseString("[{\"amount\":5}]"));}
+        switch(fault){case "currency"->lines.get(0).getAsJsonObject().addProperty("currency","usd");case "amount"->json.addProperty("amount_due",1);case "extraLine"->lines.add(lines.get(0).deepCopy());case "credit"->json.addProperty("pre_payment_credit_notes_amount",500);case "foreignFlatSubscription"->lines.get(0).getAsJsonObject().addProperty("subscription","sub_unowned");case "foreignItem"->lines.get(0).getAsJsonObject().getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_other");case "period"->lines.get(1).getAsJsonObject().getAsJsonObject("period").addProperty("end",NOW.plusSeconds(60).getEpochSecond());case "foreignSchedule"->fixture.graph.subscription.addProperty("schedule","sub_sched_foreign");case "pendingUpdate"->fixture.graph.subscription.add("pending_update",JsonParser.parseString("{\"expires_at\":1800001000}"));case "tax"->json.add("total_taxes",JsonParser.parseString("[{\"amount\":5}]"));}
         identityAndCurrent();fixture.graph.http.respond("POST","/v1/invoices/create_preview",json.toString());
         assertThatThrownBy(()->fixture.adapter.preview(new QuoteRequest(previewCommand(),target,ChangeTiming.IMMEDIATE))).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);assertThat(quotes).isEmpty();
     }
@@ -116,16 +116,22 @@ class StripeSubscriptionPlanChangeTest {
         switch(fault){case "lineTax"->line.add("taxes",JsonParser.parseString("[{\"amount\":0}]"));case "lineDiscount"->line.add("discounts",JsonParser.parseString("[\"di_unsupported\"]"));case "shipping"->json.addProperty("amount_shipping",1);case "shippingDetails"->json.add("shipping_details",JsonParser.parseString("{\"name\":\"Unsupported\"}"));}
         identityAndCurrent();fixture.graph.http.respond("POST","/v1/invoices/create_preview",json.toString());assertThatThrownBy(()->fixture.adapter.preview(new QuoteRequest(previewCommand(),target,ChangeTiming.IMMEDIATE))).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);assertThat(quotes).isEmpty();
     }
-    @ParameterizedTest @ValueSource(strings={"line","customer","subscription","window","unpaid","tax"})
+    @ParameterizedTest @ValueSource(strings={"line","customer","subscription","foreignFlatSubscription","window","unpaid","tax"})
     void presentCreditedLinkNeedsItsLiteralFundedSource(String fault){
         var json=linkedPreview();var invoice=fixture.graph.invoice.deepCopy();var sourceLine=fixture.graph.line.deepCopy();
-        switch(fault){case "line"->sourceLine.addProperty("id","il_other");case "customer"->invoice.addProperty("customer","cus_other");case "subscription"->invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details").addProperty("subscription","sub_other");case "window"->sourceLine.getAsJsonObject("period").addProperty("end",NOW.minusSeconds(1).getEpochSecond());case "unpaid"->{invoice.addProperty("status","open");invoice.addProperty("amount_paid",0);invoice.addProperty("amount_remaining",1000);}case "tax"->sourceLine.add("taxes",JsonParser.parseString("[{\"amount\":0}]"));}
+        switch(fault){case "foreignFlatSubscription"->sourceLine.addProperty("subscription","sub_unowned");case "line"->sourceLine.addProperty("id","il_other");case "customer"->invoice.addProperty("customer","cus_other");case "subscription"->invoice.getAsJsonObject("parent").getAsJsonObject("subscription_details").addProperty("subscription","sub_other");case "window"->sourceLine.getAsJsonObject("period").addProperty("end",NOW.minusSeconds(1).getEpochSecond());case "unpaid"->{invoice.addProperty("status","open");invoice.addProperty("amount_paid",0);invoice.addProperty("amount_remaining",1000);}case "tax"->sourceLine.add("taxes",JsonParser.parseString("[{\"amount\":0}]"));}
         identityAndCurrent();fixture.graph.http.respond("POST","/v1/invoices/create_preview",json.toString());creditedSource(invoice,sourceLine,!fault.equals("unpaid"));
         assertThatThrownBy(()->fixture.adapter.preview(new QuoteRequest(previewCommand(),target,ChangeTiming.IMMEDIATE))).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);assertThat(quotes).isEmpty();
     }
     @Test void literalCreditedSourceUsesExistingCompleteCashProof(){
-        identityAndCurrent();fixture.graph.http.respond("POST","/v1/invoices/create_preview",linkedPreview().toString());creditedSource(fixture.graph.invoice,fixture.graph.line,true);
+        var preview=linkedPreview();
+        preview.remove("ending_balance"); // A preview has no finalized ending balance.
+        var originalLine=fixture.graph.line.deepCopy();
+        originalLine.remove("subscription"); // Stripe's subscription-item parent carries the association.
+        identityAndCurrent();fixture.graph.http.respond("POST","/v1/invoices/create_preview",preview.toString());creditedSource(fixture.graph.invoice,originalLine,true);
         assertThat(fixture.adapter.preview(new QuoteRequest(previewCommand(),target,ChangeTiming.IMMEDIATE)).dueNowMinor()).isEqualTo(500);assertThat(fixture.graph.http.requestCount("GET","/v1/charges/ch_owned")).isEqualTo(1);
+        assertThat(fixture.graph.http.calls().stream().filter(c->c.path().equals("/v1/invoices/in_owned")).findFirst().orElseThrow().query()).containsValue("amount_paid_off_stripe");
+        assertThat(fixture.graph.http.calls().stream().filter(c->c.path().equals("/v1/invoices/create_preview")).findFirst().orElseThrow().form()).containsValue("amount_paid_off_stripe");
     }
     JsonObject linkedPreview(){var json=JsonParser.parseString(preview()).getAsJsonObject();json.getAsJsonObject("lines").getAsJsonArray("data").get(0).getAsJsonObject().getAsJsonObject("parent").getAsJsonObject("subscription_item_details").add("proration_details",JsonParser.parseString("{\"credited_items\":{\"invoice\":\"in_owned\",\"invoice_line_items\":[\"il_owned\"]}}"));return json;}
     void creditedSource(JsonObject invoice,JsonObject line,boolean paid){fixture.graph.http.respond("GET","/v1/invoices/in_owned",invoice.toString());fixture.graph.http.respond("GET","/v1/invoices/in_owned/lines",StripeBillingSnapshotMapperTest.page(false,line));fixture.graph.http.respond("GET","/v1/invoice_payments",paid?StripeBillingSnapshotMapperTest.page(false,fixture.graph.allocation):StripeBillingSnapshotMapperTest.page(false));if(paid){fixture.graph.http.respond("GET","/v1/payment_intents/pi_owned",fixture.graph.intent.toString());fixture.graph.http.respond("GET","/v1/charges/ch_owned",fixture.graph.charge.toString());fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,fixture.graph.allocation));}}
@@ -348,15 +354,41 @@ class StripeSubscriptionPlanChangeTest {
     @Test void firstHistoricalScheduledCashUsesOriginalTargetPeriodAndGeneratingItem(){var snapshot=historicalSchedule(null);assertThat(snapshot.invoices()).singleElement().satisfies(i->{assertThat(i.settlement()).isEqualTo(SettlementKind.CASH);assertThat(i.price()).isEqualTo(target);assertThat(i.period().end()).isEqualTo(snapshot.period().start());});}
     @ParameterizedTest @ValueSource(strings={"missingItem","foreignSub","period","product","released","ambiguous","missingConfiguration","lineTax","shipping"})
     void historicalTargetCashNeedsItsExactNativeLinksAndOriginalConfiguration(String fault){assertThatThrownBy(()->historicalSchedule(fault)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);}
+    @Test void originalInitialInvoiceRetainsItsSourceItemAfterTheScheduleReplacesIt(){
+        var snapshot=historicalSchedule("sourceHistory");
+        assertThat(snapshot.invoices()).singleElement().satisfies(initial->{
+            assertThat(initial.kind()).isEqualTo(BillingRecord.Kind.INITIAL);
+            assertThat(initial.price()).isEqualTo(fixture.local.billingPrice());
+            assertThat(initial.settlement()).isEqualTo(SettlementKind.CASH);
+        });
+    }
+    @ParameterizedTest @ValueSource(strings={"sourceHistoryWrongItem","sourceHistoryWrongPeriod"})
+    void substitutedSourceHistoryCannotUseTheSchedule(String fault){
+        assertThatThrownBy(()->historicalSchedule(fault)).isInstanceOf(dev.genericpayments.platform.shared.application.PaymentApplicationException.class);
+    }
     Snapshot historicalSchedule(String fault){
         var c=changeCommand(ChangeTiming.NEXT_PERIOD);identityAndCurrent();scheduleResponses();fixture.adapter.change(c);var binding=schedules.get(c.operation().id());when(fixture.operations.unresolved(fixture.local.siteId(),fixture.local.id())).thenReturn(List.of(c.operation()));
         long start=fixture.local.paidThrough().getEpochSecond(),end=binding.targetEnd();
         fixture.graph.item().addProperty("id","si_later");fixture.graph.item().addProperty("current_period_start",end);fixture.graph.item().addProperty("current_period_end",end+2678400);
         var at=Instant.ofEpochSecond(end+100);org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"clock",Clock.fixed(at,ZoneOffset.UTC));org.springframework.test.util.ReflectionTestUtils.setField(fixture.adapter,"providerClock",Clock.fixed(at,ZoneOffset.UTC));identityAndCurrent();
         var invoice=fixture.graph.invoice.deepCopy();invoice.addProperty("id","in_scheduled");for(String f:List.of("amount_due","amount_paid","total","subtotal"))invoice.addProperty(f,2000);
-        var line=fixture.graph.line.deepCopy();line.addProperty("id","il_targetGenerated");line.addProperty("invoice","in_scheduled");line.addProperty("amount",2000);line.getAsJsonObject("period").addProperty("start",start);line.getAsJsonObject("period").addProperty("end",end);line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_targetGenerated");line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_next");
+        var line=fixture.graph.line.deepCopy();line.remove("subscription");line.addProperty("id","il_targetGenerated");line.addProperty("invoice","in_scheduled");line.addProperty("amount",2000);line.getAsJsonObject("period").addProperty("start",start);line.getAsJsonObject("period").addProperty("end",end);line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item","si_targetGenerated");line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_next");
         var allocation=fixture.graph.allocation.deepCopy();allocation.addProperty("invoice","in_scheduled");allocation.addProperty("amount_paid",2000);allocation.addProperty("amount_requested",2000);allocation.addProperty("is_default",true);
         var intent=fixture.graph.intent.deepCopy();intent.addProperty("amount",2000);intent.addProperty("amount_received",2000);var charge=fixture.graph.charge.deepCopy();charge.addProperty("amount",2000);charge.addProperty("amount_captured",2000);charge.addProperty("created",start);
+        if(fault!=null && fault.startsWith("sourceHistory")){
+            long sourceAmount=c.current().regularAmount().minorUnits();
+            invoice.addProperty("billing_reason","subscription_create");
+            for(String field:List.of("amount_due","amount_paid","total","subtotal"))invoice.addProperty(field,sourceAmount);
+            line.addProperty("amount",sourceAmount);
+            line.getAsJsonObject("period").addProperty("start",fixture.local.currentPeriod().start().getEpochSecond());
+            line.getAsJsonObject("period").addProperty("end",start+(fault.equals("sourceHistoryWrongPeriod")?1:0));
+            line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription_item",
+                fault.equals("sourceHistoryWrongItem")?"si_foreign":"si_owned");
+            line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_owned");
+            for(String field:List.of("amount_paid","amount_requested"))allocation.addProperty(field,sourceAmount);
+            for(String field:List.of("amount","amount_received"))intent.addProperty(field,sourceAmount);
+            for(String field:List.of("amount","amount_captured"))charge.addProperty(field,sourceAmount);
+        }
         if(fault!=null)switch(fault){case "missingItem"->line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").remove("subscription_item");case "foreignSub"->line.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("subscription","sub_other");case "period"->line.getAsJsonObject("period").addProperty("end",end+1);case "product"->line.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("product","prod_other");case "released"->schedules.put(binding.operation(),new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.Schedule(binding.operation(),binding.subscription(),binding.account(),binding.quote(),binding.creationStep(),binding.reference(),binding.phaseStart(),binding.updateStep(),binding.targetEnd(),UUID.randomUUID(),UUID.randomUUID(),binding.sourcePhase()));case "ambiguous"->{var proof=new dev.genericpayments.platform.subscriptions.application.port.out.SubscriptionPlanProofStore.ScheduleProof(quotes.get(binding.quote()),binding);when(proofs.schedules(any(),any())).thenReturn(List.of(proof,proof));}case "missingConfiguration"->fixture.steps.rows.remove(binding.updateStep());case "lineTax"->line.add("taxes",JsonParser.parseString("[{\"amount\":0}]"));case "shipping"->invoice.addProperty("amount_shipping",1);}
         fixture.graph.http.respond("GET","/v1/invoices",StripeBillingSnapshotMapperTest.page(false,invoice));fixture.graph.http.respond("GET","/v1/invoices/in_scheduled/lines",StripeBillingSnapshotMapperTest.page(false,line));fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,allocation));fixture.graph.http.respond("GET","/v1/payment_intents/pi_owned",intent.toString());fixture.graph.http.respond("GET","/v1/charges/ch_owned",charge.toString());fixture.graph.http.respond("GET","/v1/invoice_payments",StripeBillingSnapshotMapperTest.page(false,allocation));
         return fixture.adapter.retrieve(new Lookup(fixture.account,fixture.local.id(),fixture.local.providerReference(),c.operation().providerOperationKey()));
@@ -395,6 +427,7 @@ class StripeSubscriptionPlanChangeTest {
     String preview(){
         var invoice=fixture.graph.invoice.deepCopy();invoice.addProperty("id","upcoming_in_owned");invoice.addProperty("status","draft");invoice.addProperty("amount_due",500);invoice.addProperty("total",500);invoice.addProperty("subtotal",500);
         var credit=fixture.graph.line.deepCopy();credit.addProperty("id","il_credit");credit.addProperty("amount",-500);credit.getAsJsonObject("parent").getAsJsonObject("subscription_item_details").addProperty("proration",true);
+        credit.remove("subscription");
         credit.getAsJsonObject("period").addProperty("start",NOW.getEpochSecond());
         var debit=credit.deepCopy();debit.addProperty("id","il_debit");debit.addProperty("amount",1000);debit.getAsJsonObject("pricing").getAsJsonObject("price_details").addProperty("price","price_next");
         invoice.add("lines",JsonParser.parseString(StripeBillingSnapshotMapperTest.page(false,credit,debit)));return invoice.toString();

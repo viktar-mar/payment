@@ -24,6 +24,11 @@ class StripeSubscriptionTrialTest {
 
     @Test void originalInitialZeroIsProvedOnFirstRead(){assertOriginalZero(false);}
     @ParameterizedTest @ValueSource(booleans={false,true})
+    void optionalTrialRecognizesItsZeroInvoiceWithOnlyTheNestedSubscription(boolean historical) {
+        f.graph.line.remove("subscription");
+        assertOriginalZero(historical);
+    }
+    @ParameterizedTest @ValueSource(booleans={false,true})
     void requiredTrialRecognizesTheOwnedZeroInvoiceWithoutALegacyLineSubscription(boolean historical){
         var result=readRequiredTrialWithoutLegacyLineSubscription(historical,g->{});
         assertThat(result.trialEvidence()).satisfies(trial->{

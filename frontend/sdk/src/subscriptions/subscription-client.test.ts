@@ -4,12 +4,13 @@ import { base, customerToken, json } from '../test/customer-fixtures.js';
 import { actionWire, billingWire, eventWire, mutationWire, offersWire, operationId, operationWire, portalWire, productId, quoteWire, returnUrl, subscriptionId, subscriptionPriceId, subscriptionSession, subscriptionWire, billingId } from '../test/subscription-fixtures.js';
 import * as sdk from '../index.js';
 const stripePortalUrl = 'https://billing.stripe.com/p/session?secret=test_sdkOpaque-123_ABC';
-it('returns the supported real Sandbox Portal capability without persisting it or changing the caller return URL', async () => {
+const stripeFlowUrl = stripePortalUrl.replace('/p/session?', '/p/session/flow?');
+it.each([['session', stripePortalUrl], ['session flow', stripeFlowUrl]])('returns the supported Sandbox Portal %s capability without persisting it or changing the caller return URL', async (_kind, navigationUrl) => {
   const session = subscriptionSession(); const c = createGenericPaymentClient({ apiBaseUrl: base }).subscriptions;
-  const storage = vi.spyOn(Storage.prototype, 'setItem'); const seen: Request[] = []; const wire = { ...portalWire(), navigation_url: stripePortalUrl, simulated: false };
+  const storage = vi.spyOn(Storage.prototype, 'setItem'); const seen: Request[] = []; const wire = { ...portalWire(), navigation_url: navigationUrl, simulated: false };
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { seen.push(new Request(url, init)); return json(wire, 201); });
   const result = await c.portal({ session, subscriptionId, idempotencyKey: operationId, returnUrl });
-  expect(result.navigationUrl === stripePortalUrl).toBe(true); expect(result.simulated).toBe(false); expect(result.expiresAt).toBe(wire.expires_at);
+  expect(result.navigationUrl === navigationUrl).toBe(true); expect(result.simulated).toBe(false); expect(result.expiresAt).toBe(wire.expires_at);
   expect(Object.keys(result).sort()).toEqual(['expiresAt', 'navigationUrl', 'simulated']); expect(storage).not.toHaveBeenCalled();
   expect(seen).toHaveLength(1); const request = seen[0]!;
   expect(request.url).toBe(`${base}/api/v1/customer/subscriptions/${subscriptionId}/portal-sessions`);
@@ -37,6 +38,11 @@ it.each([
   ['live secret', stripePortalUrl.replace('test_', 'live_')],
   ['wrong path', stripePortalUrl.replace('/p/session', '/session')],
   ['trailing slash', stripePortalUrl.replace('/p/session?', '/p/session/?')],
+  ['trailing flow slash', stripeFlowUrl.replace('/flow?', '/flow/?')],
+  ['nested flow', stripeFlowUrl.replace('/flow?', '/flow/flow?')],
+  ['alternate flow case', stripeFlowUrl.replace('/flow?', '/Flow?')],
+  ['encoded flow', stripeFlowUrl.replace('/flow?', '/%66low?')],
+  ['live flow secret', stripeFlowUrl.replace('test_', 'live_')],
   ['normalized path', stripePortalUrl.replace('/p/session', '/other/../p/session')],
   ['oversized', 'https://billing.stripe.com/p/session?secret=test_' + 'a'.repeat(2048)],
   ['leading whitespace', ' ' + stripePortalUrl], ['trailing newline', stripePortalUrl + '\n'],

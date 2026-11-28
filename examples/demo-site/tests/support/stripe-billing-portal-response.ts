@@ -1,6 +1,6 @@
 import {createHash} from 'node:crypto';
 import {billingBounded,billingCheck} from '../../../../infrastructure/stripe-billing-limits.mjs';
-import {parseSubscriptionPortal,validSubscriptionReturnUrl} from '../../../../frontend/sdk/dist/subscriptions/wire.js';
+import {parseSubscriptionPortal,validStripeSandboxPortalUrl,validSubscriptionReturnUrl} from '../../../../frontend/sdk/dist/subscriptions/wire.js';
 
 type Limits = {deadline:number; signal?:AbortSignal};
 type PortalAuthority = Readonly<{
@@ -42,7 +42,6 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const bearer = /^Bearer [A-Za-z0-9_-]{43}$/;
 const idempotencyKey = /^[A-Za-z0-9:_-]{1,255}$/;
 const json = /^application\/json(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?$/i;
-const hostedUrl = /^https:\/\/billing\.stripe\.com\/p\/session\?secret=test_[A-Za-z0-9_-]+$/;
 const loopback = /^http:\/\/127\.0\.0\.1:[1-9][0-9]{3,4}$/;
 const sha256 = (value:string) => createHash('sha256').update(value).digest('hex');
 const fail = ():never => { throw new Error('billing_BROWSER_PORTAL_RECEIPT'); };
@@ -184,7 +183,7 @@ export function createPortal201Guard(
         requireFact(route.request()===request && !Object.is(request,original) && request.frame()===expected.frame &&
           request.method()==='GET' && request.isNavigationRequest()===true && request.postDataBuffer()===null &&
           request.redirectedFrom()===null && request.serviceWorker()===null && request.existingResponse()===null &&
-          url.length<=2048 && hostedUrl.test(url));
+          validStripeSandboxPortalUrl(url));
         return sha256(url);
       };
       const requestedDigest=requireHostedRequest();

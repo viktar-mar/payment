@@ -50,6 +50,19 @@ public final class StripeBillingSnapshotMapper {
         catch(PaymentApplicationException safe){throw safe;}
         catch(StripeException | RuntimeException malformed){throw mismatch();}
     }
+    static Snapshot retrieveScheduledClock(StripeClient client,Ownership owner,StripeBillingScheduleClock clock,Instant observedAt){
+        try {
+            String expected=clock.requireScope(owner.account(),owner.subscription(),owner.customer());
+            require(owner.trial()==null&&owner.prorations().isEmpty()&&owner.schedules().size()==1);
+            var read=new Read(client,owner,observedAt);
+            read.scheduleClock=expected;
+            var result=read.snapshot();
+            clock.requireRemote(read.remote,expected);
+            clock.requireScope(owner.account(),owner.subscription(),owner.customer());
+            return result;
+        } catch(StripeException|IllegalArgumentException invalid){throw mismatch();}
+    }
+
     public static Snapshot retrieveOwned(StripeClient client,Ownership owner,OwnedInitial original,Instant observedAt){
         try {return new Read(client,owner,observedAt,Objects.requireNonNull(original)).snapshot();}
         catch(PaymentApplicationException safe){throw safe;}
@@ -228,12 +241,12 @@ public final class StripeBillingSnapshotMapper {
         try{
             var read=new Read(client,owner,at);for(var p:owner.prices())require(read.prices.put(p.providerPriceReference(),p)==null);
             ref(credit.creditedInvoice(),"in_");ref(credit.creditedLines().getFirst(),"il_");
-            var invoice=read.get(()->client.v1().invoices().retrieve(credit.creditedInvoice()));require(credit.creditedInvoice().equals(invoice.getId())&&StripeBillingMutationAdapter.noAdjustments(invoice));
-            var normalized=read.invoice(invoice,remote,remote.getItems().getData().getFirst(),null);
+            var invoice=read.get(()->client.v1().invoices().retrieve(credit.creditedInvoice(),StripeBillingMutationAdapter.expandedPlanInvoice(),null));require(credit.creditedInvoice().equals(invoice.getId())&&StripeBillingMutationAdapter.noAdjustments(invoice));
+            var normalized=read.invoice(invoice,remote,remote.getItems().getData().getFirst(),null,true);
             require(normalized.price().equals(quote.source())&&!normalized.period().start().isAfter(quote.anchor())&&!normalized.period().end().isBefore(quote.paidThrough())
                 &&(normalized.settlement()==SettlementKind.CASH||normalized.settlement()==SettlementKind.ZERO&&normalized.kind()==BillingRecord.Kind.PRORATION));
             var lines=read.sourceLines.get(invoice.getId());require(lines!=null);var literal=lines.stream().filter(l->credit.creditedLines().getFirst().equals(l.getId())).toList();require(literal.size()==1);var line=literal.getFirst();
-            require(invoice.getId().equals(line.getInvoice())&&quote.subscriptionReference().equals(line.getSubscription())&&line.getAmount()!=null&&line.getAmount()>0
+            require(invoice.getId().equals(line.getInvoice())&&(line.getSubscription()==null||quote.subscriptionReference().equals(line.getSubscription()))&&line.getAmount()!=null&&line.getAmount()>0
                 &&(line.getTaxes()==null||line.getTaxes().isEmpty())&&(line.getDiscounts()==null||line.getDiscounts().isEmpty())
                 &&line.getParent()!=null&&line.getParent().getSubscriptionItemDetails()!=null&&quote.subscriptionReference().equals(line.getParent().getSubscriptionItemDetails().getSubscription())
                 &&quote.item().equals(line.getParent().getSubscriptionItemDetails().getSubscriptionItem())&&line.getPricing()!=null&&line.getPricing().getPriceDetails()!=null
@@ -445,6 +458,7 @@ public final class StripeBillingSnapshotMapper {
         final Map<String,String> renewalFlatItems=new HashMap<>();
         final Map<SubscriptionProviderModels.Invoice,SettlementReason> settlementReasons=new IdentityHashMap<>();
         final Set<String> explicitNoNextAttempt=new HashSet<>();
+        String scheduleClock;
         int requests;
         Admission renewalAdmission;
         OwnedFailedRenewal.Failure debtFailure;
@@ -464,7 +478,7 @@ public final class StripeBillingSnapshotMapper {
             }
         }
         void requireSettlement(boolean valid,SettlementReason reason){if(actionFailure==null)require(valid);else actionFailure.require(valid,OwnedActionGuard.INVOICE_SETTLEMENT,reason);}
-        boolean clockMatches(String clock){return Objects.equals(clock,original==null?null:original.receipt().intent().clock().reference());}
+        boolean clockMatches(String clock){return Objects.equals(clock,original==null?scheduleClock:original.receipt().intent().clock().reference());}
 
         <T> T get(Call<T> call) throws StripeException {require(++requests<=MAX_READS);return Objects.requireNonNull(executor==null?call.run():executor.execute(call));}
         RequestOptions options(){return executor==null?null:executor.options();}
@@ -771,7 +785,11 @@ public final class StripeBillingSnapshotMapper {
                 &&p.getMetadata()!=null&&t.priceId().value().toString().equals(p.getMetadata().get("local_price_id"))&&Integer.toString(t.version()).equals(p.getMetadata().get("local_price_version")));
             currency(p.getCurrency(),t);
         }
-        SubscriptionProviderModels.Invoice invoice(com.stripe.model.Invoice invoice,com.stripe.model.Subscription remote,SubscriptionItem item,Subscription.Period trial) throws StripeException {
+        SubscriptionProviderModels.Invoice invoice(com.stripe.model.Invoice invoice, com.stripe.model.Subscription remote,
+                SubscriptionItem item, Subscription.Period trial) throws StripeException {
+            return invoice(invoice, remote, item, trial, false);
+        }
+        SubscriptionProviderModels.Invoice invoice(com.stripe.model.Invoice invoice,com.stripe.model.Subscription remote,SubscriptionItem item,Subscription.Period trial,boolean creditedFunding) throws StripeException {
             ref(invoice.getId(),"in_");require(clockMatches(invoice.getTestClock())&&"invoice".equals(invoice.getObject())&&Boolean.FALSE.equals(invoice.getLivemode())&&owner.customer().providerReference().equals(invoice.getCustomer())
                 &&invoice.getParent()!=null&&"subscription_details".equals(invoice.getParent().getType())&&invoice.getParent().getSubscriptionDetails()!=null&&remote.getId().equals(invoice.getParent().getSubscriptionDetails().getSubscription()));
             var lines=pages(after->client.v1().invoices().lineItems().list(invoice.getId(),InvoiceLineItemListParams.builder().setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()),
@@ -784,19 +802,20 @@ public final class StripeBillingSnapshotMapper {
             boolean originalHistory=original!=null&&(renewalAdmission==null||renewalAdmission.invoice().equals(invoice.getId())&&"subscription_create".equals(invoice.getBillingReason()));
             boolean ownedRenewal=renewalAdmission!=null&&!originalHistory;
             // Stripe moved the subscription association to parent.subscription_item_details.
-            // The required-trial path proves the exact nested item and zero settlement below.
+            // Both trial policies prove the original zero invoice and its exact nested item below.
             boolean ordinaryInitial=original==null&&owner.trial()==null&&"subscription_create".equals(invoice.getBillingReason())
                 &&invoice.getAmountDue()!=null&&invoice.getAmountDue()>0&&("open".equals(invoice.getStatus())||"paid".equals(invoice.getStatus()));
             var trialContext=owner.trial();
             String legacySubscription=line.getSubscription();
-            boolean permitsMissingLegacySubscription=originalHistory||ownedRenewal||ordinaryInitial;
-            boolean nestedRequiredTrial=legacySubscription==null&&!permitsMissingLegacySubscription&&trialContext!=null&&trialContext.requiredSetup()!=null;
+            boolean permitsMissingLegacySubscription=originalHistory||ownedRenewal||ordinaryInitial||creditedFunding;
+            boolean scheduledRenewal=original==null && !owner.schedules().isEmpty() && "subscription_cycle".equals(invoice.getBillingReason());
+            boolean nestedTrial=legacySubscription==null&&!permitsMissingLegacySubscription&&trialContext!=null;
             if(recoveredDebt)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             // Authenticate historical inclusive taxes before FAILED can publish the original debt.
             // Reuse this unique fetched line; historical amount/balance tolerances remain below.
             if(failedInclusiveHistory&&originalHistory)require(StripeBillingMutationAdapter.noNonAmountAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty()));
             requireOwned("line_item".equals(line.getObject())&&Boolean.FALSE.equals(line.getLivemode())&&invoice.getId().equals(line.getInvoice())
-                &&(remote.getId().equals(legacySubscription)||legacySubscription==null&&(permitsMissingLegacySubscription||nestedRequiredTrial))
+                &&(remote.getId().equals(legacySubscription)||legacySubscription==null&&(permitsMissingLegacySubscription||nestedTrial||scheduledRenewal))
                 &&Objects.equals(line.getQuantity(),1L)
                 &&line.getParent()!=null&&"subscription_item_details".equals(line.getParent().getType())&&line.getParent().getSubscriptionItemDetails()!=null,OwnedActionGuard.LINE_ASSOCIATION);
             var detail=line.getParent().getSubscriptionItemDetails();
@@ -815,15 +834,30 @@ public final class StripeBillingSnapshotMapper {
                 &&(trial==null||trial.equals(period));
             boolean matchingTrialInvoice=kind==BillingRecord.Kind.INITIAL&&trialContext!=null&&mapped.equals(trialContext.original())
                 &&(originalTrial||historicalTrial&&trial!=null&&trial.equals(period));
-            if(nestedRequiredTrial)requireOwned(matchingTrialInvoice&&invoice.getAmountDue()==0,OwnedActionGuard.LINE_ASSOCIATION);
+            if(nestedTrial)requireOwned(matchingTrialInvoice&&invoice.getAmountDue()==0,OwnedActionGuard.LINE_ASSOCIATION);
             var scheduleHistory=owner.schedules().stream().filter(p->{var q=p.quote();var binding=p.schedule();return binding.releaseStep()==null&&binding.updateStep()!=null&&binding.targetEnd()!=null
                 &&q.customerReference().equals(invoice.getCustomer())&&q.subscriptionReference().equals(remote.getId())&&q.targetPrice().equals(pricing.getPrice())&&q.product().equals(pricing.getProduct())
                 &&line.getPeriod()!=null&&Objects.equals(line.getPeriod().getStart(),q.period().end().getEpochSecond())&&Objects.equals(line.getPeriod().getEnd(),binding.targetEnd());}).toList();
             require(scheduleHistory.size()<=1);
+            if (scheduledRenewal && legacySubscription==null && !permitsMissingLegacySubscription)
+                require(!scheduleHistory.isEmpty());
             if(!scheduleHistory.isEmpty()){require("subscription_cycle".equals(invoice.getBillingReason())&&Boolean.FALSE.equals(detail.getProration())&&detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}")
                 &&StripeBillingMutationAdapter.noAdjustments(invoice)&&(line.getTaxes()==null||line.getTaxes().isEmpty())&&(line.getDiscounts()==null||line.getDiscounts().isEmpty()));}
-            else if(originalTrial&&!nestedRequiredTrial)require(detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}"));
-            else require((historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem()));
+            else if(originalTrial&&!nestedTrial)require(detail.getSubscriptionItem()!=null&&detail.getSubscriptionItem().matches("si_[A-Za-z0-9]{1,252}"));
+            else if(!(historicalTrial?trialContext.request().item():item.getId()).equals(detail.getSubscriptionItem())){
+                // A phase transition can replace the item. The prior paid line still belongs to the
+                // source item recorded by the exact two-phase schedule when it was configured.
+                require(kind==BillingRecord.Kind.INITIAL && !detail.getProration() && "paid".equals(invoice.getStatus())
+                    && StripeBillingMutationAdapter.noAdjustments(invoice) && (line.getTaxes()==null||line.getTaxes().isEmpty())
+                    && owner.schedules().stream().anyMatch(previous->{
+                        var q=previous.quote();var binding=previous.schedule();
+                        return binding.updateStep()!=null && binding.releaseStep()==null
+                            && q.subscriptionReference().equals(remote.getId()) && q.customerReference().equals(invoice.getCustomer())
+                            && q.source().equals(mapped.terms()) && q.sourcePrice().equals(pricing.getPrice())
+                            && q.product().equals(pricing.getProduct()) && q.item().equals(detail.getSubscriptionItem())
+                            && q.period().equals(period);
+                    }));
+            }
             var allocations=pages(after->client.v1().invoicePayments().list(InvoicePaymentListParams.builder().setInvoice(invoice.getId()).setLimit((long)PAGE_SIZE).setStartingAfter(after).build(),options()));
             sourceAllocations.put(invoice.getId(),allocations);
             for(var allocation:allocations){ref(allocation.getId(),"inpay_");require("invoice_payment".equals(allocation.getObject())&&Boolean.FALSE.equals(allocation.getLivemode())&&invoice.getId().equals(allocation.getInvoice()));currency(allocation.getCurrency(),mapped.terms());}
@@ -859,7 +893,7 @@ public final class StripeBillingSnapshotMapper {
                 case "void"->{if(plain&&allocations.isEmpty())settlement=SettlementKind.VOID;}
                 default->throw mismatch();
             }
-            if(nestedRequiredTrial)requireOwned(settlement==SettlementKind.ZERO,OwnedActionGuard.LINE_ASSOCIATION);
+            if(nestedTrial)requireOwned(settlement==SettlementKind.ZERO,OwnedActionGuard.LINE_ASSOCIATION);
             if(!scheduleHistory.isEmpty())require(settlement==SettlementKind.CASH||item.getId().equals(detail.getSubscriptionItem())&&settlement==SettlementKind.OPEN);
             var result=new SubscriptionProviderModels.Invoice(invoice.getId(),kind,mapped.terms(),null,period,invoice.getAmountDue(),mapped.terms().regularAmount().currency(),settlement,cash);
             if(actionFailure!=null&&settlement==SettlementKind.UNSUPPORTED)settlementReasons.put(result,unsupportedReason);
@@ -876,7 +910,7 @@ public final class StripeBillingSnapshotMapper {
             var q=proof.quote();var result=proof.result();var s=owner.subscription();
             require(q.account().equals(owner.account().id())&&q.site().equals(s.siteId())&&q.customer().equals(s.customerId())&&q.customerReference().equals(owner.customer().providerReference())&&q.subscription().equals(s.id())&&q.subscriptionReference().equals(s.providerReference())&&q.id().equals(result.quote())&&result.account().equals(q.account())&&result.subscription().equals(s.id())&&result.reference().equals(q.subscriptionReference())&&result.invoice().equals(invoice.getId())&&q.timing()==ChangeTiming.IMMEDIATE);
             StripeBillingMutationAdapter.requireInvoice(invoice,q,result.invoice());
-            require(lines.stream().allMatch(l->invoice.getId().equals(l.getInvoice())&&q.subscriptionReference().equals(l.getSubscription())));
+            require(lines.stream().allMatch(l->invoice.getId().equals(l.getInvoice())));
             require(lines.stream().allMatch(l->l.getPricing()!=null&&l.getPricing().getPriceDetails()!=null&&Objects.equals(l.getId(),q.sourcePrice().equals(l.getPricing().getPriceDetails().getPrice())?result.creditLine():result.debitLine())));
             var period=new Subscription.Period(q.anchor(),q.paidThrough());
             require(q.lines().equals(StripeBillingMutationAdapter.prorationLines(lines,q.subscriptionReference(),q.item(),q.sourcePrice(),q.targetPrice(),q.product(),period,q.target().regularAmount().currency(),true)));

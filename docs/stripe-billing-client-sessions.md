@@ -2,6 +2,10 @@
 
 The backend supports memory-only **PAYMENT** and **SETUP** client sessions for exact owned original operations. PAYMENT verifies the original Billing invoice, default InvoicePayment allocation and PaymentIntent for the supported CREATE/CHANGE/RESUME/RECOVER proof. SETUP has a distinct SetupIntent proof for method setup and required-before-trial collection, including before a remote Subscription exists. No server-side Stripe confirmation is performed. Portal uses a separate navigation contract, not this client-session route. See the [SDK guide](../frontend/sdk/README.md#stripe-billing-forms-and-portal) and [current acceptance matrix](stage-5b-acceptance.md): these implemented paths do not establish full 5B or actual provider acceptance.
 
+## Sandbox Customer Portal prerequisite
+
+Initialize the account-wide Customer Portal default in the Stripe Sandbox before enabling Portal for a site. On Stripe API `2026-09-30.endive`, the first configuration created on an uninitialized account becomes its default. Before sending a site configuration, the backend requests the active Sandbox default with `is_default=true` and `limit=1`. A missing or ambiguous default stops the write. The backend verifies the site configuration has `is_default=false` on creation and retrieval before issuing a session. Cancel-at-period-end uses Stripe's disabled cancellation-reasons default. [Stripe configuration creation](https://docs.stripe.com/api/customer_portal/configurations/create) · [Stripe configuration list](https://docs.stripe.com/api/customer_portal/configurations/list)
+
 ## Customer API handoff
 
 All action/client-session/confirmation responses use `Cache-Control: no-store`. The browser keeps Stripe client material in memory only; never put it in URLs, logs, telemetry, local/session storage or persistent state.

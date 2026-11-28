@@ -25,8 +25,25 @@ class StripeBillingFirstRenewalCompositionIntegrationTest extends StripeBillingF
 
     private OwnedFirstRenewalPublicationService publisher() { return publisher(facts); }
     private OwnedFirstRenewalPublicationService publisher(ApplySubscriptionSnapshotUseCase apply) {
+        return publisher(apply,Clock.systemUTC());
+    }
+    private OwnedFirstRenewalPublicationService publisher(ApplySubscriptionSnapshotUseCase apply,Clock utc) {
         return new OwnedFirstRenewalPublicationService(renewals,transaction,lifecycleOperations,lifecycleLocks,accountLocks,
-            subscriptions,readPreparation,observations,atCurrentOperationalUtc(apply),trialEligibility,Clock.systemUTC());
+            subscriptions,readPreparation,observations,atCurrentOperationalUtc(apply),trialEligibility,utc);
+    }
+
+    @Test void futureGraphCannotPublishEvenWhenTheApplicationClockAcceptsIt() {
+        var admission=paidAdmission();
+        var observed=paid(admission);
+        var future=observed.claim().deadlineAt().minusMillis(1);
+        var paid=new Paid(admission,observed.ready(),observed.boundary(),observed.fence(),observed.snapshot(),observed.claim(),future);
+        var state=financialState();
+        assertThat(future).isAfter(jdbc.queryForObject("select clock_timestamp()",Timestamp.class).toInstant().plusSeconds(2));
+        var publisher=publisher(facts,Clock.fixed(future,ZoneOffset.UTC));
+        assertThatThrownBy(()->publisher.publish(admission,observed.ready(),paid))
+            .rootCause().isInstanceOfSatisfying(java.sql.SQLException.class,error->assertThat(error.getSQLState()).isEqualTo("23514"));
+        assertThat(count("stripe_billing_first_renewal_publications")).isZero();
+        assertThat(financialState()).isEqualTo(state);
     }
 
     // Catches money/access published before fresh READY2 cash, missing callback payloads, or changed original evidence.
@@ -60,7 +77,18 @@ class StripeBillingFirstRenewalCompositionIntegrationTest extends StripeBillingF
         assertThat(financialState()).isEqualTo(before);assertOriginal(original);
         assertThat(count("stripe_billing_first_renewal_publications")).isZero();
         int completedRead=http.calls.size();
-        var published=publisher().publish(admission,second,paid);
+        // Sample the start of the INSERT independently in PostgreSQL. A timestamp taken during an
+        // earlier projection query (or on the application host) is not the write's publication time.
+        jdbc.execute("""
+            alter table stripe_billing_first_renewal_publications add constraint fixture_publication_insert_time
+            check (published_at >= statement_timestamp())
+            """);
+        Publication published;
+        try {
+            published=publisher().publish(admission,second,paid);
+        } finally {
+            jdbc.execute("alter table stripe_billing_first_renewal_publications drop constraint fixture_publication_insert_time");
+        }
         assertRenewalPublished(published,expected);
         assertThat(http.calls).hasSize(completedRead);assertOriginal(original);assertThat(receipt).isEqualTo(originalReceipt);
         assertThat(owned.requireReceipt(billing.id(),current().id())).isEqualTo(originalReceipt);
