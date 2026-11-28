@@ -6,10 +6,14 @@ import dev.genericpayments.platform.subscriptions.application.model.Subscription
 import dev.genericpayments.platform.subscriptions.application.port.in.QuerySubscriptionsUseCase;
 import dev.genericpayments.platform.subscriptions.domain.AccessDecision;
 import dev.genericpayments.platform.webhooks.application.port.out.CallbackConfigurationPort;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.TestPropertySource;
@@ -28,7 +32,11 @@ class OwnedOptionalTrialAcceptanceIntegrationTest extends OwnedOptionalTrialAdmi
         return UUID.fromString("7f87e8d2-5b6b-4ac5-99a0-70809e6ec87f");
     }
 
-    @Test void opensFreshTrialAndSettlesTheSameResumeInvoiceThroughTheAcceptanceSession() {
+    @ParameterizedTest
+    @ValueSource(ints = {999_999_499, 999_999_900})
+    void opensFreshTrialAndSettlesTheSameResumeInvoiceThroughTheAcceptanceSession(int nanos) {
+        var operationalTime = Instant.now().truncatedTo(ChronoUnit.SECONDS).plusSeconds(1).plusNanos(nanos);
+        TestClock.set(operationalTime);
         assertThat(jdbc.queryForObject("show join_collapse_limit", String.class)).isEqualTo("1");
         assertThat(jdbc.queryForObject("show from_collapse_limit", String.class)).isEqualTo("1");
         assertThat(jdbc.queryForObject("show jit", String.class)).isEqualTo("off");
@@ -75,6 +83,9 @@ class OwnedOptionalTrialAcceptanceIntegrationTest extends OwnedOptionalTrialAdmi
         var setup = session.snapshot().setupOperation();
         OwnedOptionalTrialSetupSdkTest.queueComplete(http, a, setup);
         session.completeSetup();
+        var persistedTimes = jdbc.queryForObject("select created_at, updated_at from subscription_operations where id=?",
+            (row, index) -> List.of(row.getTimestamp("created_at").toInstant(), row.getTimestamp("updated_at").toInstant()), setup);
+        assertThat(persistedTimes).containsExactly(operationalTime.truncatedTo(ChronoUnit.MICROS), operationalTime.truncatedTo(ChronoUnit.MICROS));
         var method = proofs.setup(billing.id(), setup).orElseThrow();
         OwnedOptionalTrialResumeSdkReplies.dispatch(http, a, original, setup, method.reference(), method.method(), "");
         OwnedOptionalTrialResumeSdkReplies.observation(http, a, original, setup, method.reference(), method.method(), false, "");

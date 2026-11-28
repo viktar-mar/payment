@@ -10,7 +10,6 @@ import dev.genericpayments.platform.payments.application.port.in.RecordSubscript
 import dev.genericpayments.platform.payments.domain.SubscriptionBillingContext;
 import dev.genericpayments.platform.catalog.domain.Money;
 import java.time.*;
-import java.time.temporal.ChronoUnit;
 import java.util.*;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.*;
@@ -169,14 +168,12 @@ public class SubscriptionFactService implements ApplySubscriptionSnapshotUseCase
         // invoice may be historical on the first observation; only today's full CASH period projects.
         var delayedTransition=unversioned?stripeDelayedTransition(original,snapshot,locked,now):Optional.<Invoice>empty();
         var observedBills=new HashMap<String,UUID>();boolean delayedTransitionApplied=false;
-        // Use the billing table's timestamp precision on both sides of a database round trip.
-        var billObservedAt=now.truncatedTo(ChronoUnit.MICROS);
         // Cash belongs to history even after terminal lifecycle. Never synthesize cash from invoice totals.
         for(var invoice:snapshot.invoices()) {
             validateTerms(original,invoice.price());if(invoice.previousPrice()!=null)validateTerms(original,invoice.previousPrice());
             var settlement=switch(invoice.settlement()){case OPEN->BillingRecord.Settlement.OPEN;case CASH->BillingRecord.Settlement.CONFIRMED_CASH;case ZERO->BillingRecord.Settlement.ZERO_AMOUNT;case UNSUPPORTED->BillingRecord.Settlement.UNSUPPORTED;case VOID->BillingRecord.Settlement.VOID;};
             var previousBill=bills.find(original.siteId(),original.id(),account.id(),invoice.reference());
-            var bill=bills.upsert(new BillingRecord(previousBill.map(BillingRecord::id).orElseGet(UUID::randomUUID),original.siteId(),original.id(),account.id(),invoice.reference(),invoice.kind(),invoice.price(),invoice.previousPrice(),invoice.period(),invoice.amountDueMinor(),invoice.currency(),settlement,previousBill.map(BillingRecord::version).orElse(0L),previousBill.map(BillingRecord::createdAt).orElse(billObservedAt),billObservedAt));
+            var bill=bills.upsert(new BillingRecord(previousBill.map(BillingRecord::id).orElseGet(UUID::randomUUID),original.siteId(),original.id(),account.id(),invoice.reference(),invoice.kind(),invoice.price(),invoice.previousPrice(),invoice.period(),invoice.amountDueMinor(),invoice.currency(),settlement,previousBill.map(BillingRecord::version).orElse(0L),previousBill.map(BillingRecord::createdAt).orElse(now),now));
             observedBills.put(invoice.reference(),bill.id());
             objects.bind(account.provider(),original,SubscriptionObjectPort.Kind.INVOICE,invoice.reference(),bill.id(),now);
             for(var attempt:invoice.cashObjects()) {

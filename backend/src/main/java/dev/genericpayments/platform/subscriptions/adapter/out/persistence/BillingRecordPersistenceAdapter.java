@@ -22,14 +22,15 @@ public class BillingRecordPersistenceAdapter implements BillingRecordStore {
     public BillingRecord upsert(BillingRecord b){
         var v=new LinkedHashMap<String,Object>();v.put("id",b.id());v.put("site_id",b.siteId().value());v.put("subscription_id",b.subscriptionId());v.put("product_id",b.billedPrice().productId().value());v.put("payment_account_id",b.accountId().value());
         v.put("provider_invoice_reference",b.providerInvoiceReference());v.put("kind",b.kind().name());v.put("currency",b.currency());terms(v,"billed",b.billedPrice());terms(v,"previous",b.previousPrice());period(v,"period",b.period());
-        v.put("amount_due_minor",b.amountDueMinor());v.put("settlement",b.settlement().name());v.put("version",b.version());v.put("created_at",time(b.createdAt()));v.put("updated_at",time(b.updatedAt()));
+        v.put("amount_due_minor",b.amountDueMinor());v.put("settlement",b.settlement().name());v.put("version",b.version());
+        v.put("created_at",auditTime(b.createdAt()));v.put("updated_at",auditTime(b.updatedAt()));
         int inserted=insert(jdbc,"subscription_billing_records",v,"on conflict(payment_account_id,provider_invoice_reference) do nothing");
         var stored=jdbc.query("select * from subscription_billing_records where payment_account_id=? and provider_invoice_reference=? for update",this::map,b.accountId().value(),b.providerInvoiceReference()).getFirst();
         if(!stored.siteId().equals(b.siteId())||!stored.subscriptionId().equals(b.subscriptionId())||stored.kind()!=b.kind()||!stored.billedPrice().equals(b.billedPrice())||!Objects.equals(stored.previousPrice(),b.previousPrice())||!stored.period().equals(b.period())||stored.amountDueMinor()!=b.amountDueMinor()||!stored.currency().equals(b.currency()))
             throw new IllegalArgumentException("Invoice identity or terms changed");
         if(inserted==1||stored.settlement()==b.settlement()||stored.settlement()==BillingRecord.Settlement.CONFIRMED_CASH||stored.settlement()==BillingRecord.Settlement.ZERO_AMOUNT)return stored;
         if(stored.version()!=b.version()||b.updatedAt().isBefore(stored.updatedAt()))throw new OptimisticLockingFailureException("Billing record changed");
-        jdbc.update("update subscription_billing_records set settlement=?,updated_at=?,version=version+1 where id=?",b.settlement().name(),time(b.updatedAt()),stored.id());
+        jdbc.update("update subscription_billing_records set settlement=?,updated_at=?,version=version+1 where id=?",b.settlement().name(),auditTime(b.updatedAt()),stored.id());
         return lock(b.siteId(),stored.id());
     }
     @Transactional(propagation=Propagation.MANDATORY)
