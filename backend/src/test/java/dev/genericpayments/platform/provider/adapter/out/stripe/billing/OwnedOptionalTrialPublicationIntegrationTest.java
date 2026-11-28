@@ -14,6 +14,7 @@ import java.nio.file.Path;
 import java.sql.Timestamp;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -132,6 +133,9 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
 
     @Test void exactTestClockExpiryPublishesPauseOnceWithoutDebtOrCash() {
         var a = start(true);
+        // Freeze between database microseconds so both observations use the same high-resolution instant.
+        var billTime = operationalClock.instant().plusSeconds(1).truncatedTo(ChronoUnit.MICROS);
+        TestClock.set(billTime.plusNanos(900));
         OwnedOptionalTrialSdkReplies.observation(http, a, "");
         publication.publish(billing, a.scope());
         var originalBill = jdbc.queryForObject("select id from subscription_billing_records", UUID.class);
@@ -142,6 +146,8 @@ class OwnedOptionalTrialPublicationIntegrationTest extends OwnedOptionalTrialFix
         assertThat(http.calls).isNotEmpty().allMatch(call -> call.method().name().equals("GET"));
         assertThat(jdbc.queryForList("select billing_status from subscriptions", String.class)).containsExactly("PAUSED");
         assertThat(jdbc.queryForList("select id from subscription_billing_records", UUID.class)).containsExactly(originalBill);
+        assertThat(jdbc.queryForObject("select created_at from subscription_billing_records", Timestamp.class).toInstant())
+            .isEqualTo(billTime);
         assertThat(jdbc.queryForList("select event_type from subscription_events order by sequence_number", String.class))
             .containsExactly("TRIAL_STARTED", "PAUSED");
         assertThat(jdbc.queryForObject("select extract(epoch from occurred_at)::bigint from subscription_events where event_type='PAUSED'", Long.class))
